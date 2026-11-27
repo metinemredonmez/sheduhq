@@ -24,7 +24,7 @@ use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use crate::{AppState, db::set_context};
+use crate::{AppState, db::set_context, notifications};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +221,11 @@ pub async fn dispatch(
         .fetch_one(&mut *tx)
         .await?;
 
+    // Kapatılabilen kategorideyse kişinin tercihi uygulanır; bilinmeyen tür ve alarm her zaman
+    // gönderilir (şüphede bildirim gider).
+    let muteable = notifications::category_of_event(&kind)
+        .filter(|category| category.can_be_disabled())
+        .map(notifications::category_name);
     let recipients: Vec<Recipient> = sqlx::query_as(
         "SELECT DISTINCT d.id, d.user_id, d.push_token, d.platform
            FROM user_devices d
@@ -228,6 +233,11 @@ pub async fn dispatch(
            JOIN organizations o ON o.id = m.organization_id
            JOIN users u ON u.id = d.user_id AND u.status = 'active'
           WHERE d.push_token IS NOT NULL
+            -- Kişinin kapattığı kategori (alarm hiç kapatılamaz; $4 alarmda NULL'dır).
+            AND ($4::text IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM notification_preferences np
+                    WHERE np.user_id = d.user_id AND np.organization_id = $1
+                      AND np.category = $4 AND NOT np.enabled))
             AND EXISTS (SELECT 1 FROM refresh_tokens r
                          WHERE r.device_id = d.id AND r.revoked_at IS NULL AND r.expires_at > now()
                            -- Personel cihazı yalnızca ikinci adımı tamamlanmış oturumla (AUT-01;
@@ -247,6 +257,7 @@ pub async fn dispatch(
     .bind(organization_id)
     .bind(panel_id)
     .bind(partition_number)
+    .bind(muteable)
     .fetch_all(&mut *tx)
     .await?;
 

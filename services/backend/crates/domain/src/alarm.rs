@@ -58,7 +58,38 @@ pub enum Priority {
     Critical,
 }
 
+/// Kişinin tercihleriyle açıp kapatabileceği bildirim kategorisi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationCategory {
+    /// Bütün alarm türleri (hırsızlık, yangın, gaz, su, panik, tıbbi, sabotaj).
+    Alarm,
+    /// Panelle bağlantının kopması ve yeniden kurulması.
+    Connectivity,
+    /// Pil veya şebeke sorunu.
+    Power,
+    /// Kurma ve kapatma.
+    Arming,
+}
+
+impl NotificationCategory {
+    pub const ALL: [Self; 4] = [Self::Alarm, Self::Connectivity, Self::Power, Self::Arming];
+
+    /// Alarm bildirimleri kapatılamaz: alarm çaldığında haber almak ürünün temel sözüdür.
+    pub fn can_be_disabled(self) -> bool {
+        !matches!(self, Self::Alarm)
+    }
+}
+
 impl PanelNotification {
+    pub fn category(&self) -> NotificationCategory {
+        match self {
+            Self::Alarm { .. } => NotificationCategory::Alarm,
+            Self::Disconnected | Self::Connected => NotificationCategory::Connectivity,
+            Self::PowerProblem => NotificationCategory::Power,
+            Self::Armed { .. } | Self::Disarmed { .. } => NotificationCategory::Arming,
+        }
+    }
+
     pub fn priority(&self) -> Priority {
         match self {
             Self::Alarm { .. } => Priority::Critical,
@@ -91,6 +122,31 @@ mod tests {
                 zone: None,
             };
             assert_eq!(notification.priority(), Priority::Critical, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn only_alarms_cannot_be_disabled() {
+        let alarm = PanelNotification::Alarm {
+            kind: AlarmKind::Fire,
+            partition: 1,
+            zone: Some(3),
+        };
+        assert_eq!(alarm.category(), NotificationCategory::Alarm);
+        assert!(!alarm.category().can_be_disabled());
+        for other in [
+            PanelNotification::Disconnected,
+            PanelNotification::Connected,
+            PanelNotification::PowerProblem,
+            PanelNotification::Disarmed { partition: 1 },
+        ] {
+            assert!(other.category().can_be_disabled(), "{other:?}");
+        }
+        // Kritik öncelikli her bildirim kapatılamayan kategoridedir.
+        for category in NotificationCategory::ALL {
+            if category.can_be_disabled() {
+                assert_ne!(category, NotificationCategory::Alarm);
+            }
         }
     }
 

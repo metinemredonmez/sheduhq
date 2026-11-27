@@ -109,6 +109,14 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   veritabanındaki sahip kontrolü, MFA'da iptalin ikinci adıma bağlılığı, metin sürümü kontrolü,
   silme işinin süre kontrolü ve defterin değiştirilemezlik tetikleyicisi tek tek bozulduğunda
   ilgili testin kaldığı yerelde doğrulandı.
+- **Bildirim tercihleri (AZ-02, API-02, LOG-01):** `services/backend/crates/api/tests/notifications.rs`
+  (2 entegrasyon testi), `tests/sql/008_notification_preferences.sql` ve domain birim testi:
+  varsayılan hepsi açık; alarmı kapatma isteği reddedilir ve aynı istekteki başka değişiklik de
+  uygulanmaz; bilinmeyen alan reddedilir; üye olmayan göremez ve yazamaz; tercih organizasyon
+  başınadır; kurmayı kapatan üyeye kurma bildirimi gitmez ama alarm gider, geri açınca kapatma
+  bildirimi gider. Veritabanında alarm kategorisi yazılamaz, kişi başkası adına veya üyesi
+  olmadığı organizasyona tercih yazamaz, üyelik silinince tercih silinir. Dağıtıcı filtresi, alarm
+  koruması ve kişi başına yazma politikası bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.

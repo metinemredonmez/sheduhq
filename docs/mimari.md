@@ -156,6 +156,13 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   API başlamaz.
 - **Sanal alarm:** hırsızlık zonu yalnızca kurulu bölümde, yangın/gaz/su/panik/tıbbi/sabotaj zonu
   her zaman alarm verir; bypass edilmiş zon alarm vermez.
+- **Bildirim tercihleri:** `GET`/`PATCH /v1/organizations/{org_id}/notification-preferences`.
+  Kişi her organizasyon için dört kategoriden üçünü kapatabilir: bağlantı (kopma/yeniden
+  bağlanma), güç, kurma/kapatma. Alarm kategorisi (bütün alarm türleri) kapatılamaz; veritabanı
+  da bu kategoriyi saklamaz. Kayıt yoksa kategori açıktır. Tercih yalnızca push'u etkiler; olay
+  geçmişi ve WebSocket akışı değişmez. Tercih değişikliği denetim kaydına yazılır ("haber
+  verildi mi?" sorusunun kanıtı); üyelik silinince tercihler de silinir. Bilinmeyen olay türü
+  her zaman gönderilir.
 
 ## Üyeler, davetler ve panel yetkileri
 

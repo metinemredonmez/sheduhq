@@ -30,7 +30,7 @@ Geliştirme sırası: **backend → AI servisi → admin → web → mobil.** Ge
 - Kur / evde / gece / kapat; PIN ve isteğe bağlı biyometri; sonucun anında gösterilmesi.
 - Zon listesi ve zonu devre dışı bırakma (bypass).
 - Alarm push bildirimleri (kritik öncelik, alarm sesleri), bildirim merkezi ve tür bazlı tercihler
-  (alarm türleri kapatılamaz).
+  (alarm türleri kapatılamaz). (Backend: tür bazlı tercihler hazır.)
 - Olay geçmişi (tarih filtresi).
 - Panik butonları: polis, ambulans, itfaiye (basılı tutma ve onay ile).
 - Bağlı cihazlar ve oturumlar; uzaktan oturum kapatma.
