@@ -28,6 +28,7 @@ use crate::{
     AppState, audit,
     db::set_context,
     error::{ApiError, ApiResult, is_unique_violation},
+    privacy,
     sms::mask_phone,
 };
 
@@ -535,7 +536,13 @@ pub async fn login(
             .map_err(|_| ApiError::Internal)?;
 
     let user_id = match user {
-        Some((id, Some(_), status)) if password_ok && status == "active" => id,
+        // Silme bekleyen hesap tam doğrulamayla giriş yaparsa talep iptal olur (aşağıda; MFA
+        // açıksa ikinci adımdan sonra).
+        Some((id, Some(_), status))
+            if password_ok && (status == "active" || status == "pending_deletion") =>
+        {
+            id
+        }
         other => {
             let target = other.map(|(id, _, _)| id.to_string());
             audit::record(
@@ -561,6 +568,7 @@ pub async fn login(
     }
 
     let mut tx = conn.begin().await?;
+    let cancelled = privacy::cancel_scheduled_erasure(&mut tx, user_id).await?;
     let (session_id, refresh_token) = create_session(&mut tx, user_id, &request.device).await?;
     audit::record(
         &mut tx,
@@ -575,7 +583,15 @@ pub async fn login(
         },
     )
     .await?;
+    let phone = if cancelled {
+        mfa::phone_of(&mut tx, user_id).await?
+    } else {
+        None
+    };
     tx.commit().await?;
+    if cancelled {
+        mfa::notify(&state, phone, privacy::SMS_ERASURE_CANCELLED);
+    }
 
     Ok(Json(LoginResponse::Tokens(token_response(
         &state,
@@ -775,11 +791,12 @@ pub async fn reset_start(
     limit(&state, &mut conn, rate_limit::SMS_PER_PHONE, &phone).await?;
     limit(&state, &mut conn, rate_limit::SMS_GLOBAL, "all").await?;
 
-    let user: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM users WHERE phone = $1 AND status = 'active'")
-            .bind(&phone)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let user: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE phone = $1 AND status IN ('active', 'pending_deletion')",
+    )
+    .bind(&phone)
+    .fetch_optional(&mut *conn)
+    .await?;
     if let Some((user_id,)) = user {
         issue_code(
             &state,
@@ -824,11 +841,14 @@ pub async fn reset_complete(
     let password_hash = hash_password(request.new_password).await?;
 
     let mut tx = state.db.begin().await?;
-    sqlx::query("UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2 AND status = 'active'")
-        .bind(&password_hash)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE users SET password_hash = $1, updated_at = now()
+          WHERE id = $2 AND status IN ('active', 'pending_deletion')",
+    )
+    .bind(&password_hash)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("UPDATE user_devices SET push_token = NULL WHERE user_id = $1")
         .bind(user_id)
         .execute(&mut *tx)

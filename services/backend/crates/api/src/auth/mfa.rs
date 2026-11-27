@@ -435,7 +435,8 @@ pub async fn verify(
     let mut tx = state.db.begin().await?;
     let challenge: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
         "SELECT c.id, c.user_id, c.platform, c.device_name
-           FROM mfa_challenges c JOIN users u ON u.id = c.user_id AND u.status = 'active'
+           FROM mfa_challenges c
+           JOIN users u ON u.id = c.user_id AND u.status IN ('active', 'pending_deletion')
           WHERE c.token_hash = $1 AND c.consumed_at IS NULL AND c.expires_at > now()
             AND c.attempts < $2
           FOR UPDATE OF c",
@@ -500,6 +501,7 @@ pub async fn verify(
     };
     let (session_id, refresh_token) = create_session(&mut tx, user_id, &device).await?;
     mark_session(&mut tx, user_id, session_id, method).await?;
+    let cancelled = crate::privacy::cancel_scheduled_erasure(&mut tx, user_id).await?;
     audit::record(
         &mut tx,
         audit::Event {
@@ -515,6 +517,9 @@ pub async fn verify(
     .await?;
     let phone = phone_of(&mut tx, user_id).await?;
     tx.commit().await?;
+    if cancelled {
+        notify(&state, phone.clone(), crate::privacy::SMS_ERASURE_CANCELLED);
+    }
     if matches!(method, Method::RecoveryCode) {
         notify(&state, phone, SMS_RECOVERY_USED);
     }

@@ -329,7 +329,69 @@ async fn account_deletion_anonymizes_and_keeps_shared_security_records(
     let (status, body) = app
         .post_auth("/v1/me/delete", json!({ "password": PASSWORD }), &member)
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body["deletion_due_at"].is_string());
+
+    // Talep hesabı hemen kapatır: oturum biter, push token silinir; veri henüz silinmez.
+    let (status, _) = app.get("/v1/me", &member).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (due_in_days,): (f64,) = sqlx::query_as(
+        "SELECT (extract(epoch FROM deletion_due_at - now()) / 86400)::float8 FROM users WHERE id = $1::uuid",
+    )
+    .bind(&member_id)
+    .fetch_one(&app.admin)
+    .await
+    .expect("sorgu");
+    assert!((29.9..30.1).contains(&due_in_days), "{due_in_days}");
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM user_devices WHERE user_id = $1::uuid AND push_token IS NOT NULL",
+            &member_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(sms_containing(&app, MEMBER, "30 gün sonra").await, 1);
+
+    // Süre içinde giriş talebi iptal eder; kişi yeniden talep eder.
+    let (status, login) = app.login(MEMBER, PASSWORD).await;
+    assert_eq!(status, StatusCode::OK, "{login}");
+    let member = s(&login, "access_token");
+    let (status, _) = app.get("/v1/me", &member).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sms_containing(&app, MEMBER, "iptal").await, 1);
+    let (status, _) = app
+        .post_auth("/v1/me/delete", json!({ "password": PASSWORD }), &member)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Süre dolmadan silme işi dokunmaz; dolunca siler.
+    assert_eq!(
+        shedu_api::privacy::erase_due_accounts(&app.state)
+            .await
+            .expect("iş"),
+        0
+    );
+    sqlx::query(
+        "UPDATE users SET deletion_due_at = now() - interval '1 minute' WHERE id = $1::uuid",
+    )
+    .bind(&member_id)
+    .execute(&app.admin)
+    .await
+    .expect("süre");
+    assert_eq!(
+        shedu_api::privacy::erase_due_accounts(&app.state)
+            .await
+            .expect("iş"),
+        1
+    );
+    assert_eq!(
+        shedu_api::privacy::erase_due_accounts(&app.state)
+            .await
+            .expect("iş"),
+        0
+    );
 
     // Oturum ve giriş kapandı.
     let (status, _) = app.get("/v1/me", &member).await;
@@ -421,6 +483,7 @@ async fn account_deletion_anonymizes_and_keeps_shared_security_records(
     .expect("denetim");
     assert_eq!(details["organizations_deleted"], 1);
     assert_eq!(details["memberships_removed"], 1);
+    assert_eq!(details["scheduled"], true);
     assert!(!details.to_string().contains(MEMBER));
     assert_eq!(sms_containing(&app, MEMBER, "silindi").await, 1);
 
@@ -570,4 +633,142 @@ async fn profile_and_phone_can_be_corrected_safely(_: PgPoolOptions, connect: Pg
             .all(|(d,)| !d.to_string().contains(NEW) && !d.to_string().contains(PHONE)),
         "denetim kaydına numara yazılmamalı"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn mfa_user_cancels_deletion_only_after_the_second_step(
+    _: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let app = app(connect).await;
+    let (access, user_id, _) = app.user(PHONE).await;
+    let secret = app.enable_mfa(&access).await;
+    let (status, _) = app
+        .post_auth("/v1/me/delete", json!({ "password": PASSWORD }), &access)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let state = || async {
+        sqlx::query_as::<_, (String,)>("SELECT status FROM users WHERE id = $1::uuid")
+            .bind(&user_id)
+            .fetch_one(&app.admin)
+            .await
+            .expect("sorgu")
+            .0
+    };
+
+    // Parola tek başına talebi iptal etmez.
+    let (status, login) = app.login(PHONE, PASSWORD).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(login["mfa_required"], true);
+    assert_eq!(state().await, "pending_deletion");
+    let (status, _) = app
+        .post(
+            "/v1/auth/mfa/verify",
+            json!({ "mfa_token": s(&login, "mfa_token"), "code": totp_code(&secret, 1) }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(state().await, "active");
+    assert_eq!(audit_count(&app, "privacy.erasure_cancelled").await, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rıza defteri
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_ledger_records_every_answer(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (access, user_id, _) = app.user(PHONE).await;
+    let consent = |purpose: &str, version: &str, granted: bool| json!({ "purpose": purpose, "version": version, "granted": granted, "platform": "ios" });
+
+    let (status, list) = app.get("/v1/me/consents", &access).await;
+    assert_eq!(status, StatusCode::OK);
+    let purposes = list["purposes"].as_array().expect("liste");
+    assert!(purposes.len() >= 2);
+    let marketing = purposes
+        .iter()
+        .find(|p| p["code"] == "marketing")
+        .expect("pazarlama");
+    assert_eq!(marketing["granted"], Value::Null);
+    let version = s(marketing, "current_version");
+
+    // Bilinmeyen amaç, eski sürüm, geri çekilemeyen aydınlatma kaydı, fazladan alan.
+    let (status, _) = app
+        .post_auth(
+            "/v1/me/consents",
+            consent("uydurma", &version, true),
+            &access,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = app
+        .post_auth(
+            "/v1/me/consents",
+            consent("marketing", "eski-0", true),
+            &access,
+        )
+        .await;
+    assert_eq!(
+        (status, s(&body, "error")),
+        (StatusCode::CONFLICT, "outdated_version".into())
+    );
+    let (status, _) = app
+        .post_auth(
+            "/v1/me/consents",
+            consent("privacy_notice", &version, false),
+            &access,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut extra = consent("marketing", &version, true);
+    extra["user_id"] = json!(Uuid::new_v4());
+    let (status, _) = app.post_auth("/v1/me/consents", extra, &access).await;
+    assert!(status.is_client_error());
+
+    // Ver, geri çek: güncel durum son kayıttır; geçmiş korunur.
+    for granted in [true, false] {
+        let (status, _) = app
+            .post_auth(
+                "/v1/me/consents",
+                consent("marketing", &version, granted),
+                &access,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (status, _) = app
+        .post_auth(
+            "/v1/me/consents",
+            consent("privacy_notice", &version, true),
+            &access,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, list) = app.get("/v1/me/consents", &access).await;
+    let current = |code: &str| {
+        list["purposes"]
+            .as_array()
+            .and_then(|l| l.iter().find(|p| p["code"] == code))
+            .cloned()
+            .expect("amaç")
+    };
+    assert_eq!(current("marketing")["granted"], false);
+    assert_eq!(current("marketing")["up_to_date"], true);
+    assert_eq!(current("privacy_notice")["granted"], true);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM consent_records WHERE user_id = $1::uuid",
+            &user_id
+        )
+        .await,
+        3
+    );
+
+    // Dışa aktarmada bütün geçmiş vardır.
+    let (status, data) = export(&app, &access, PASSWORD).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["consents"].as_array().map(Vec::len), Some(3));
+    assert_eq!(audit_count(&app, "privacy.consent_recorded").await, 3);
 }

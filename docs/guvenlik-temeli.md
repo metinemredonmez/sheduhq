@@ -26,7 +26,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
 | Sırlar | KEY-02 | Sır yönetimi; istemci uygulamasında ve depoda sır yok | Doğrulanacak |
 | Log | LOG-01, LOG-02 | Yapılandırılmış güvenlik olayı; log'da PIN, token, telefon yok | Doğrulanacak |
 | Veri | DAT-01, DAT-02, AZ-03 | Kişisel veri dışa aktarma yalnızca kişinin kendi verisi; yeniden doğrulama, günlük sınır, dosya sunucuda tutulmaz | Doğrulanacak |
-| Veri | DAT-05 | Hesap silme: anonimleştirme ve yok etme tek işlemde; güvenlik kayıtları kimliksiz kalır | Doğrulanacak |
+| Veri | DAT-05 | Hesap silme: 30 gün geri alınabilir talep, sonra anonimleştirme ve yok etme tek işlemde; güvenlik kayıtları kimliksiz kalır; rıza defteri yalnızca eklenir | Doğrulanacak |
 | AI | AI-01, AI-02, AI-03 | Araçlar yalnızca okuma; kiracı izolasyonu; maliyet bütçesi | Doğrulanacak |
 | Üretim | OPS-01 | Güvenli üretim profili; debug ve sunucu seçici yok; varsayılan dinleme adresi `127.0.0.1` | Doğrulanacak |
 | Build | OPS-04 | CODEOWNERS, korumalı `main`, Dependabot, en az yetkili CI | Doğrulanacak |
@@ -90,8 +90,8 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bildirilir. Zorunluluk, tekrar oynatma koruması ve push kuralı tek tek bozulduğunda ilgili
   testin kaldığı yerelde doğrulandı.
 - **Kişisel veriler (DAT-01, DAT-02, DAT-05, AZ-03, AUT-04, RES-01, LOG-02):**
-  `services/backend/crates/api/tests/privacy.rs` (4 entegrasyon testi) ve
-  `services/backend/tests/sql/006_privacy.sql`: dışa aktarma yanlış parola ve fazladan alanla
+  `services/backend/crates/api/tests/privacy.rs` (6 entegrasyon testi),
+  `services/backend/tests/sql/006_privacy.sql` ve `007_consent_deferred_erasure.sql`: dışa aktarma yanlış parola ve fazladan alanla
   çalışmaz; yalnızca kişinin kendi komutlarını ve yetkilerini içerir, sahibin numarası ve kimliği
   girmez, push token'ı girmez; ayrıldıktan sonra da kendi komutu gelir; günde 3'ten fazlası 429.
   MFA açıkken yalnızca parolalı oturumla dışa aktarma, numara değişimi ve silme yapılamaz.
@@ -100,8 +100,15 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   komut ve denetim kaydı kalır ama kişi kimliksizdir, numarasına gelen davet silinir, denetim
   kaydına numara yazılmaz; aynı numarayla yeniden kayıt olunur. Numara değişimi başka hesabın
   numarasına kod göndermez, başkasının değişim kodunu kabul etmez, eski numaraya bildirir.
-  Dışa aktarmadaki kullanıcı filtresi, parola şartı, numara kodunun kullanıcıya bağı ve
-  veritabanındaki sahip kontrolü tek tek bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
+  Silme talebi oturumu hemen kapatır ve push token'ını siler; süre dolmadan silme işi dokunmaz,
+  dolunca bir kez siler; süre içinde giriş talebi iptal eder, MFA açıksa yalnızca parola iptal
+  etmez. Rıza defterinde bilinmeyen amaç, eski metin sürümü ve aydınlatma kaydının geri
+  çekilmesi reddedilir; kayıtlar uygulama rolüyle de tablo sahibiyle de değiştirilemez ve
+  silinemez; hesap silinince rıza kayıtları kalır.
+  Dışa aktarmadaki kullanıcı filtresi, parola şartı, numara kodunun kullanıcıya bağı,
+  veritabanındaki sahip kontrolü, MFA'da iptalin ikinci adıma bağlılığı, metin sürümü kontrolü,
+  silme işinin süre kontrolü ve defterin değiştirilemezlik tetikleyicisi tek tek bozulduğunda
+  ilgili testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -121,8 +128,12 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   - DAT-05: yedekler henüz yok; yedekten geri dönüşte silinmiş hesapların yeniden canlanmaması
     için silme kayıtlarının (denetim kaydındaki `privacy.account_erased`) yeniden uygulanması
     yedekleme kurulurken tanımlanacak.
-  - DAT-01: saklama süreleri (komut, olay, denetim kaydı, bildirim teslimi) ve süresi dolan
-    verinin otomatik silinmesi yok; süreler hukuki kararla belirlenecek (açık sorular).
+  - DAT-01: saklama süreleri (komut, olay, denetim kaydı, bildirim teslimi, rıza kayıtları) ve
+    süresi dolan verinin otomatik silinmesi yok; süreler hukuki kararla belirlenecek (açık
+    sorular).
+  - Rıza amaçları ve metin sürümleri taslaktır (`taslak-1`); aydınlatma metni ve rıza metinleri
+    onaylanınca migration'la güncellenecek. Ticari ileti onayı için İYS (İleti Yönetim Sistemi)
+    entegrasyonu yok.
   - DAT-01: silinen kullanıcının eski numarasını içeren SMS sağlayıcısı kayıtları ve push
     sağlayıcısındaki cihaz kayıtları Shedu'nun dışındadır; sağlayıcılar bağlanırken
     sözleşmeyle ele alınacak.

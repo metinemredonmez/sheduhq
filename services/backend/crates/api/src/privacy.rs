@@ -8,19 +8,27 @@
 //! numarası veya olay ayrıntısı girmez; push token'ları ve faktör sırları girmez. Dosya sunucuda
 //! saklanmaz, yanıt önbelleğe alınmaz (`no-store`). Kullanıcı başına günde 3 kez.
 //!
-//! Silme: veritabanındaki `erase_account()` tek işlemde yapar (bkz. migration 0008). Başka üyesi
-//! olan organizasyonun sahibi önce sahipliği devretmelidir.
+//! Silme: talep hesabı hemen kapatır (oturumlar, push token'ları) ve silmeyi 30 gün sonraya
+//! planlar; kişi bu sürede tam doğrulamayla giriş yaparsa talep iptal olur. Süre dolunca silme işi
+//! veritabanındaki `erase_account()`'ı tek işlemde çalıştırır (bkz. migration 0008, 0009). Başka
+//! üyesi olan organizasyonun sahibi önce sahipliği devretmelidir.
+//!
+//! Rıza defteri: amaç başına verme ve geri çekme kayıtları yalnızca eklenir; güncel durum son
+//! kayıttır. Eski metin sürümüne verilen yanıt kabul edilmez.
+
+use std::time::Duration;
 
 use axum::{
     Json, Router,
     extract::State,
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::{
@@ -32,6 +40,13 @@ use crate::{
 
 /// Dışa aktarılan komut ve güvenlik olayı sayısı üst sınırı (veritabanı da uygular).
 const MAX_ROWS: i32 = 10_000;
+/// Silme talebinden kalıcı silmeye kadar geçen süre.
+pub const ERASURE_GRACE_DAYS: i32 = 30;
+const SMS_SCHEDULED: &str = "Shedu: Hesabınız 30 gün sonra kalıcı olarak silinecek. Vazgeçerseniz \
+                             bu süre içinde giriş yapmanız yeterli.";
+pub(crate) const SMS_ERASURE_CANCELLED: &str = "Shedu: Hesap silme talebiniz girişinizle iptal \
+                                                edildi. Bunu siz yapmadıysanız hemen parolanızı \
+                                                değiştirin.";
 const SMS_ERASED: &str = "Shedu: Hesabınız ve kişisel verileriniz silindi. Bunu siz yapmadıysanız \
                           hemen destek ile iletişime geçin.";
 
@@ -39,6 +54,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/me/data-export", post(export))
         .route("/me/delete", post(delete_account))
+        .route("/me/consents", get(list_consents).post(record_consent))
 }
 
 #[derive(Deserialize)]
@@ -110,6 +126,15 @@ struct WindowData {
     day: i16,
     start_minute: i16,
     end_minute: i16,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ConsentRecord {
+    purpose: String,
+    version: String,
+    granted: bool,
+    platform: Option<String>,
+    recorded_at: DateTime<Utc>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -247,6 +272,13 @@ pub async fn export(
     }
 
     set_context(&mut tx, Some(user.user_id), None).await?;
+    let consents: Vec<ConsentRecord> = sqlx::query_as(
+        "SELECT purpose, version, granted, platform, recorded_at FROM consent_records
+          WHERE user_id = $1 ORDER BY recorded_at, id",
+    )
+    .bind(user.user_id)
+    .fetch_all(&mut *tx)
+    .await?;
     let commands: Vec<CommandData> = sqlx::query_as("SELECT * FROM privacy_my_commands($1)")
         .bind(MAX_ROWS)
         .fetch_all(&mut *tx)
@@ -284,6 +316,7 @@ pub async fn export(
             "recovery_codes_remaining": recovery_remaining,
         },
         "access_grants": grants,
+        "consents": consents,
         "commands": commands,
         "security_events": security_events,
         "truncated": truncated,
@@ -296,6 +329,7 @@ pub async fn export(
     Ok(response)
 }
 
+/// Silme talebi: hesabı hemen kapatır ve kalıcı silmeyi 30 gün sonraya planlar.
 pub async fn delete_account(
     State(state): State<AppState>,
     user: AuthUser,
@@ -325,38 +359,267 @@ pub async fn delete_account(
             .into_response());
     }
 
-    let phone = mfa::phone_of(&mut tx, user.user_id).await?;
-    let erased: Result<(serde_json::Value,), sqlx::Error> =
-        sqlx::query_as("SELECT erase_account()")
-            .fetch_one(&mut *tx)
-            .await;
-    let (summary,) = match erased {
-        Ok(row) => row,
-        // Arada biri organizasyona katıldıysa veritabanı reddeder.
-        Err(error)
-            if error
-                .as_database_error()
-                .and_then(|e| e.code())
-                .is_some_and(|code| code == "23001") =>
-        {
-            return Err(ApiError::Conflict("transfer_ownership_first"));
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let scheduled: Option<(DateTime<Utc>,)> = sqlx::query_as(
+        "UPDATE users
+            SET status = 'pending_deletion', updated_at = now(),
+                deletion_due_at = now() + make_interval(days => $2)
+          WHERE id = $1 AND status = 'active'
+          RETURNING deletion_due_at",
+    )
+    .bind(user.user_id)
+    .bind(ERASURE_GRACE_DAYS)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (due,) = scheduled.ok_or(ApiError::Unauthorized)?;
+    // Hesap hemen kapanır: bütün oturumlar biter, cihazlara bildirim gitmez (SES-04).
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user.user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE user_devices SET push_token = NULL WHERE user_id = $1")
+        .bind(user.user_id)
+        .execute(&mut *tx)
+        .await?;
     audit::record(
         &mut tx,
         audit::Event {
             organization_id: None,
             actor_user_id: Some(user.user_id),
-            action: "privacy.account_erased",
+            action: "privacy.erasure_scheduled",
             target_type: Some("user"),
             target_id: Some(&user.user_id.to_string()),
             outcome: audit::Outcome::Success,
-            details: summary,
+            details: json!({ "deletion_due_at": due }),
+        },
+    )
+    .await?;
+    let phone = mfa::phone_of(&mut tx, user.user_id).await?;
+    tx.commit().await?;
+    mfa::notify(&state, phone, SMS_SCHEDULED);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "deletion_due_at": due })),
+    )
+        .into_response())
+}
+
+/// Bekleyen silme talebini iptal eder (tam doğrulamalı girişte çağrılır). İptal edildiyse `true`.
+pub(crate) async fn cancel_scheduled_erasure(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+) -> ApiResult<bool> {
+    let cancelled = sqlx::query(
+        "UPDATE users SET status = 'active', deletion_due_at = NULL, updated_at = now()
+          WHERE id = $1 AND status = 'pending_deletion'",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1;
+    if cancelled {
+        audit::record(
+            conn,
+            audit::Event {
+                organization_id: None,
+                actor_user_id: Some(user_id),
+                action: "privacy.erasure_cancelled",
+                target_type: Some("user"),
+                target_id: Some(&user_id.to_string()),
+                outcome: audit::Outcome::Success,
+                details: json!({}),
+            },
+        )
+        .await?;
+    }
+    Ok(cancelled)
+}
+
+/// Süresi dolan silme taleplerini uygular; silinen hesap sayısını döner. Birden fazla API kopyası
+/// aynı anda çalışabilir: her hesap `SKIP LOCKED` ile tek kopya tarafından işlenir.
+pub async fn erase_due_accounts(state: &AppState) -> ApiResult<usize> {
+    let mut erased = 0;
+    let mut failed: Vec<Uuid> = Vec::new();
+    while erased + failed.len() < 500 {
+        let mut tx = state.db.begin().await?;
+        let due: Option<(Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT id, phone FROM users
+              WHERE status = 'pending_deletion' AND deletion_due_at <= now() AND id <> ALL($1)
+              ORDER BY deletion_due_at
+              LIMIT 1
+              FOR UPDATE SKIP LOCKED",
+        )
+        .bind(&failed)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((user_id, phone)) = due else { break };
+        set_context(&mut tx, Some(user_id), None).await?;
+        let summary: Result<(serde_json::Value,), sqlx::Error> =
+            sqlx::query_as("SELECT erase_account()")
+                .fetch_one(&mut *tx)
+                .await;
+        match summary {
+            Ok((mut summary,)) => {
+                summary["scheduled"] = json!(true);
+                audit::record(
+                    &mut tx,
+                    audit::Event {
+                        organization_id: None,
+                        actor_user_id: Some(user_id),
+                        action: "privacy.account_erased",
+                        target_type: Some("user"),
+                        target_id: Some(&user_id.to_string()),
+                        outcome: audit::Outcome::Success,
+                        details: summary,
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+                mfa::notify(state, phone, SMS_ERASED);
+                erased += 1;
+            }
+            Err(error) => {
+                // İşlem geri alınır; hesap bir sonraki turda yeniden denenir.
+                tracing::error!(?error, "planlı hesap silme başarısız");
+                failed.push(user_id);
+            }
+        }
+    }
+    Ok(erased)
+}
+
+/// Silme işini saatte bir çalıştırır.
+pub fn start_erasure_job(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            match erase_due_accounts(&state).await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "planlı hesap silmeleri uygulandı"),
+                Err(error) => tracing::error!(?error, "planlı hesap silme işi çalışmadı"),
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rıza defteri
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentRequest {
+    purpose: String,
+    /// Kişiye gösterilen metnin sürümü; güncel sürüm olmalı.
+    version: String,
+    granted: bool,
+    platform: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ConsentState {
+    code: String,
+    kind: String,
+    description: String,
+    current_version: String,
+    granted: Option<bool>,
+    version: Option<String>,
+    recorded_at: Option<DateTime<Utc>>,
+    /// Son yanıt güncel metin sürümüne mi verildi? Değilse istemci yeniden sormalı.
+    up_to_date: bool,
+}
+
+pub async fn list_consents(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    let purposes: Vec<ConsentState> = sqlx::query_as(
+        "SELECT p.code, p.kind, p.description, p.current_version, r.granted, r.version,
+                r.recorded_at, coalesce(r.version = p.current_version, false) AS up_to_date
+           FROM consent_purposes p
+           LEFT JOIN LATERAL (
+                SELECT granted, version, recorded_at FROM consent_records
+                 WHERE user_id = $1 AND purpose = p.code
+                 ORDER BY recorded_at DESC, id DESC
+                 LIMIT 1) r ON true
+          ORDER BY p.code",
+    )
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(json!({ "purposes": purposes })))
+}
+
+pub async fn record_consent(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<ConsentRequest>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    if request
+        .platform
+        .as_deref()
+        .is_some_and(|p| !matches!(p, "ios" | "android" | "web"))
+    {
+        return Err(ApiError::BadRequest("invalid_platform"));
+    }
+    let mut tx = state.db.begin().await?;
+    rate_limit::hit(
+        &mut tx,
+        &state.hmac_secret,
+        rate_limit::CONSENT_PER_USER,
+        &user.user_id.to_string(),
+    )
+    .await?;
+    let purpose: Option<(String, String)> =
+        sqlx::query_as("SELECT kind, current_version FROM consent_purposes WHERE code = $1")
+            .bind(&request.purpose)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (kind, current_version) = purpose.ok_or(ApiError::Unprocessable("unknown_purpose"))?;
+    if request.version != current_version {
+        return Err(ApiError::Conflict("outdated_version"));
+    }
+    if kind == "notice_acknowledgement" && !request.granted {
+        return Err(ApiError::BadRequest("notice_cannot_be_withdrawn"));
+    }
+    let (recorded_at,): (DateTime<Utc>,) = sqlx::query_as(
+        "INSERT INTO consent_records (user_id, purpose, version, granted, platform)
+         VALUES ($1, $2, $3, $4, $5) RETURNING recorded_at",
+    )
+    .bind(user.user_id)
+    .bind(&request.purpose)
+    .bind(&request.version)
+    .bind(request.granted)
+    .bind(&request.platform)
+    .fetch_one(&mut *tx)
+    .await?;
+    audit::record(
+        &mut tx,
+        audit::Event {
+            organization_id: None,
+            actor_user_id: Some(user.user_id),
+            action: "privacy.consent_recorded",
+            target_type: Some("user"),
+            target_id: Some(&user.user_id.to_string()),
+            outcome: audit::Outcome::Success,
+            details: json!({
+                "purpose": request.purpose, "version": request.version, "granted": request.granted,
+            }),
         },
     )
     .await?;
     tx.commit().await?;
-    mfa::notify(&state, phone, SMS_ERASED);
-    Ok(StatusCode::NO_CONTENT.into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "purpose": request.purpose,
+            "version": request.version,
+            "granted": request.granted,
+            "recorded_at": recorded_at,
+        })),
+    ))
 }

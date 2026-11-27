@@ -99,6 +99,11 @@ impl AppState {
         events::start_listener(self)
     }
 
+    /// Süresi dolan hesap silme taleplerini saatte bir uygular.
+    pub fn start_erasure_job(&self) -> tokio::task::JoinHandle<()> {
+        privacy::start_erasure_job(self)
+    }
+
     /// Push dağıtıcısını ve kaçırılan olay taramasını başlatır.
     pub fn start_push_dispatcher(&self) -> tokio::task::JoinHandle<()> {
         push::start_dispatcher(self)

@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.push = push;
     state.start_event_listener();
     state.start_push_dispatcher();
+    state.start_erasure_job();
 
     // Eski deneme sayacı pencerelerini saatte bir temizle.
     tokio::spawn(async move {

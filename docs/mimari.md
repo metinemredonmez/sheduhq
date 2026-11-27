@@ -195,7 +195,7 @@ Uç noktalar (`/v1/organizations/{org_id}` altında): `GET /members`, `PATCH`/`D
 ## Kişisel veriler (KVKK)
 
 Uç noktalar (`/v1`): `PATCH me` (görünen ad), `POST me/phone/start`, `POST me/phone/complete`,
-`POST me/data-export`, `POST me/delete`. KVKK md. 11'deki bilgi alma, düzeltme ve silme
+`POST me/data-export`, `POST me/delete`, `GET`/`POST me/consents` (rıza defteri). KVKK md. 11'deki bilgi alma, düzeltme ve silme
 haklarının teknik karşılığıdır; aydınlatma metni ve hukuki kararlar açık sorulardadır.
 
 - **Ortak koşul:** dışa aktarma, numara değişimi ve silme parolayla yeniden doğrulama ister; MFA
@@ -209,15 +209,27 @@ haklarının teknik karşılığıdır; aydınlatma metni ve hukuki kararlar aç
 - **Düzeltme:** görünen ad doğrudan değişir. Numara değişimi yeni numaraya giden SMS koduyla
   tamamlanır; kod değişimi başlatan kullanıcıya bağlıdır. Yeni numara başka hesaptaysa kod
   gönderilmez, yanıt aynıdır. Değişiklik eski numaraya bildirilir. Günde 3 başlatma.
-- **Silme (anonimleştirme ve yok etme):** veritabanındaki `erase_account()` tek işlemde yapar.
-  Kişinin tek başına sahibi olduğu organizasyonlar bütün verisiyle (paneller, olaylar, komutlar,
-  davetler) silinir. Diğer organizasyonlardaki üyelikler ve yetkiler silinir. Numarasına gelmiş
-  davetler, cihazlar, oturumlar, MFA kayıtları silinir. Başka organizasyonlardaki güvenlik
-  kayıtları (komut, bildirim teslimi, denetim kaydı) korunur; kullanıcı satırı ad, numara,
-  e-posta ve parola olmadan "Silinmiş kullanıcı" olarak kalır, böylece bu kayıtlar kişiye
-  bağlanamaz. Başka üyesi olan organizasyonun sahibi önce sahipliği devretmelidir (yanıt hangi
-  organizasyonlar olduğunu söyler). Silme kullanıcıya SMS ile bildirilir. Aynı numarayla yeniden
-  kayıt olunabilir; bu yeni bir hesaptır.
+- **Silme talebi (30 gün geri alınabilir):** talep hesabı hemen kapatır: bütün oturumlar biter,
+  push token'ları silinir, hesap bildirim almaz. Kalıcı silme 30 gün sonraya planlanır ve kişiye
+  SMS ile bildirilir. Bu sürede tam doğrulamayla (parola ve MFA açıksa ikinci adım) giriş yapan
+  kişinin talebi iptal olur; yalnızca parola yetmez. Parolasını unutan kişi bu sürede parola
+  sıfırlayıp giriş yapabilir. Başka üyesi olan organizasyonun sahibi talep edemez, önce
+  sahipliği devretmelidir (yanıt hangi organizasyonlar olduğunu söyler).
+- **Kalıcı silme (anonimleştirme ve yok etme):** API'deki silme işi saatte bir süresi dolan
+  talepleri bulur (birden fazla kopyada `SKIP LOCKED` ile tek kez) ve veritabanındaki
+  `erase_account()`'ı tek işlemde çalıştırır. Kişinin tek başına sahibi olduğu organizasyonlar
+  bütün verisiyle (paneller, olaylar, komutlar, davetler) silinir. Diğer organizasyonlardaki
+  üyelikler ve yetkiler silinir. Numarasına gelmiş davetler, cihazlar, oturumlar, MFA kayıtları
+  silinir. Başka organizasyonlardaki güvenlik kayıtları (komut, bildirim teslimi, denetim kaydı)
+  ve rıza kayıtları korunur; kullanıcı satırı ad, numara, e-posta ve parola olmadan "Silinmiş
+  kullanıcı" olarak kalır, böylece bu kayıtlar kişiye bağlanamaz. Silme kullanıcıya SMS ile
+  bildirilir. Aynı numarayla yeniden kayıt olunabilir; bu yeni bir hesaptır.
+- **Rıza defteri:** amaçlar (`consent_purposes`) ve güncel metin sürümleri veritabanındadır;
+  başlangıçta `privacy_notice` (aydınlatma metninin gösterildiği kaydı, geri çekilmez) ve
+  `marketing` (açık rıza) var, sürümleri taslaktır. Her verme ve geri çekme ayrı bir kayıttır;
+  kayıtlar değiştirilemez ve silinemez. Güncel durum son kayıttır; eski metin sürümüne verilen
+  yanıt kabul edilmez, metin değişince istemci yeniden sorar (`up_to_date`). Dışa aktarmada
+  bütün geçmiş yer alır.
 
 ## Komut akışı (kurma / kapatma)
 

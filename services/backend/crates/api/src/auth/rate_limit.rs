@@ -173,3 +173,10 @@ pub const PHONE_CHANGE_PER_USER: Budget = Budget {
     window_secs: 24 * 60 * 60,
     limit: 3,
 };
+
+/// Rıza kaydı, kullanıcı başına saatte (defter yalnızca eklenir; şişirilmesin, RES-01).
+pub const CONSENT_PER_USER: Budget = Budget {
+    scope: "consent:user",
+    window_secs: 60 * 60,
+    limit: 30,
+};
