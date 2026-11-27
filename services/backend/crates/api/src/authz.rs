@@ -159,6 +159,18 @@ pub async fn permissions(
     panel_id: Uuid,
     partition_id: Option<Uuid>,
 ) -> ApiResult<Permissions> {
+    // Panel bu organizasyona ait değilse hiçbir yetki yok. RLS de bunu sağlar; açık filtre,
+    // veritabanı rolü yanlış ayarlansa bile kiracı sınırını korur (ikinci bariyer).
+    let (in_org,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM panels WHERE id = $1 AND organization_id = $2)",
+    )
+    .bind(panel_id)
+    .bind(ctx.organization_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !in_org {
+        return Ok(Permissions::default());
+    }
     if ctx.role.is_manager() {
         return Ok(Permissions::ALL);
     }
@@ -167,12 +179,13 @@ pub async fn permissions(
         "SELECT id, partition_id, can_view_events, can_arm, can_disarm, can_bypass, always_open,
                 extract(epoch FROM valid_from)::bigint, extract(epoch FROM expires_at)::bigint
            FROM access_grants
-          WHERE user_id = $1 AND panel_id = $2
+          WHERE user_id = $1 AND panel_id = $2 AND organization_id = $4
             AND ($3::uuid IS NULL OR partition_id IS NULL OR partition_id = $3)",
     )
     .bind(ctx.user.user_id)
     .bind(panel_id)
     .bind(partition_id)
+    .bind(ctx.organization_id)
     .fetch_all(&mut *conn)
     .await?;
     let sees_all = ctx.role.sees_all_panels();
@@ -233,12 +246,13 @@ pub async fn visible_partitions(
     }
     let rows: Vec<(Option<Uuid>,)> = sqlx::query_as(
         "SELECT partition_id FROM access_grants
-          WHERE user_id = $1 AND panel_id = $2 AND can_view_events
+          WHERE user_id = $1 AND panel_id = $2 AND organization_id = $3 AND can_view_events
             AND (valid_from IS NULL OR valid_from <= now())
             AND (expires_at IS NULL OR expires_at > now())",
     )
     .bind(ctx.user.user_id)
     .bind(panel_id)
+    .bind(ctx.organization_id)
     .fetch_all(conn)
     .await?;
     if rows.iter().any(|(partition,)| partition.is_none()) {
@@ -290,10 +304,13 @@ pub async fn session_active(conn: &mut PgConnection, user: AuthUser) -> Result<b
         "SELECT 1 FROM users u
           WHERE u.id = $1 AND u.status = 'active'
             AND EXISTS (SELECT 1 FROM refresh_tokens r
-                         WHERE r.family_id = $2 AND r.user_id = $1 AND r.revoked_at IS NULL)",
+                         WHERE r.family_id = $2 AND r.user_id = $1 AND r.revoked_at IS NULL)
+            AND (SELECT min(f.created_at) FROM refresh_tokens f WHERE f.family_id = $2)
+                > now() - make_interval(days => $3)",
     )
     .bind(user.user_id)
     .bind(user.session_id)
+    .bind(crate::auth::tokens::SESSION_MAX_DAYS)
     .fetch_optional(conn)
     .await?;
     Ok(active.is_some())

@@ -197,9 +197,10 @@ async fn render(state: &AppState, ctx: &OrgContext, event: &OrgEvent) -> ApiResu
         "command" => {
             let id: Uuid = event.id.parse().map_err(|_| ApiError::Internal)?;
             let row: Option<CommandRow> = sqlx::query_as(
-                "SELECT id, panel_id, partition_id, kind, status, rejection_reason, user_id FROM commands WHERE id = $1",
+                "SELECT id, panel_id, partition_id, kind, status, rejection_reason, user_id FROM commands WHERE id = $1 AND organization_id = $2",
             )
             .bind(id)
+            .bind(fresh.organization_id)
             .fetch_optional(&mut *tx)
             .await?;
             row.filter(|r| fresh.role.is_manager() || r.6 == fresh.user.user_id).map(
@@ -216,9 +217,10 @@ async fn render(state: &AppState, ctx: &OrgContext, event: &OrgEvent) -> ApiResu
                 None
             } else {
                 let row: Option<(Uuid, Uuid, i16, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-                    "SELECT id, panel_id, number, state, state_changed_at FROM partitions WHERE id = $1",
+                    "SELECT id, panel_id, number, state, state_changed_at FROM partitions WHERE id = $1 AND organization_id = $2",
                 )
                 .bind(id)
+                .bind(fresh.organization_id)
                 .fetch_optional(&mut *tx)
                 .await?;
                 row.map(|(id, panel_id, number, state, changed)| {
@@ -242,11 +244,34 @@ async fn render(state: &AppState, ctx: &OrgContext, event: &OrgEvent) -> ApiResu
             );
             let row: Option<EventRow> = sqlx::query_as(
                 "SELECT id, panel_id, kind, alarm_kind, arm_mode, priority, partition_number, zone_number, occurred_at
-                   FROM panel_events WHERE id = $1",
+                   FROM panel_events WHERE id = $1 AND organization_id = $2",
             )
             .bind(id)
+            .bind(fresh.organization_id)
             .fetch_optional(&mut *tx)
             .await?;
+            // Bölüme ait olay yalnızca o bölümü görebilene gider (olay geçmişi, push ve bildirim
+            // merkeziyle aynı kural); bölümsüz (panel düzeyi) olaylar paneli gören herkese.
+            let row = match row {
+                Some(row) if row.6.is_some() => {
+                    let visible = authz::visible_partitions(&mut tx, &fresh, event.panel).await?;
+                    let allowed = match visible {
+                        None => true,
+                        Some(ids) => {
+                            let numbers: Vec<(i16,)> = sqlx::query_as(
+                                "SELECT number FROM partitions WHERE id = ANY($1) AND organization_id = $2",
+                            )
+                            .bind(&ids)
+                            .bind(fresh.organization_id)
+                            .fetch_all(&mut *tx)
+                            .await?;
+                            numbers.iter().any(|(n,)| Some(*n) == row.6)
+                        }
+                    };
+                    allowed.then_some(row)
+                }
+                other => other,
+            };
             row.map(|(id, panel_id, kind, alarm_kind, arm_mode, priority, partition, zone, occurred)| {
                 json!({ "type": "panel_event", "id": id, "panel_id": panel_id, "kind": kind,
                         "alarm_kind": alarm_kind, "arm_mode": arm_mode, "priority": priority,

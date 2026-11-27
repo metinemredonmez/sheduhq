@@ -197,9 +197,12 @@ pub async fn dispatch(
     set_context(&mut tx, None, Some(organization_id)).await?;
 
     let claimed: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM panel_events WHERE id = $1 AND notified_at IS NULL FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM panel_events
+          WHERE id = $1 AND organization_id = $2 AND notified_at IS NULL
+          FOR UPDATE SKIP LOCKED",
     )
     .bind(event_id)
+    .bind(organization_id)
     .fetch_optional(&mut *tx)
     .await?;
     if claimed.is_none() {

@@ -21,6 +21,9 @@ pub const AUDIENCE: &str = "shedu-api";
 const TOKEN_TYPE_ACCESS: &str = "access";
 pub const ACCESS_TTL_SECS: i64 = 10 * 60;
 pub const REFRESH_TTL_DAYS: i64 = 30;
+/// Oturumun (refresh ailesi) mutlak ömrü: yenileme ile uzamaz; dolunca yeniden giriş gerekir
+/// (SES-03).
+pub const SESSION_MAX_DAYS: i32 = 90;
 const LEEWAY_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

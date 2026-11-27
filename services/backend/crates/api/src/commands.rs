@@ -247,11 +247,12 @@ pub async fn create_command(
     let target: Option<(String, bool, bool, String)> = sqlx::query_as(
         "SELECT p.connectivity, p.ready_to_arm, p.simulated, pt.state
            FROM panels p JOIN partitions pt ON pt.panel_id = p.id
-          WHERE p.id = $1 AND pt.id = $2
+          WHERE p.id = $1 AND pt.id = $2 AND p.organization_id = $3
             FOR UPDATE OF pt",
     )
     .bind(panel_id)
     .bind(request.partition_id)
+    .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
     let (connectivity, ready_to_arm, simulated, state_text) = target.ok_or(ApiError::NotFound)?;
@@ -355,9 +356,10 @@ pub async fn create_command(
     let view: CommandView = sqlx::query_as(
         "SELECT id, panel_id, partition_id, kind, zones, status, rejection_reason,
                 requested_at, completed_at, user_id
-           FROM commands WHERE id = $1",
+           FROM commands WHERE id = $1 AND organization_id = $2",
     )
     .bind(command_id)
+    .bind(org_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -382,9 +384,10 @@ pub async fn get_command(
     let view: Option<CommandView> = sqlx::query_as(
         "SELECT id, panel_id, partition_id, kind, zones, status, rejection_reason,
                 requested_at, completed_at, user_id
-           FROM commands WHERE id = $1",
+           FROM commands WHERE id = $1 AND organization_id = $2",
     )
     .bind(command_id)
+    .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;

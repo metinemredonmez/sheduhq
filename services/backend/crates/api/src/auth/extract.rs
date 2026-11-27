@@ -42,10 +42,13 @@ impl FromRequestParts<AppState> for AuthUser {
             "SELECT 1 FROM users u
               WHERE u.id = $1 AND u.status = 'active'
                 AND EXISTS (SELECT 1 FROM refresh_tokens r
-                             WHERE r.family_id = $2 AND r.user_id = $1 AND r.revoked_at IS NULL)",
+                             WHERE r.family_id = $2 AND r.user_id = $1 AND r.revoked_at IS NULL)
+                AND (SELECT min(f.created_at) FROM refresh_tokens f WHERE f.family_id = $2)
+                    > now() - make_interval(days => $3)",
         )
         .bind(claims.sub)
         .bind(claims.sid)
+        .bind(super::tokens::SESSION_MAX_DAYS)
         .fetch_optional(&state.db)
         .await?;
 

@@ -34,6 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options: PgConnectOptions = config.database_url.parse()?;
     let pool = db::connect(options, config.database_role.clone()).await?;
+    // RLS'yi aşan bir rolle (süper kullanıcı, tablo sahibi) başlamak yerine dur (AZ-02, EXC-01).
+    db::verify_least_privilege(&pool).await?;
     let mut state = AppState::new(
         pool.clone(),
         &config.jwt_secret,

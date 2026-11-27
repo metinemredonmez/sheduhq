@@ -724,3 +724,67 @@ async fn websocket_is_closed_after_logout(_: PgPoolOptions, connect: PgConnectOp
     assert!(closed, "bağlantı kapanmalı");
     let _ = home;
 }
+
+/// Denetim bulgusu 2: WebSocket panel olaylarında bölüm yetkisi uygulanır.
+#[sqlx::test(migrations = "../../migrations")]
+async fn websocket_respects_partition_permissions(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let (panel, home, garage) = demo(&app, &owner, &org).await;
+    let (member, member_id, _) = app.user(OTHER_PHONE).await;
+    add_member(&app, &org, &member_id, "member").await;
+    grant(
+        &app,
+        &org,
+        &member_id,
+        &panel,
+        Some(&garage),
+        true,
+        true,
+        true,
+    )
+    .await;
+    let addr = serve(&app).await;
+    let mut socket = open(addr, &org, Some(&member), None)
+        .await
+        .expect("bağlantı");
+
+    // Önce üyenin göremediği Ev, sonra görebildiği Garaj kurulur.
+    let (_, body) = command(&app, &owner, &org, &panel, &home, "arm_away", None, &key()).await;
+    wait_status(&app, &owner, &org, &s(&body, "id"), "succeeded").await;
+    let (_, body) = command(
+        &app,
+        &owner,
+        &org,
+        &panel,
+        &garage,
+        "arm_away",
+        None,
+        &key(),
+    )
+    .await;
+    wait_status(&app, &owner, &org, &s(&body, "id"), "succeeded").await;
+    let (messages, _) = collect(&mut socket, Duration::from_secs(5), |m| {
+        m.iter()
+            .any(|x| x["type"] == "panel_event" && x["partition_number"] == 2)
+    })
+    .await;
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["type"] == "panel_event" && m["partition_number"] == 2),
+        "garaj olayı gelmeli: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m["type"] == "panel_event" && m["partition_number"] == 1),
+        "ev olayı gelmemeli: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m["type"] == "partition" && m["id"] == home.as_str()),
+        "ev bölümü durumu gelmemeli: {messages:?}"
+    );
+}

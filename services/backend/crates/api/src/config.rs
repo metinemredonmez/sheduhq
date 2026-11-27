@@ -103,6 +103,10 @@ impl Config {
         }
 
         let database_role = get("SHEDU_DB_ROLE").filter(|role| !role.is_empty());
+        // Üretimde uygulama her zaman RLS'ye tabi rolle çalışır; açılışta ayrıca doğrulanır.
+        if environment == Environment::Production && database_role.is_none() {
+            return Err(ConfigError::Missing("SHEDU_DB_ROLE"));
+        }
 
         let jwt_secret = secret(&get, "SHEDU_JWT_SECRET")?;
         let hmac_secret = secret(&get, "SHEDU_HMAC_SECRET")?;
@@ -193,6 +197,25 @@ mod tests {
             ("SHEDU_DATA_KEY", DATA),
         ]));
         assert_eq!(result.err(), Some(ConfigError::DatabaseTlsRequired));
+    }
+
+    #[test]
+    fn production_requires_an_application_role() {
+        let result = Config::from_lookup(lookup(&[
+            ("DATABASE_URL", "postgres://db/shedu?sslmode=verify-full"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
+        ]));
+        assert_eq!(result.err(), Some(ConfigError::Missing("SHEDU_DB_ROLE")));
+        let ok = Config::from_lookup(lookup(&[
+            ("DATABASE_URL", "postgres://db/shedu?sslmode=verify-full"),
+            ("SHEDU_DB_ROLE", "shedu_app"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
+        ]));
+        assert!(ok.is_ok());
     }
 
     #[test]

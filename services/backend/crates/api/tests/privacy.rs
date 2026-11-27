@@ -241,10 +241,24 @@ async fn privacy_actions_need_a_verified_session_when_mfa_is_on(
     connect: PgConnectOptions,
 ) {
     let app = app(connect).await;
-    let (verified, user_id, _) = app.user(PHONE).await;
-    let (_, password_only) = app.login(PHONE, PASSWORD).await;
-    let password_only = s(&password_only, "access_token");
-    app.enable_mfa(&verified).await;
+    let (password_only, user_id, _) = app.user(PHONE).await;
+    let secret = app.enable_mfa(&password_only).await;
+    // MFA açılınca diğer oturumlar kapandığı için faktörü açık kullanıcının parolalı oturumu normal
+    // akışta kalmaz; adım yükseltme yine de ikinci bariyerdir: oturumun ikinci adım kaydı silinir.
+    sqlx::query("DELETE FROM session_factors WHERE user_id = $1::uuid")
+        .bind(&user_id)
+        .execute(&app.admin)
+        .await
+        .expect("silme");
+    let (_, login) = app.login(PHONE, PASSWORD).await;
+    let (status, tokens) = app
+        .post(
+            "/v1/auth/mfa/verify",
+            json!({ "mfa_token": s(&login, "mfa_token"), "code": totp_code(&secret, 1) }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    let verified = s(&tokens, "access_token");
 
     for (path, body) in [
         ("/v1/me/data-export", json!({ "password": PASSWORD })),

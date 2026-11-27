@@ -36,6 +36,7 @@ use crate::{
     auth::{AuthUser, mfa, rate_limit},
     db::set_context,
     error::{ApiError, ApiResult},
+    invitations,
 };
 
 /// Dışa aktarılan komut ve güvenlik olayı sayısı üst sınırı (veritabanı da uygular).
@@ -243,9 +244,10 @@ pub async fn export(
         let mut rows: Vec<GrantData> = sqlx::query_as(
             "SELECT id, organization_id, panel_id, partition_id, can_view_events, can_arm,
                     can_disarm, can_bypass, always_open, valid_from, expires_at
-               FROM access_grants WHERE user_id = $1 ORDER BY created_at",
+               FROM access_grants WHERE user_id = $1 AND organization_id = $2 ORDER BY created_at",
         )
         .bind(user.user_id)
+        .bind(organization.id)
         .fetch_all(&mut *tx)
         .await?;
         let ids: Vec<Uuid> = rows.iter().map(|g| g.id).collect();
@@ -382,6 +384,20 @@ pub async fn delete_account(
         .bind(user.user_id)
         .execute(&mut *tx)
         .await?;
+    // Gönderdiği açık davetler iptal edilir: kabul edilirse organizasyon tek üyeli olmaktan çıkar
+    // ve kalıcı silme takılır. Davetler kiracı verisidir; her organizasyon kendi bağlamında.
+    let organizations: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT organization_id FROM memberships WHERE user_id = $1")
+            .bind(user.user_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut revoked_invitations = 0;
+    for (organization_id,) in organizations {
+        set_context(&mut tx, Some(user.user_id), Some(organization_id)).await?;
+        revoked_invitations +=
+            invitations::revoke_sent_by(&mut tx, organization_id, user.user_id).await?;
+    }
+    set_context(&mut tx, Some(user.user_id), None).await?;
     audit::record(
         &mut tx,
         audit::Event {
@@ -391,7 +407,7 @@ pub async fn delete_account(
             target_type: Some("user"),
             target_id: Some(&user.user_id.to_string()),
             outcome: audit::Outcome::Success,
-            details: json!({ "deletion_due_at": due }),
+            details: json!({ "deletion_due_at": due, "invitations_revoked": revoked_invitations }),
         },
     )
     .await?;

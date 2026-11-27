@@ -39,12 +39,26 @@ pub async fn app(connect: PgConnectOptions) -> TestApp {
 
 /// `simulator_delay`: sanal panelde komutun tamamlanma gecikmesi.
 pub async fn app_with(connect: PgConnectOptions, simulator_delay: Duration) -> TestApp {
+    build(connect, simulator_delay, Some("shedu_app")).await
+}
+
+/// RLS'yi aşan (süper kullanıcı) bağlantıyla kurulmuş uygulama. Yalnızca kiracı filtrelerinin
+/// RLS olmadan da geçerli olduğunu sınamak için; gerçek kurulumda API böyle başlamaz.
+pub async fn app_bypassing_rls(connect: PgConnectOptions) -> TestApp {
+    build(connect, Duration::from_millis(50), None).await
+}
+
+async fn build(
+    connect: PgConnectOptions,
+    simulator_delay: Duration,
+    role: Option<&str>,
+) -> TestApp {
     let admin = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(connect.clone())
         .await
         .expect("yönetici bağlantısı");
-    let pool = db::pool_options(Some("shedu_app".into()))
+    let pool = db::pool_options(role.map(str::to_owned))
         .max_connections(8)
         .connect_with(connect)
         .await

@@ -96,11 +96,13 @@ pub async fn list_events(
         match authz::visible_partitions(&mut tx, &ctx, panel_id).await? {
             None => None,
             Some(ids) => {
-                let rows: Vec<(i16,)> =
-                    sqlx::query_as("SELECT number FROM partitions WHERE id = ANY($1)")
-                        .bind(&ids)
-                        .fetch_all(&mut *tx)
-                        .await?;
+                let rows: Vec<(i16,)> = sqlx::query_as(
+                    "SELECT number FROM partitions WHERE id = ANY($1) AND organization_id = $2",
+                )
+                .bind(&ids)
+                .bind(org_id)
+                .fetch_all(&mut *tx)
+                .await?;
                 Some(rows.into_iter().map(|(n,)| n).collect())
             }
         };
@@ -108,7 +110,7 @@ pub async fn list_events(
     let mut events: Vec<EventView> = sqlx::query_as(
         "SELECT id, kind, alarm_kind, arm_mode, priority, partition_number, zone_number, source, occurred_at
            FROM panel_events
-          WHERE panel_id = $1
+          WHERE panel_id = $1 AND organization_id = $7
             AND ($2::bigint IS NULL OR id < $2)
             AND ($3::timestamptz IS NULL OR occurred_at >= $3)
             AND ($4::timestamptz IS NULL OR occurred_at <= $4)
@@ -122,6 +124,7 @@ pub async fn list_events(
     .bind(query.to)
     .bind(&partition_numbers)
     .bind(limit + 1)
+    .bind(org_id)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -227,10 +230,12 @@ pub async fn simulate_alarm(
     if !ctx.role.is_manager() {
         return Err(ApiError::Forbidden("not_permitted"));
     }
-    let simulated: Option<(bool,)> = sqlx::query_as("SELECT simulated FROM panels WHERE id = $1")
-        .bind(panel_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let simulated: Option<(bool,)> =
+        sqlx::query_as("SELECT simulated FROM panels WHERE id = $1 AND organization_id = $2")
+            .bind(panel_id)
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     match simulated {
         None => return Err(ApiError::NotFound),
         Some((false,)) => return Err(ApiError::Conflict("not_simulated")),

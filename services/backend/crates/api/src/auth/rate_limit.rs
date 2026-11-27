@@ -180,3 +180,61 @@ pub const CONSENT_PER_USER: Budget = Budget {
     window_secs: 60 * 60,
     limit: 30,
 };
+
+/// Başarısız doğrulama denemeleri, hesap başına 24 saatte: SMS kodlarında telefon, ikinci adımda
+/// kullanıcı. Kod başına 5 deneme sınırına ek olarak yeni kod isteyerek veya IP değiştirerek
+/// tahminin sürdürülmesini engeller (AUT-02; NIST SP 800-63B en fazla 100 ardışık hata ister).
+/// Sınır dolunca o hesapta doğru kod da kabul edilmez; pencere bitince açılır (kalıcı kilit yok).
+pub const CODE_FAILURES_PER_PHONE: Budget = Budget {
+    scope: "fail:phone",
+    window_secs: 24 * 60 * 60,
+    limit: 20,
+};
+pub const MFA_FAILURES_PER_USER: Budget = Budget {
+    scope: "fail:mfa-user",
+    window_secs: 24 * 60 * 60,
+    limit: 20,
+};
+
+/// Sayacı artırmadan, pencerede sınırın dolup dolmadığını denetler.
+pub async fn ensure_available(
+    conn: &mut PgConnection,
+    hmac_secret: &[u8],
+    budget: Budget,
+    value: &str,
+) -> ApiResult<()> {
+    let key = rate_key(hmac_secret, budget.scope, value);
+    let row: Option<(i32, i32)> = sqlx::query_as(
+        "SELECT hits,
+                greatest(1, ceil(extract(epoch FROM window_start) + $2 - extract(epoch FROM now())))::int
+           FROM rate_limit_buckets
+          WHERE key = $1 AND window_start = to_timestamp(floor(extract(epoch FROM now()) / $2) * $2)",
+    )
+    .bind(key)
+    .bind(budget.window_secs)
+    .fetch_optional(conn)
+    .await?;
+    match row {
+        Some((hits, retry_after)) if hits >= budget.limit => {
+            tracing::warn!(scope = budget.scope, "hesap başına hata sınırı dolu");
+            Err(ApiError::TooManyRequests {
+                retry_after_secs: u64::try_from(retry_after).unwrap_or(60),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Başarısız denemeyi sayar; sınır bu denemeyle dolsa da hata döndürmez (bir sonraki deneme
+/// `ensure_available` ile reddedilir).
+pub async fn record_failure(
+    conn: &mut PgConnection,
+    hmac_secret: &[u8],
+    budget: Budget,
+    value: &str,
+) -> ApiResult<()> {
+    match hit(conn, hmac_secret, budget, value).await {
+        Ok(()) | Err(ApiError::TooManyRequests { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
+}

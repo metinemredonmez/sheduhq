@@ -153,13 +153,31 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   personelinin MFA'sız oturumunda olaylar gösterilmez, kilitli denir; okundu bilgisi başkası
   adına yazılamaz, başka organizasyonun olayına bağlanamaz. Görünürlük kuralı, katılma zamanı ve
   MFA kilidi bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
+- **27 Kasım denetim düzeltmeleri (AZ-02, EXC-01, AZ-01, API-04, SES-03, SES-04, DAT-01, AUT-02):**
+  bağımsız kod denetiminin 1 yüksek ve 4 orta bulgusu düzeltildi; her biri için önce açığı
+  gösteren, düzeltmeden önce kalan test yazıldı (`services/backend/crates/api/tests/hardening.rs`,
+  `panels.rs`): RLS'yi aşan rolle açılış reddi ve RLS olmadan da kiracı filtrelerinin tuttuğu
+  (panel listesi ve ayrıntısı, geçmiş, komut, başka kiracının paneline komut, bildirim merkezi);
+  WebSocket'te bölüm yetkisi; MFA açılınca diğer oturumların ve cihaz bildirimlerinin kapanması;
+  90 günlük mutlak oturum ömrü; silme talebinde gönderilmiş davetlerin iptali, etkin olmayan
+  kişinin davetinin kabul edilmemesi ve kalıcı silmenin takılmaması; hesap başına 24 saatte 20
+  başarısız doğrulama sınırı (SMS ve ikinci adım).
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
   - AUT-02: kademeli doğrulama (ör. CAPTCHA) yok; yalnızca pencere bazlı sınır var.
-  - SES-03: mutlak oturum ömrü (refresh ailesi için üst süre) yok.
   - KEY-03: JWT anahtarı tek; planlı rotasyon için `kid` ile anahtar kümesi eklenecek.
-  - NET-03: ters vekil arkasında gerçek IP için güvenilir vekil listesi yok.
+  - NET-03: ters vekil arkasında gerçek IP için güvenilir vekil listesi yok; dağıtımdan önce
+    çözülmeli (aksi halde bütün IP sayaçları tek vekil adresinde birleşir).
+  - AUT-02 (denetim, düşük): hesap başına sayaçlar başkası tarafından tüketilebilir; kurbanın
+    girişi veya sıfırlama kodu pencere boyunca engellenebilir. Kalıcı kilit olmadığı için bilerek
+    kabul edildi; kademeli doğrulama (CAPTCHA) ile hafifletilecek.
+  - RES-01 (denetim, düşük): WebSocket'te kullanıcı başına bağlantı sınırı yok; her olayda her
+    bağlantı için veritabanı işlemi açılıyor. Bağlantı sınırı ve olay başına toplu yetki
+    hesaplaması eklenecek.
+  - ARC-04 (denetim, düşük): kimlik tabloları RLS dışında olduğundan ele geçirilmiş API
+    organizasyon kimliklerini okuyabilir; `shedu-admin`'de işlemi yapanın adı doğrulanmaz
+    (sunucu hesabına güvenilir).
   - AZ-01: izleme merkezinin müşteri organizasyonlarına erişimi (organizasyonlar arası operatör)
     yok; izleme merkezi modeli netleşince ayrı politika olarak tasarlanacak.
   - AUT-01/PKY: passkey (oltalamaya dayanıklı faktör) yok; yalnızca TOTP. Shedu'nun kendi

@@ -79,15 +79,23 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
   oturumun iptal edilmemiş olduğu veritabanından kontrol edilir; çıkış anında etkilidir.
 - **Refresh token:** 30 gün, her kullanımda yenilenir. Kullanılmış bir token yeniden gelirse bütün
   oturum ailesi iptal edilir ve denetim kaydına yazılır. İstemci aynı oturumun yenilemesini tek
-  seferde yapmalıdır (single-flight).
+  seferde yapmalıdır (single-flight). Oturumun mutlak ömrü 90 gündür: yenileme ile uzamaz, dolunca
+  access token da geçersiz olur ve yeniden giriş gerekir.
 - **Deneme sınırları:** hesap, IP ve bütün sistem için ayrı sayaçlar; PostgreSQL'de, bütün API
-  kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır.
+  kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır. Kod
+  başına 5 denemeye ek olarak hesap başına 24 saatte en fazla 20 başarısız doğrulama (SMS
+  kodunda telefon, ikinci adımda kullanıcı başına); dolunca o hesapta doğru kod da kabul edilmez.
+  Bu sayaçlar başkası tarafından tüketilebilir (kurbanın girişi geçici olarak engellenebilir);
+  kalıcı kilit olmadığı için bilerek kabul edilen bir dengedir.
 - **Dışarıya açılma:** API varsayılan olarak yalnızca `127.0.0.1`'i dinler. Dışarıdan yalnızca
   TLS'li ters vekil üzerinden erişilir; doğrudan erişime kapalıdır (NET-02). Ters vekil arkasında
   gerçek istemci IP'si için güvenilir vekil listesi henüz yapılandırılmadı (NET-03).
 - **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı TLS istemiyorsa veya
   sırlar (`SHEDU_JWT_SECRET`, `SHEDU_HMAC_SECRET`, `SHEDU_DATA_KEY`) kısa ya da aynıysa API
-  başlamaz.
+  başlamaz. Üretimde `SHEDU_DB_ROLE` zorunludur ve her ortamda açılışta bağlantı rolü denetlenir:
+  süper kullanıcı, BYPASSRLS yetkili rol veya tabloların sahibi RLS'den muaf olduğu için API ve
+  `shedu-admin` böyle bir rolle başlamaz. Kiracı sorgularında organizasyon filtresi ayrıca açıkça
+  yazılır; RLS ikinci değil, iki bariyerden biridir.
 
 ## İki adımlı doğrulama (MFA)
 
@@ -274,7 +282,11 @@ shedu-admin user enable --phone +90… --reason "…"
 - **Ayrı rol:** araç `shedu_admin` veritabanı rolüyle bağlanır (gerçek giriş rolü bu role üye
   yapılır, parolası API'ninkinden ayrıdır: `CREATE ROLE … LOGIN; GRANT shedu_admin TO …`). Bu
   rol uygulama rolünün yetkilerini miras alır ve RLS'ye aynen tabidir; ek olarak yalnızca bütün
-  organizasyonların özetini veren fonksiyonu çalıştırabilir. API'nin rolü bu listeyi alamaz.
+  organizasyonların özetini veren fonksiyonu çalıştırabilir ve bayrak ile sürüm politikası
+  yazabilir. API'nin rolü bu fonksiyonu çalıştıramaz; ancak kimlik tabloları (kullanıcılar,
+  üyelikler) RLS dışında olduğundan, API ele geçirilirse organizasyon kimlikleri yine okunabilir.
+  Ayrımın amacı yönetim işlemlerini sınırlamaktır, ele geçirilmiş API'ye karşı tam bir kalkan
+  değildir.
 - **Gerekçe ve iz:** her değişiklik `--reason` (10–300 karakter) ister; işlemi yapan kişi
   (`--operator` ya da sunucudaki kullanıcı adı) ve gerekçe denetim kaydına yazılır. Telefon
   numarası denetim kaydına yazılmaz, ekranda maskelenir.

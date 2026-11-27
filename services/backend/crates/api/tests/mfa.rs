@@ -12,6 +12,7 @@ use shedu_api::auth::totp;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 const OTHER: &str = "+905557776655";
+const STAFF: &str = "+905552221100";
 
 async fn audit_count(app: &TestApp, action: &str, outcome: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM audit_log WHERE action = $1 AND outcome = $2")
@@ -300,9 +301,16 @@ async fn business_staff_need_a_verified_session_everywhere(
     let app = app(connect).await;
     app.start_background().await;
     let (owner, _, org) = app.user(PHONE).await;
-    // Parolayla açılmış ikinci oturum (MFA açılmadan önce).
-    let (_, second) = app.login(PHONE, PASSWORD).await;
-    let second = s(&second, "access_token");
+    // MFA açmamış ikinci personel (yönetici): yalnızca parolalı oturum.
+    let (second, staff_id, _) = app.user(STAFF).await;
+    sqlx::query(
+        "INSERT INTO memberships (user_id, organization_id, role) VALUES ($1::uuid, $2::uuid, 'admin')",
+    )
+    .bind(&staff_id)
+    .bind(&org)
+    .execute(&app.admin)
+    .await
+    .expect("üyelik");
     let (home_user, _, home_org) = app.user(OTHER).await;
 
     sqlx::query("UPDATE organizations SET kind = 'business' WHERE id = $1::uuid")
@@ -322,7 +330,7 @@ async fn business_staff_need_a_verified_session_everywhere(
         .await;
     assert_eq!(code, StatusCode::OK);
 
-    // MFA'yı açan oturum erişir; yalnızca parolalı eski oturum erişemez.
+    // MFA'yı açan oturum erişir; MFA'sız personelin parolalı oturumu erişemez.
     let secret = app.enable_mfa(&owner).await;
     let (code, _) = app.get(&panels, &owner).await;
     assert_eq!(code, StatusCode::OK);

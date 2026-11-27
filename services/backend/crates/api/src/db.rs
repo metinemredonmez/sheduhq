@@ -49,3 +49,40 @@ pub async fn set_context(
         .await?;
     Ok(())
 }
+
+/// Bağlantı rolü RLS'yi aşıyorsa dönen hata.
+#[derive(Debug)]
+pub struct PrivilegeError(String);
+
+impl std::fmt::Display for PrivilegeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PrivilegeError {}
+
+/// Bağlantının RLS'yi aşmayan bir rolle çalıştığını doğrular (AZ-02, EXC-01). Süper kullanıcı,
+/// BYPASSRLS yetkili rol ve tabloların sahibi (veya sahibin yetkilerini taşıyan rol) RLS'den
+/// muaftır; kiracı izolasyonu bu durumda yalnızca sorgu filtrelerine kalır. API ve yönetici aracı
+/// böyle bir rolle başlamaz.
+pub async fn verify_least_privilege(pool: &PgPool) -> Result<(), PrivilegeError> {
+    let row: Result<(String, bool, bool, i64), sqlx::Error> = sqlx::query_as(
+        "SELECT current_user::text, r.rolsuper, r.rolbypassrls,
+                (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public' AND c.relkind = 'r'
+                    AND pg_has_role(current_user, c.relowner, 'USAGE'))
+           FROM pg_roles r WHERE r.rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await;
+    let (role, superuser, bypass, owned) =
+        row.map_err(|e| PrivilegeError(format!("veritabanı rolü denetlenemedi: {e}")))?;
+    if superuser || bypass || owned > 0 {
+        return Err(PrivilegeError(format!(
+            "veritabanı rolü '{role}' RLS'yi aşıyor (süper kullanıcı, BYPASSRLS veya tablo sahibi); \
+             SHEDU_DB_ROLE=shedu_app ile uygulama rolüne geçin"
+        )));
+    }
+    Ok(())
+}

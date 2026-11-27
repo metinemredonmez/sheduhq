@@ -45,7 +45,8 @@ macro_rules! visible {
     () => {
         "($2 OR EXISTS (
              SELECT 1 FROM access_grants g
-              WHERE g.user_id = $1 AND g.panel_id = e.panel_id AND g.can_view_events
+              WHERE g.user_id = $1 AND g.panel_id = e.panel_id
+                AND g.organization_id = e.organization_id AND g.can_view_events
                 AND (g.valid_from IS NULL OR g.valid_from <= now())
                 AND (g.expires_at IS NULL OR g.expires_at > now())
                 AND (g.partition_id IS NULL OR e.partition_number IS NULL
@@ -173,7 +174,7 @@ pub async fn list(
                JOIN panels p ON p.id = e.panel_id
                LEFT JOIN partitions pt ON pt.panel_id = e.panel_id AND pt.number = e.partition_number
                LEFT JOIN zones z ON z.panel_id = e.panel_id AND z.number = e.zone_number
-              WHERE ",
+              WHERE e.organization_id = $3 AND ",
             visible!(),
             " AND ($4::bigint IS NULL OR e.id < $4) AND (NOT $5 OR ",
             unread!(),
@@ -231,7 +232,7 @@ pub async fn list(
 
 async fn count_unread(conn: &mut PgConnection, ctx: &OrgContext) -> ApiResult<i64> {
     let (count,): (i64,) = sqlx::query_as(concat!(
-        "SELECT count(*) FROM (SELECT 1 FROM panel_events e WHERE ",
+        "SELECT count(*) FROM (SELECT 1 FROM panel_events e WHERE e.organization_id = $3 AND ",
         visible!(),
         " AND ",
         unread!(),
@@ -314,11 +315,12 @@ pub async fn mark_read(
         };
         if request.all {
             let (max,): (Option<i64>,) = sqlx::query_as(concat!(
-                "SELECT max(e.id) FROM panel_events e WHERE ",
+                "SELECT max(e.id) FROM panel_events e WHERE e.organization_id = $3 AND ",
                 visible!()
             ))
             .bind(ctx.user.user_id)
             .bind(ctx.role.sees_all_panels())
+            .bind(organization_id)
             .fetch_one(&mut *tx)
             .await?;
             if let Some(max) = max {
@@ -347,12 +349,13 @@ pub async fn mark_read(
             }
         } else {
             let visible_ids: Vec<(i64,)> = sqlx::query_as(concat!(
-                "SELECT e.id FROM panel_events e WHERE e.id = ANY($3) AND ",
+                "SELECT e.id FROM panel_events e WHERE e.id = ANY($3) AND e.organization_id = $4 AND ",
                 visible!()
             ))
             .bind(ctx.user.user_id)
             .bind(ctx.role.sees_all_panels())
             .bind(&ids)
+            .bind(organization_id)
             .fetch_all(&mut *tx)
             .await?;
             for (event_id,) in visible_ids {

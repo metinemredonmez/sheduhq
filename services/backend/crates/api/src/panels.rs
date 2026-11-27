@@ -90,21 +90,24 @@ async fn visible_panels(
     let panels = if ctx.role.sees_all_panels() {
         sqlx::query_as::<_, PanelSummary>(
             "SELECT id, name, brand, model, connectivity, ready_to_arm, last_seen_at, simulated
-               FROM panels ORDER BY name",
+               FROM panels WHERE organization_id = $1 ORDER BY name",
         )
+        .bind(ctx.organization_id)
         .fetch_all(&mut *conn)
         .await?
     } else {
         sqlx::query_as::<_, PanelSummary>(
             "SELECT id, name, brand, model, connectivity, ready_to_arm, last_seen_at, simulated
                FROM panels
-              WHERE id IN (SELECT panel_id FROM access_grants
-                            WHERE user_id = $1 AND can_view_events
+              WHERE organization_id = $2
+                AND id IN (SELECT panel_id FROM access_grants
+                            WHERE user_id = $1 AND organization_id = $2 AND can_view_events
                               AND (valid_from IS NULL OR valid_from <= now())
                               AND (expires_at IS NULL OR expires_at > now()))
               ORDER BY name",
         )
         .bind(ctx.user.user_id)
+        .bind(ctx.organization_id)
         .fetch_all(&mut *conn)
         .await?
     };

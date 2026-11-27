@@ -222,6 +222,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         .connect_with(options)
         .await
         .map_err(|e| format!("veritabanına bağlanılamadı: {e}"))?;
+    db::verify_least_privilege(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
     let error = |e: admin::AdminError| e.to_string();
 
     match &cli.command {

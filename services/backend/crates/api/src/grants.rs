@@ -314,11 +314,13 @@ pub async fn list(
     if !ctx.role.is_manager() && member_id != ctx.user.user_id {
         return Err(ApiError::Forbidden("not_permitted"));
     }
-    let rows: Vec<GrantRow> =
-        sqlx::query_as(select_grants!("WHERE user_id = $1 ORDER BY created_at"))
-            .bind(member_id)
-            .fetch_all(&mut *tx)
-            .await?;
+    let rows: Vec<GrantRow> = sqlx::query_as(select_grants!(
+        "WHERE user_id = $1 AND organization_id = $2 ORDER BY created_at"
+    ))
+    .bind(member_id)
+    .bind(org_id)
+    .fetch_all(&mut *tx)
+    .await?;
     let grants = load_views(&mut tx, rows).await?;
     tx.commit().await?;
     Ok(Json(json!({ "grants": grants })))
@@ -350,10 +352,12 @@ pub async fn create(
     }
 
     // Panel ve bölüm bu organizasyonda olmalı; RLS başka kiracının panelini zaten göstermez.
-    let panel: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM panels WHERE id = $1")
-        .bind(request.panel_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let panel: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM panels WHERE id = $1 AND organization_id = $2")
+            .bind(request.panel_id)
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     if panel.is_none() {
         return Err(ApiError::Unprocessable("unknown_panel"));
     }
@@ -451,7 +455,7 @@ pub async fn update(
         "UPDATE access_grants
             SET can_view_events = $2, can_arm = $3, can_disarm = $4, can_bypass = $5,
                 always_open = $6, valid_from = $7, expires_at = $8
-          WHERE id = $1",
+          WHERE id = $1 AND organization_id = $9",
     )
     .bind(grant_id)
     .bind(terms.can_view_events)
@@ -461,6 +465,7 @@ pub async fn update(
     .bind(terms.always_open)
     .bind(terms.valid_from)
     .bind(terms.expires_at)
+    .bind(org_id)
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
@@ -497,8 +502,11 @@ pub async fn remove(
         return Err(ApiError::Forbidden("not_permitted"));
     }
     let deleted: Option<(Uuid, Uuid)> =
-        sqlx::query_as("DELETE FROM access_grants WHERE id = $1 RETURNING user_id, panel_id")
+        sqlx::query_as(
+            "DELETE FROM access_grants WHERE id = $1 AND organization_id = $2 RETURNING user_id, panel_id",
+        )
             .bind(grant_id)
+            .bind(org_id)
             .fetch_optional(&mut *tx)
             .await?;
     let (member_id, panel_id) = deleted.ok_or(ApiError::NotFound)?;

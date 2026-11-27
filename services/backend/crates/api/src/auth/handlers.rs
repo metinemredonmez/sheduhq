@@ -242,6 +242,16 @@ pub(super) async fn consume_code(
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
         return Err(invalid);
     }
+    {
+        let mut conn = state.db.acquire().await?;
+        rate_limit::ensure_available(
+            &mut conn,
+            &state.hmac_secret,
+            rate_limit::CODE_FAILURES_PER_PHONE,
+            phone,
+        )
+        .await?;
+    }
 
     let mut tx = state.db.begin().await?;
     let row: Option<(Uuid, Vec<u8>, i16, Option<Uuid>)> = sqlx::query_as(
@@ -281,6 +291,14 @@ pub(super) async fn consume_code(
     .bind(id)
     .bind(codes::MAX_ATTEMPTS)
     .execute(&mut *tx)
+    .await?;
+    // Hesap başına birikimli sayaç (yalnızca gerçekten verilmiş bir koda yapılan yanlış deneme).
+    rate_limit::record_failure(
+        &mut tx,
+        &state.hmac_secret,
+        rate_limit::CODE_FAILURES_PER_PHONE,
+        phone,
+    )
     .await?;
     tx.commit().await?;
     Err(invalid)
@@ -619,9 +637,12 @@ pub async fn refresh(
            FROM users u
           WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.revoked_at IS NULL
             AND r.expires_at > now() AND u.id = r.user_id AND u.status = 'active'
+            AND (SELECT min(f.created_at) FROM refresh_tokens f WHERE f.family_id = r.family_id)
+                > now() - make_interval(days => $2)
           RETURNING r.user_id, r.family_id, r.device_id",
     )
     .bind(&hash)
+    .bind(tokens::SESSION_MAX_DAYS)
     .fetch_optional(&mut *tx)
     .await?;
 

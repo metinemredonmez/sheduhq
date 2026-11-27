@@ -415,6 +415,7 @@ pub async fn accept(
         "UPDATE invitations i SET accepted_at = now(), accepted_by = $2
           WHERE i.id = $1 AND i.phone = app_current_user_phone() AND i.expires_at > now()
             AND i.accepted_at IS NULL AND i.declined_at IS NULL AND i.revoked_at IS NULL
+            AND EXISTS (SELECT 1 FROM users iu WHERE iu.id = i.invited_by AND iu.status = 'active')
             AND EXISTS (SELECT 1 FROM memberships m
                          WHERE m.user_id = i.invited_by AND m.organization_id = i.organization_id
                            AND (m.role = 'owner' OR (m.role = 'admin' AND i.role IN ('member', 'operator'))))

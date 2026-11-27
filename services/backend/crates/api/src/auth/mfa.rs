@@ -353,6 +353,33 @@ async fn totp_enabled(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<bool>
     Ok(row.is_some())
 }
 
+/// Hesap başına birikimli ikinci adım hata sınırı (AUT-02): doluysa deneme yapılmaz.
+async fn ensure_mfa_attempts(state: &AppState, user_id: Uuid) -> ApiResult<()> {
+    let mut conn = state.db.acquire().await?;
+    rate_limit::ensure_available(
+        &mut conn,
+        &state.hmac_secret,
+        rate_limit::MFA_FAILURES_PER_USER,
+        &user_id.to_string(),
+    )
+    .await
+}
+
+/// Başarısız ikinci adım denemesini hesap başına sayar.
+async fn count_mfa_failure(
+    conn: &mut PgConnection,
+    state: &AppState,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    rate_limit::record_failure(
+        conn,
+        &state.hmac_secret,
+        rate_limit::MFA_FAILURES_PER_USER,
+        &user_id.to_string(),
+    )
+    .await
+}
+
 /// Hassas hesap işlemleri (dışa aktarma, numara değişimi, silme) için adım yükseltme: kullanıcının
 /// faktörü açıksa bu oturumda ikinci adım tamamlanmış olmalı (AUT-04).
 pub(crate) async fn step_up(conn: &mut PgConnection, user: AuthUser) -> ApiResult<()> {
@@ -459,6 +486,7 @@ pub async fn verify(
         )
         .await?;
     }
+    ensure_mfa_attempts(&state, user_id).await?;
 
     let method = check_factor(
         &state,
@@ -479,6 +507,7 @@ pub async fn verify(
         .bind(CHALLENGE_MAX_ATTEMPTS)
         .execute(&mut *tx)
         .await?;
+        count_mfa_failure(&mut tx, &state, user_id).await?;
         record(
             &mut tx,
             user_id,
@@ -632,8 +661,10 @@ pub async fn confirm(
         )
         .await?;
     }
+    ensure_mfa_attempts(&state, user.user_id).await?;
     let mut tx = state.db.begin().await?;
     if !check_totp(&state, &mut tx, user.user_id, &request.code, false).await? {
+        count_mfa_failure(&mut tx, &state, user.user_id).await?;
         record(
             &mut tx,
             user.user_id,
@@ -651,13 +682,35 @@ pub async fn confirm(
         .await?;
     let codes = replace_recovery_codes(&state, &mut tx, user.user_id).await?;
     mark_session(&mut tx, user.user_id, user.session_id, Method::Totp).await?;
+    // MFA'yı açan oturum dışındaki bütün oturumlar kapanır: parola çalındıysa saldırganın açık
+    // oturumu ikinci faktörden sonra yaşamaya devam etmez (SES-04). Kapanan cihazlara bildirim
+    // gitmez.
+    sqlx::query(
+        "UPDATE user_devices SET push_token = NULL
+          WHERE user_id = $1
+            AND id IN (SELECT device_id FROM refresh_tokens
+                        WHERE user_id = $1 AND family_id <> $2 AND revoked_at IS NULL)",
+    )
+    .bind(user.user_id)
+    .bind(user.session_id)
+    .execute(&mut *tx)
+    .await?;
+    let ended = sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now()
+          WHERE user_id = $1 AND family_id <> $2 AND revoked_at IS NULL",
+    )
+    .bind(user.user_id)
+    .bind(user.session_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     let phone = phone_of(&mut tx, user.user_id).await?;
     record(
         &mut tx,
         user.user_id,
         "mfa.enabled",
         audit::Outcome::Success,
-        json!({ "method": "totp" }),
+        json!({ "method": "totp", "revoked_tokens": ended }),
     )
     .await?;
     tx.commit().await?;
@@ -683,6 +736,7 @@ pub async fn disable(
         )
         .await?;
     }
+    ensure_mfa_attempts(&state, user.user_id).await?;
     let mut tx = state.db.begin().await?;
     if !totp_enabled(&mut tx, user.user_id).await? {
         return Err(ApiError::Conflict("mfa_not_enabled"));
@@ -696,6 +750,7 @@ pub async fn disable(
     )
     .await?;
     if method.is_none() {
+        count_mfa_failure(&mut tx, &state, user.user_id).await?;
         record(
             &mut tx,
             user.user_id,
@@ -752,9 +807,11 @@ pub async fn regenerate_recovery_codes(
         )
         .await?;
     }
+    ensure_mfa_attempts(&state, user.user_id).await?;
     let mut tx = state.db.begin().await?;
     let code = request.code.unwrap_or_default();
     if !check_totp(&state, &mut tx, user.user_id, &code, true).await? {
+        count_mfa_failure(&mut tx, &state, user.user_id).await?;
         tx.commit().await?;
         return Err(ApiError::BadRequest("invalid_code"));
     }
