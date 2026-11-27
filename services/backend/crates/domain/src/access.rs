@@ -52,6 +52,8 @@ pub struct AccessPolicy {
     pub valid_from: Option<i64>,
     /// Bu andan itibaren erişim yok (Unix saniyesi).
     pub expires_at: Option<i64>,
+    /// `true` ise gün ve saat kısıtı yoktur (ör. ev sahibi); geçerlilik süresi yine uygulanır.
+    pub always_open: bool,
     pub windows: Vec<AccessWindow>,
 }
 
@@ -71,7 +73,7 @@ impl AccessPolicy {
         if self.expires_at.is_some_and(|until| at.unix >= until) {
             return false;
         }
-        self.windows.iter().any(|window| window.contains(at))
+        self.always_open || self.windows.iter().any(|window| window.contains(at))
     }
 }
 
@@ -171,6 +173,18 @@ mod tests {
 
         policy.expires_at = Some(1_000_001);
         assert!(policy.is_open_at(at(Weekday::Mon, hm(9, 0))));
+    }
+
+    #[test]
+    fn always_open_ignores_windows_but_not_validity() {
+        let mut policy = AccessPolicy {
+            always_open: true,
+            ..AccessPolicy::default()
+        };
+        assert!(policy.is_open_at(at(Weekday::Sun, hm(3, 0))));
+
+        policy.expires_at = Some(1_000_000);
+        assert!(!policy.is_open_at(at(Weekday::Sun, hm(3, 0))));
     }
 
     #[test]

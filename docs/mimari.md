@@ -39,6 +39,25 @@
 5. **Sözleşme önce gelir.** API, OpenAPI şemasını kendisi üretir; mobil ve web istemcileri bu şemadan
    üretilir.
 
+## Veritabanı
+
+Şema: [`services/backend/migrations/`](../services/backend/migrations/). Testler:
+[`services/backend/tests/sql/`](../services/backend/tests/sql/), çalıştırmak için
+`services/backend/scripts/test-db.sh` (geçici bir veritabanında, süper kullanıcıyla).
+
+- **Roller:** migration'lar tablo sahibi rolle çalışır. Uygulama, RLS'yi aşamayan `shedu_app`
+  rolüne üye bir kullanıcıyla bağlanır. Yönetici CLI'ı gibi kiracılar arası işler ayrı, `BYPASSRLS`
+  yetkili bir rolle ve yalnızca denetim kaydı yazarak yapılır.
+- **Kiracı bağlamı:** API her işlemde `SET LOCAL app.org_id = '<token'dan gelen organizasyon>'`
+  yapar. Ayar yoksa hiçbir kiracı satırı görünmez; geçersiz değer hata verir.
+- **Kiracılar arası bağlantı:** bölüm, zon, yetki ve komut kayıtları bileşik yabancı anahtarla
+  aynı organizasyonun aynı paneline bağlanmak zorundadır.
+- **Komutlar:** `(user_id, idempotency_key)` tekildir; bir bölümde aynı anda yalnızca bir komut
+  yolda olabilir.
+- **Denetim kaydı:** yalnızca eklenir; tetikleyici güncellemeyi, silmeyi ve TRUNCATE'i engeller.
+- **Saklanmayanlar:** panel PIN'i hiç saklanmaz; parola argon2id, refresh token SHA-256, SMS
+  kodu HMAC-SHA256 olarak tutulur.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

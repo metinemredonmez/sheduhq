@@ -32,6 +32,7 @@ docs/          Mimari, MVP kapsamı, güvenlik temeli, karar kayıtları
 | Bileşen | Gerekenler | Komut |
 |---|---|---|
 | Backend | Rust (stable) | `cd services/backend && cargo test && cargo run -p shedu-api` |
+| Veritabanı şeması | PostgreSQL 15+ (geçici, süper kullanıcı) | `PGHOST=… PGDATABASE=… services/backend/scripts/test-db.sh` |
 | AI servisi | [uv](https://docs.astral.sh/uv/) | `cd services/ai && uv sync && uv run pytest` |
 | Altyapı | Docker | `cd infra && cp .env.example .env && docker compose up -d` |
 
