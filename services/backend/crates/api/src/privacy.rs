@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState, audit,
-    auth::{AuthUser, mfa, rate_limit},
+    auth::{AuthUser, handlers::revoke_user_sessions, mfa, rate_limit},
     db::set_context,
     error::{ApiError, ApiResult},
     invitations,
@@ -176,11 +176,37 @@ async fn reauthenticate(
     mfa::require_password(state, user.user_id, password, action).await
 }
 
+/// Kurumsal personel (işletme veya izleme merkezinde sahip, yönetici, operatör) organizasyon
+/// verisine yalnızca ikinci adımı tamamlanmış oturumla erişir (AUT-01; kural
+/// `authz::mfa_required` ile aynı). Dışa aktarma bu organizasyonlardaki yetki ve komut
+/// kayıtlarını da içerdiği için aynı kural burada da geçerlidir: faktörü henüz kurulmamış
+/// personel önce faktörü kurar.
+async fn ensure_staff_factor(state: &AppState, user: AuthUser) -> ApiResult<()> {
+    let mut tx = state.db.begin().await?;
+    set_context(&mut tx, Some(user.user_id), None).await?;
+    let (staff, verified): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM memberships m JOIN organizations o ON o.id = m.organization_id
+                         WHERE m.user_id = $1 AND o.kind IN ('business', 'monitoring_center')
+                           AND m.role IN ('owner', 'admin', 'operator')),
+                EXISTS (SELECT 1 FROM session_factors WHERE family_id = $2 AND user_id = $1)",
+    )
+    .bind(user.user_id)
+    .bind(user.session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if staff && !verified {
+        return Err(ApiError::Forbidden("mfa_required"));
+    }
+    Ok(())
+}
+
 pub async fn export(
     State(state): State<AppState>,
     user: AuthUser,
     Json(request): Json<PasswordRequest>,
 ) -> ApiResult<Response> {
+    ensure_staff_factor(&state, user).await?;
     reauthenticate(&state, user, request.password, "privacy.export").await?;
     {
         let mut conn = state.db.acquire().await?;
@@ -216,14 +242,15 @@ pub async fn export(
     .bind(user.user_id)
     .fetch_all(&mut *tx)
     .await?;
+    // Etkin oturum kuralı HTTP ve push ile aynı (`session_active`).
     let sessions: Vec<SessionData> = sqlx::query_as(
-        "SELECT r.family_id AS id, min(r.device_id::text)::uuid AS device_id,
-                min(r.created_at) AS started_at, max(r.created_at) AS last_active_at,
-                bool_or(r.revoked_at IS NULL AND r.used_at IS NULL AND r.expires_at > now()) AS active,
-                min(f.method) AS second_factor
-           FROM refresh_tokens r LEFT JOIN session_factors f ON f.family_id = r.family_id
-          WHERE r.user_id = $1
-          GROUP BY r.family_id
+        "SELECT s.id, s.device_id, s.created_at AS started_at,
+                coalesce((SELECT max(r.created_at) FROM refresh_tokens r WHERE r.family_id = s.id),
+                         s.created_at) AS last_active_at,
+                session_active(s.id, s.user_id) AS active,
+                f.method AS second_factor
+           FROM session_families s LEFT JOIN session_factors f ON f.family_id = s.id
+          WHERE s.user_id = $1
           ORDER BY started_at",
     )
     .bind(user.user_id)
@@ -341,6 +368,17 @@ pub async fn delete_account(
 
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, Some(user.user_id), None).await?;
+    // Hesap satırı önce kilitlenir. Bu kişinin davetinin kabulü ve bu kişiye sahiplik devri hesap
+    // satırını paylaşımlı kilitler: ya talepten önce biter (aşağıdaki denetim yeni üyeyi veya
+    // sahipliği görür) ya da talepten sonra sıralanır ve kapanmış hesabı görüp reddedilir (AZ-03).
+    let active: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM users WHERE id = $1 AND status = 'active' FOR UPDATE")
+            .bind(user.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if active.is_none() {
+        return Err(ApiError::Unauthorized);
+    }
     // Başka üyesi olan organizasyonların sahibi: hangi organizasyonlar olduğu söylenir.
     let shared: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT m.organization_id FROM memberships m
@@ -374,16 +412,7 @@ pub async fn delete_account(
     .await?;
     let (due,) = scheduled.ok_or(ApiError::Unauthorized)?;
     // Hesap hemen kapanır: bütün oturumlar biter, cihazlara bildirim gitmez (SES-04).
-    sqlx::query(
-        "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(user.user_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("UPDATE user_devices SET push_token = NULL WHERE user_id = $1")
-        .bind(user.user_id)
-        .execute(&mut *tx)
-        .await?;
+    revoke_user_sessions(&mut tx, user.user_id, None).await?;
     // Gönderdiği açık davetler iptal edilir: kabul edilirse organizasyon tek üyeli olmaktan çıkar
     // ve kalıcı silme takılır. Davetler kiracı verisidir; her organizasyon kendi bağlamında.
     let organizations: Vec<(Uuid,)> =
@@ -421,20 +450,34 @@ pub async fn delete_account(
         .into_response())
 }
 
-/// Bekleyen silme talebini iptal eder (tam doğrulamalı girişte çağrılır). İptal edildiyse `true`.
+/// Bekleyen silme talebini iptal eder (tam doğrulamalı girişte, oturum açılmadan önce çağrılır).
+/// İptal edildiyse `true`. Talep yalnızca 30 günlük süre içinde geri alınabilir: süresi dolmuş
+/// (silme işinin henüz işlemediği) hesapla giriş reddedilir. Silme işi hesap satırını kilitler;
+/// iptal onunla sıralanır (DAT-05).
 pub(crate) async fn cancel_scheduled_erasure(
     conn: &mut PgConnection,
     user_id: Uuid,
 ) -> ApiResult<bool> {
     let cancelled = sqlx::query(
         "UPDATE users SET status = 'active', deletion_due_at = NULL, updated_at = now()
-          WHERE id = $1 AND status = 'pending_deletion'",
+          WHERE id = $1 AND status = 'pending_deletion' AND deletion_due_at > now()",
     )
     .bind(user_id)
     .execute(&mut *conn)
     .await?
     .rows_affected()
         == 1;
+    if !cancelled {
+        let (active,): (bool,) = sqlx::query_as(
+            "SELECT coalesce(bool_or(status = 'active'), false) FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !active {
+            return Err(ApiError::Unauthorized);
+        }
+    }
     if cancelled {
         audit::record(
             conn,

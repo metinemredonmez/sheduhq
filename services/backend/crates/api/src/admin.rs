@@ -496,17 +496,7 @@ pub async fn set_user_active(
         .await?;
     let mut revoked = 0;
     if !active {
-        revoked = sqlx::query(
-            "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        sqlx::query("UPDATE user_devices SET push_token = NULL WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        revoked = crate::auth::handlers::revoke_user_sessions(&mut tx, user_id, None).await?;
     }
     audit::record(
         &mut tx,

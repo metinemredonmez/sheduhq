@@ -82,6 +82,7 @@ def test_refusal_is_reported_with_its_spend() -> None:
 
     assert caught.value.usage is not None
     assert caught.value.usage.cost_microusd == 200 * 4 + 30 * 20
+    assert caught.value.may_be_billed is True
 
 
 def test_fallback_attempts_are_all_billed() -> None:
@@ -117,23 +118,42 @@ def test_unusable_responses_are_unavailable_and_still_billed(result: Any) -> Non
         write(result)
 
     assert caught.value.usage is not None
+    assert caught.value.may_be_billed is True
+
+
+def status_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.APIStatusError:
+    return cls("hata", response=httpx2.Response(status, request=REQUEST), body=None)
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "may_be_billed"),
     [
-        anthropic.RateLimitError(
-            "sınır", response=httpx2.Response(429, request=REQUEST), body=None
-        ),
-        anthropic.InternalServerError(
-            "kesinti", response=httpx2.Response(500, request=REQUEST), body=None
-        ),
-        anthropic.APITimeoutError(request=REQUEST),
-        anthropic.APIConnectionError(request=REQUEST),
+        # Yanıt gelmedi: istek gitmiş ve model çalışmış olabilir.
+        (anthropic.APITimeoutError(request=REQUEST), True),
+        (anthropic.APIConnectionError(request=REQUEST), True),
+        # Sağlayıcının hata yanıtı faturalanmaz.
+        (status_error(anthropic.RateLimitError, 429), False),
+        (status_error(anthropic.InternalServerError, 500), False),
+        (status_error(anthropic.OverloadedError, 529), False),
+        (status_error(anthropic.BadRequestError, 400), False),
+        (status_error(anthropic.AuthenticationError, 401), False),
     ],
 )
-def test_api_errors_are_unavailable(error: Exception) -> None:
+def test_api_errors_are_unavailable_with_billing_uncertainty(
+    error: Exception, may_be_billed: bool
+) -> None:
     with pytest.raises(Unavailable) as caught:
         write(error)
 
     assert caught.value.usage is None
+    assert caught.value.may_be_billed is may_be_billed
+
+
+def test_sdk_retries_are_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ağa çıkılmaz; yalnızca istemci kurulur.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anahtari-ag-yok")
+
+    writer = ClaudeWriter.from_environment(DEFAULT_MODEL)
+
+    assert writer._client.max_retries == 0
+    assert writer._client.timeout == 30.0

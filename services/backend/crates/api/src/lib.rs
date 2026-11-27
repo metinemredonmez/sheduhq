@@ -112,6 +112,11 @@ impl AppState {
     }
 
     /// Süresi dolan hesap silme taleplerini saatte bir uygular.
+    /// Takılan sanal panel komutlarının kurtarılması.
+    pub fn start_simulator_recovery(&self) -> tokio::task::JoinHandle<()> {
+        simulator::start_recovery(self)
+    }
+
     pub fn start_erasure_job(&self) -> tokio::task::JoinHandle<()> {
         privacy::start_erasure_job(self)
     }

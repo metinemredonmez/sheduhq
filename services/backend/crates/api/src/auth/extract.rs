@@ -38,21 +38,14 @@ impl FromRequestParts<AppState> for AuthUser {
             .verify_access(token)
             .map_err(|_| ApiError::Unauthorized)?;
 
-        let active: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM users u
-              WHERE u.id = $1 AND u.status = 'active'
-                AND EXISTS (SELECT 1 FROM refresh_tokens r
-                             WHERE r.family_id = $2 AND r.user_id = $1 AND r.revoked_at IS NULL)
-                AND (SELECT min(f.created_at) FROM refresh_tokens f WHERE f.family_id = $2)
-                    > now() - make_interval(days => $3)",
-        )
-        .bind(claims.sub)
-        .bind(claims.sid)
-        .bind(super::tokens::SESSION_MAX_DAYS)
-        .fetch_optional(&state.db)
-        .await?;
+        // Oturum kuralı bütün yüzeylerde aynı: `session_active` (aile, 90 gün, kullanıcı durumu).
+        let (active,): (bool,) = sqlx::query_as("SELECT session_active($2, $1)")
+            .bind(claims.sub)
+            .bind(claims.sid)
+            .fetch_one(&state.db)
+            .await?;
 
-        if active.is_none() {
+        if !active {
             return Err(ApiError::Unauthorized);
         }
         Ok(Self {

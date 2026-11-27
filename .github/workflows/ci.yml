@@ -22,7 +22,8 @@ jobs:
         working-directory: services/backend
     services:
       postgres:
-        image: postgres:19-alpine
+        # Tam sürüm etiketi + çok mimarili manifest özeti (OPS-04); özet elle güncellenir.
+        image: postgres:19.0-alpine@sha256:cac45fb483caee3668946088a1c0532db89d5285c28dbfeac889b4068296e06f
         env:
           # Yalnızca CI'daki geçici veritabanı; gerçek bir sır değildir.
           POSTGRES_PASSWORD: ci-only
@@ -36,11 +37,14 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:ci-only@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Araç zinciri
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+        env:
+          # Kesin kararlı sürüm; "stable" kanalı zamanla değişir (OPS-04).
+          RUST_TOOLCHAIN: "1.100.0"
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
       - name: Biçim
         run: cargo fmt --all --check
       - name: Lint
@@ -57,14 +61,20 @@ jobs:
       run:
         working-directory: services/ai
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
       - name: uv
-        run: python -m pip install --upgrade "uv>=0.9,<1"
+        env:
+          UV_VERSION: "0.13.10"
+          # PyPI'deki manylinux x86_64 tekerleğinin SHA-256 özeti (ubuntu-latest).
+          UV_SHA256: 7cc9c41b43d583e34c781fd3446405b06e9c5fa2db468ce2a534d353db6429e5
+        run: |
+          echo "uv==${UV_VERSION} --hash=sha256:${UV_SHA256}" > "${RUNNER_TEMP}/uv-requirements.txt"
+          python -m pip install --require-hashes --only-binary :all: --no-deps -r "${RUNNER_TEMP}/uv-requirements.txt"
       - name: Bağımlılıklar
         run: uv sync --locked
       - name: Lint
@@ -79,11 +89,16 @@ jobs:
       fail-fast: false
       matrix:
         # 19: en son sürüm (hedef). 18: bulut sağlayıcılarının yeni sürümü sunması gecikirse
-        # kullanılacak bir önceki sürüm.
-        postgres: ["19", "18"]
+        # kullanılacak bir önceki sürüm. İmajlar tam sürüm etiketi + çok mimarili manifest
+        # özetiyle sabitlenir (OPS-04); özetler elle güncellenir.
+        include:
+          - postgres: "19"
+            image: postgres:19.0-alpine@sha256:cac45fb483caee3668946088a1c0532db89d5285c28dbfeac889b4068296e06f
+          - postgres: "18"
+            image: postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}-alpine
+        image: ${{ matrix.image }}
         env:
           # Yalnızca CI'daki geçici veritabanı; gerçek bir sır değildir.
           POSTGRES_PASSWORD: ci-only
@@ -102,7 +117,7 @@ jobs:
       PGPASSWORD: ci-only
       PGDATABASE: shedu_test
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Migration ve SQL testleri
@@ -115,7 +130,7 @@ jobs:
       GITLEAKS_VERSION: "8.30.1"
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           persist-credentials: false

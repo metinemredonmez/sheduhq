@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use super::{
     AuthUser,
-    handlers::{DeviceInfo, TokenResponse, create_session, ip_of, token_response},
+    handlers::{self, DeviceInfo, TokenResponse, create_session, ip_of, token_response},
     rate_limit, reauth, tokens, totp,
 };
 use crate::{
@@ -344,6 +344,24 @@ async fn mark_session(
     Ok(())
 }
 
+/// Kimlik bilgisi sürümünü artırır ve bekleyen ikinci adım biletlerini geçersiz kılar (SES-04).
+async fn bump_credentials(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<()> {
+    sqlx::query(
+        "UPDATE users SET credential_version = credential_version + 1, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE mfa_challenges SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 async fn totp_enabled(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<bool> {
     let row: Option<(i32,)> =
         sqlx::query_as("SELECT 1 FROM user_totp WHERE user_id = $1 AND confirmed_at IS NOT NULL")
@@ -353,11 +371,16 @@ async fn totp_enabled(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<bool>
     Ok(row.is_some())
 }
 
-/// Hesap başına birikimli ikinci adım hata sınırı (AUT-02): doluysa deneme yapılmaz.
-async fn ensure_mfa_attempts(state: &AppState, user_id: Uuid) -> ApiResult<()> {
-    let mut conn = state.db.acquire().await?;
-    rate_limit::ensure_available(
-        &mut conn,
+/// Hesap başına birikimli ikinci adım hata sınırı (AUT-02): doluysa deneme yapılmaz. Denetim
+/// çağıranın işleminde ve kilitlidir: aynı hesabın eşzamanlı denemeleri sınırı aşamaz ve işlem
+/// açıkken havuzdan ikinci bağlantı istenmez.
+async fn ensure_mfa_attempts(
+    conn: &mut PgConnection,
+    state: &AppState,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    rate_limit::lock_and_ensure_available(
+        conn,
         &state.hmac_secret,
         rate_limit::MFA_FAILURES_PER_USER,
         &user_id.to_string(),
@@ -401,10 +424,12 @@ pub(crate) async fn step_up(conn: &mut PgConnection, user: AuthUser) -> ApiResul
 // Giriş: ikinci adım
 // ---------------------------------------------------------------------------------------------
 
-/// Faktörü açık kullanıcı için ikinci adım bileti oluşturur; faktör yoksa `None`.
+/// Faktörü açık kullanıcı için ikinci adım bileti oluşturur; faktör yoksa `None`. Bilet, parolanın
+/// doğrulandığı andaki kimlik bilgisi sürümünü taşır: arada parola sıfırlanırsa bilet oturum açamaz.
 pub(super) async fn start_challenge(
     conn: &mut PgConnection,
     user_id: Uuid,
+    credential_version: i32,
     device: &DeviceInfo,
 ) -> ApiResult<Option<Challenge>> {
     if !totp_enabled(conn, user_id).await? {
@@ -412,14 +437,16 @@ pub(super) async fn start_challenge(
     }
     let (token, hash) = tokens::new_refresh_token().map_err(|_| ApiError::Internal)?;
     sqlx::query(
-        "INSERT INTO mfa_challenges (user_id, token_hash, platform, device_name, expires_at)
-         VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+        "INSERT INTO mfa_challenges (user_id, token_hash, platform, device_name, expires_at,
+                                     credential_version)
+         VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)",
     )
     .bind(user_id)
     .bind(hash)
     .bind(&device.platform)
     .bind(&device.name)
     .bind(CHALLENGE_TTL_SECS as f64)
+    .bind(credential_version)
     .execute(&mut *conn)
     .await?;
     record(
@@ -460,8 +487,8 @@ pub async fn verify(
     }
 
     let mut tx = state.db.begin().await?;
-    let challenge: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT c.id, c.user_id, c.platform, c.device_name
+    let challenge: Option<(Uuid, Uuid, String, Option<String>, i32)> = sqlx::query_as(
+        "SELECT c.id, c.user_id, c.platform, c.device_name, c.credential_version
            FROM mfa_challenges c
            JOIN users u ON u.id = c.user_id AND u.status IN ('active', 'pending_deletion')
           WHERE c.token_hash = $1 AND c.consumed_at IS NULL AND c.expires_at > now()
@@ -472,21 +499,19 @@ pub async fn verify(
     .bind(CHALLENGE_MAX_ATTEMPTS)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((challenge_id, user_id, platform, device_name)) = challenge else {
+    let Some((challenge_id, user_id, platform, device_name, credential_version)) = challenge else {
         tx.commit().await?;
         return Err(ApiError::Unauthorized);
     };
-    {
-        let mut conn = state.db.acquire().await?;
-        rate_limit::hit(
-            &mut conn,
-            &state.hmac_secret,
-            rate_limit::MFA_PER_USER,
-            &user_id.to_string(),
-        )
-        .await?;
-    }
-    ensure_mfa_attempts(&state, user_id).await?;
+    // Sınırlar biletin işleminde: işlem ve bilet kilidi açıkken havuzdan ikinci bağlantı istenmez.
+    rate_limit::hit(
+        &mut tx,
+        &state.hmac_secret,
+        rate_limit::MFA_PER_USER,
+        &user_id.to_string(),
+    )
+    .await?;
+    ensure_mfa_attempts(&mut tx, &state, user_id).await?;
 
     let method = check_factor(
         &state,
@@ -524,6 +549,13 @@ pub async fn verify(
         .bind(challenge_id)
         .execute(&mut *tx)
         .await?;
+    // Bilet açıldıktan sonra parola sıfırlandıysa veya hesap kapatıldıysa oturum açılmaz.
+    if let Err(error) =
+        handlers::ensure_credentials_unchanged(&mut tx, user_id, credential_version).await
+    {
+        tx.commit().await?;
+        return Err(error);
+    }
     let device = DeviceInfo {
         platform,
         name: device_name,
@@ -661,8 +693,8 @@ pub async fn confirm(
         )
         .await?;
     }
-    ensure_mfa_attempts(&state, user.user_id).await?;
     let mut tx = state.db.begin().await?;
+    ensure_mfa_attempts(&mut tx, &state, user.user_id).await?;
     if !check_totp(&state, &mut tx, user.user_id, &request.code, false).await? {
         count_mfa_failure(&mut tx, &state, user.user_id).await?;
         record(
@@ -684,26 +716,11 @@ pub async fn confirm(
     mark_session(&mut tx, user.user_id, user.session_id, Method::Totp).await?;
     // MFA'yı açan oturum dışındaki bütün oturumlar kapanır: parola çalındıysa saldırganın açık
     // oturumu ikinci faktörden sonra yaşamaya devam etmez (SES-04). Kapanan cihazlara bildirim
-    // gitmez.
-    sqlx::query(
-        "UPDATE user_devices SET push_token = NULL
-          WHERE user_id = $1
-            AND id IN (SELECT device_id FROM refresh_tokens
-                        WHERE user_id = $1 AND family_id <> $2 AND revoked_at IS NULL)",
-    )
-    .bind(user.user_id)
-    .bind(user.session_id)
-    .execute(&mut *tx)
-    .await?;
-    let ended = sqlx::query(
-        "UPDATE refresh_tokens SET revoked_at = now()
-          WHERE user_id = $1 AND family_id <> $2 AND revoked_at IS NULL",
-    )
-    .bind(user.user_id)
-    .bind(user.session_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    // gitmez. Kimlik bilgisi sürümü artar: parolası şu an doğrulanmakta olan bir giriş, ikinci
+    // faktör sormadan oturum açamaz.
+    bump_credentials(&mut tx, user.user_id).await?;
+    let ended =
+        handlers::revoke_user_sessions(&mut tx, user.user_id, Some(user.session_id)).await?;
     let phone = phone_of(&mut tx, user.user_id).await?;
     record(
         &mut tx,
@@ -736,8 +753,8 @@ pub async fn disable(
         )
         .await?;
     }
-    ensure_mfa_attempts(&state, user.user_id).await?;
     let mut tx = state.db.begin().await?;
+    ensure_mfa_attempts(&mut tx, &state, user.user_id).await?;
     if !totp_enabled(&mut tx, user.user_id).await? {
         return Err(ApiError::Conflict("mfa_not_enabled"));
     }
@@ -773,6 +790,7 @@ pub async fn disable(
             .execute(&mut *tx)
             .await?;
     }
+    bump_credentials(&mut tx, user.user_id).await?;
     let phone = phone_of(&mut tx, user.user_id).await?;
     record(
         &mut tx,
@@ -807,8 +825,8 @@ pub async fn regenerate_recovery_codes(
         )
         .await?;
     }
-    ensure_mfa_attempts(&state, user.user_id).await?;
     let mut tx = state.db.begin().await?;
+    ensure_mfa_attempts(&mut tx, &state, user.user_id).await?;
     let code = request.code.unwrap_or_default();
     if !check_totp(&state, &mut tx, user.user_id, &code, true).await? {
         count_mfa_failure(&mut tx, &state, user.user_id).await?;

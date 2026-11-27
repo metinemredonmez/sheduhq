@@ -42,18 +42,36 @@ async fn demo(app: &TestApp, access: &str, org: &str) -> (String, String) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn startup_refuses_a_role_that_bypasses_rls(_: PgPoolOptions, connect: PgConnectOptions) {
     let app = app(connect.clone()).await;
-    db::verify_least_privilege(&app.pool)
+    db::verify_least_privilege(&app.pool, db::Service::Api)
         .await
         .expect("uygulama rolü kabul edilmeli");
     let superuser = db::pool_options(None)
         .max_connections(1)
-        .connect_with(connect)
+        .connect_with(connect.clone())
         .await
         .expect("bağlantı");
-    let error = db::verify_least_privilege(&superuser)
+    let error = db::verify_least_privilege(&superuser, db::Service::Api)
         .await
         .expect_err("süper kullanıcı reddedilmeli");
     assert!(error.to_string().contains("RLS"), "{error}");
+
+    // Her ikili yalnızca kendi rolüyle başlar (AZ-05): API yönetim rolüyle, yönetim aracı
+    // uygulama rolüyle çalışmaz.
+    db::verify_least_privilege(&app.pool, db::Service::Admin)
+        .await
+        .expect_err("uygulama rolü yönetim aracında reddedilmeli");
+    let admin = db::pool_options(Some("shedu_admin".to_owned()))
+        .max_connections(1)
+        .connect_with(connect)
+        .await
+        .expect("bağlantı");
+    db::verify_least_privilege(&admin, db::Service::Admin)
+        .await
+        .expect("yönetim rolü yönetim aracında kabul edilmeli");
+    let error = db::verify_least_privilege(&admin, db::Service::Api)
+        .await
+        .expect_err("yönetim rolü API'de reddedilmeli");
+    assert!(error.to_string().contains("uygulama rolü"), "{error}");
 }
 
 /// Bulgu 1 (ikinci bariyer): RLS devre dışı olsa bile kiracı filtreleri sorgularda açıkça var.
@@ -184,7 +202,7 @@ async fn sessions_have_an_absolute_lifetime(_: PgPoolOptions, connect: PgConnect
         .await;
     assert_eq!(status, StatusCode::OK, "yeni oturum yenilenebilmeli");
     sqlx::query(
-        "UPDATE refresh_tokens SET created_at = now() - interval '91 days' WHERE family_id = $1::uuid",
+        "UPDATE session_families SET created_at = now() - interval '91 days' WHERE id = $1::uuid",
     )
     .bind(&session)
     .execute(&app.admin)

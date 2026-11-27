@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use sqlx::{
     PgConnection, PgPool,
-    postgres::{PgConnectOptions, PgPoolOptions},
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
 };
 use uuid::Uuid;
 
@@ -50,6 +50,24 @@ pub async fn set_context(
     Ok(())
 }
 
+/// Bağlantı ayarı TLS ile sunucu sertifikasını ve ana makine adını doğruluyor mu? (NET-01)
+/// Bağlantı dizgesindeki metne değil, ayrıştırılmış etkin ayara bakılır: tekrarlanan `sslmode`,
+/// başka bir parametrenin içindeki metin veya `PGSSLMODE` ortam değişkeni sonucu yanıltamaz.
+/// Üretim ve yönetim bağlantısı yalnızca `verify-full` ile kurulur; `require` sertifikayı
+/// doğrulamaz (araya giren sunucuyu fark etmez).
+pub fn verifies_server_identity(options: &PgConnectOptions) -> bool {
+    matches!(options.get_ssl_mode(), PgSslMode::VerifyFull)
+}
+
+/// Bağlantıyı kuran ikili: her biri yalnızca kendi veritabanı rolüyle çalışır (AZ-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    /// HTTP API: `shedu_app` rolü; yönetim rolünün yetkileri olmamalı.
+    Api,
+    /// Yönetim aracı: `shedu_admin` rolü.
+    Admin,
+}
+
 /// Bağlantı rolü RLS'yi aşıyorsa dönen hata.
 #[derive(Debug)]
 pub struct PrivilegeError(String);
@@ -62,21 +80,24 @@ impl std::fmt::Display for PrivilegeError {
 
 impl std::error::Error for PrivilegeError {}
 
-/// Bağlantının RLS'yi aşmayan bir rolle çalıştığını doğrular (AZ-02, EXC-01). Süper kullanıcı,
-/// BYPASSRLS yetkili rol ve tabloların sahibi (veya sahibin yetkilerini taşıyan rol) RLS'den
-/// muaftır; kiracı izolasyonu bu durumda yalnızca sorgu filtrelerine kalır. API ve yönetici aracı
-/// böyle bir rolle başlamaz.
-pub async fn verify_least_privilege(pool: &PgPool) -> Result<(), PrivilegeError> {
-    let row: Result<(String, bool, bool, i64), sqlx::Error> = sqlx::query_as(
+/// Bağlantının RLS'yi aşmayan ve ikiliye ait rolle çalıştığını doğrular (AZ-02, AZ-05, EXC-01).
+/// Süper kullanıcı, BYPASSRLS yetkili rol ve tabloların sahibi (veya sahibin yetkilerini taşıyan
+/// rol) RLS'den muaftır; kiracı izolasyonu bu durumda yalnızca sorgu filtrelerine kalır. Ayrıca
+/// API yalnızca uygulama rolüyle (yönetim rolünün yetkileri olmadan), yönetim aracı yalnızca
+/// yönetim rolüyle başlar.
+pub async fn verify_least_privilege(pool: &PgPool, service: Service) -> Result<(), PrivilegeError> {
+    let row: Result<(String, bool, bool, i64, bool, bool), sqlx::Error> = sqlx::query_as(
         "SELECT current_user::text, r.rolsuper, r.rolbypassrls,
                 (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                   WHERE n.nspname = 'public' AND c.relkind = 'r'
-                    AND pg_has_role(current_user, c.relowner, 'USAGE'))
+                    AND pg_has_role(current_user, c.relowner, 'USAGE')),
+                pg_has_role(current_user, 'shedu_app', 'MEMBER'),
+                pg_has_role(current_user, 'shedu_admin', 'MEMBER')
            FROM pg_roles r WHERE r.rolname = current_user",
     )
     .fetch_one(pool)
     .await;
-    let (role, superuser, bypass, owned) =
+    let (role, superuser, bypass, owned, app, admin) =
         row.map_err(|e| PrivilegeError(format!("veritabanı rolü denetlenemedi: {e}")))?;
     if superuser || bypass || owned > 0 {
         return Err(PrivilegeError(format!(
@@ -84,5 +105,15 @@ pub async fn verify_least_privilege(pool: &PgPool) -> Result<(), PrivilegeError>
              SHEDU_DB_ROLE=shedu_app ile uygulama rolüne geçin"
         )));
     }
-    Ok(())
+    match service {
+        Service::Api if !app || admin => Err(PrivilegeError(format!(
+            "API veritabanı rolü '{role}' uygulama rolü değil veya yönetim rolünün yetkilerini \
+             taşıyor; SHEDU_DB_ROLE=shedu_app kullanın"
+        ))),
+        Service::Admin if !admin => Err(PrivilegeError(format!(
+            "yönetim aracının veritabanı rolü '{role}' yönetim rolü değil; \
+             SHEDU_ADMIN_DB_ROLE=shedu_admin kullanın"
+        ))),
+        _ => Ok(()),
+    }
 }

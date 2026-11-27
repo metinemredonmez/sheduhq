@@ -1,7 +1,7 @@
 //! `shedu-admin`: platform yöneticisi aracı (pilot). Yalnızca sunucuda, kendi veritabanı rolüyle
 //! (`shedu_admin`) çalışır; API'den erişilemez (AZ-05, OPS-02).
 //!
-//! Ortam: `DATABASE_URL` (zorunlu; üretimde `sslmode=verify-full` veya `require`),
+//! Ortam: `DATABASE_URL` (zorunlu; üretimde `sslmode=verify-full`),
 //! `SHEDU_ENV` (`development` değilse üretim sayılır), `SHEDU_ADMIN_DB_ROLE` (varsayılan
 //! `shedu_admin`). İşlemi yapan kişi `--operator` ile ya da sunucudaki `USER` değişkeninden
 //! alınır; her değişiklik `--reason` ister ve denetim kaydına yazılır.
@@ -205,13 +205,17 @@ fn operator(cli: &Cli, reason: &str) -> Result<Operator, String> {
 fn database() -> Result<(PgConnectOptions, String), String> {
     let url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL tanımlı değil".to_owned())?;
     let development = std::env::var("SHEDU_ENV").as_deref() == Ok("development");
-    if !development && !(url.contains("sslmode=verify-full") || url.contains("sslmode=require")) {
-        return Err("üretimde DATABASE_URL sslmode=verify-full (veya require) içermeli".to_owned());
-    }
-    let role = std::env::var("SHEDU_ADMIN_DB_ROLE").unwrap_or_else(|_| ADMIN_ROLE.to_owned());
     let options = url
         .parse::<PgConnectOptions>()
         .map_err(|_| "DATABASE_URL geçersiz".to_owned())?;
+    // Etkin TLS modu denetlenir, bağlantı dizgesindeki metin değil (NET-01).
+    if !development && !db::verifies_server_identity(&options) {
+        return Err(
+            "üretimde DATABASE_URL sslmode=verify-full olmalı (sunucu sertifikası ve ana makine adı doğrulanır)"
+                .to_owned(),
+        );
+    }
+    let role = std::env::var("SHEDU_ADMIN_DB_ROLE").unwrap_or_else(|_| ADMIN_ROLE.to_owned());
     Ok((options, role))
 }
 
@@ -222,7 +226,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         .connect_with(options)
         .await
         .map_err(|e| format!("veritabanına bağlanılamadı: {e}"))?;
-    db::verify_least_privilege(&pool)
+    db::verify_least_privilege(&pool, db::Service::Admin)
         .await
         .map_err(|e| e.to_string())?;
     let error = |e: admin::AdminError| e.to_string();

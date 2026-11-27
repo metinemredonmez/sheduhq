@@ -79,7 +79,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::DatabaseTlsRequired => write!(
                 f,
-                "üretimde DATABASE_URL sslmode=verify-full (veya require) içermeli"
+                "üretimde DATABASE_URL sslmode=verify-full olmalı (sunucu sertifikası ve ana makine adı doğrulanır)"
             ),
         }
     }
@@ -106,9 +106,10 @@ impl Config {
             .map_err(|_| ConfigError::Invalid("SHEDU_API_ADDR"))?;
 
         let database_url = get("DATABASE_URL").ok_or(ConfigError::Missing("DATABASE_URL"))?;
-        if environment == Environment::Production
-            && !(database_url.contains("sslmode=verify-full")
-                || database_url.contains("sslmode=require"))
+        let options: sqlx::postgres::PgConnectOptions = database_url
+            .parse()
+            .map_err(|_| ConfigError::Invalid("DATABASE_URL"))?;
+        if environment == Environment::Production && !crate::db::verifies_server_identity(&options)
         {
             return Err(ConfigError::DatabaseTlsRequired);
         }
@@ -244,6 +245,31 @@ mod tests {
             ("SHEDU_DATA_KEY", DATA),
         ]));
         assert_eq!(result.err(), Some(ConfigError::DatabaseTlsRequired));
+    }
+
+    #[test]
+    fn production_tls_check_reads_the_effective_mode_not_the_text() {
+        for url in [
+            // Sertifikayı doğrulamaz.
+            "postgres://db/shedu?sslmode=require",
+            // Metin başka parametrenin içinde; etkin mod `disable`.
+            "postgres://db/shedu?sslmode=disable&application_name=sslmode%3Dverify-full",
+            // Son değer geçerli.
+            "postgres://db/shedu?sslmode=verify-full&sslmode=prefer",
+        ] {
+            let result = Config::from_lookup(lookup(&[
+                ("DATABASE_URL", url),
+                ("SHEDU_DB_ROLE", "shedu_app"),
+                ("SHEDU_JWT_SECRET", JWT),
+                ("SHEDU_HMAC_SECRET", HMAC),
+                ("SHEDU_DATA_KEY", DATA),
+            ]));
+            assert_eq!(
+                result.err(),
+                Some(ConfigError::DatabaseTlsRequired),
+                "{url}"
+            );
+        }
     }
 
     #[test]

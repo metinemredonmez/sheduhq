@@ -52,10 +52,18 @@
 `services/backend/scripts/test-db.sh` (geçici bir veritabanında, süper kullanıcıyla).
 
 - **Roller:** migration'lar tablo sahibi rolle çalışır. Uygulama, RLS'yi aşamayan `shedu_app`
-  rolüne üye bir kullanıcıyla bağlanır. Yönetici CLI'ı gibi kiracılar arası işler ayrı, `BYPASSRLS`
-  yetkili bir rolle ve yalnızca denetim kaydı yazarak yapılır.
-- **Kiracı bağlamı:** API her işlemde `SET LOCAL app.org_id = '<token'dan gelen organizasyon>'`
-  yapar. Ayar yoksa hiçbir kiracı satırı görünmez; geçersiz değer hata verir.
+  rolüne üye bir kullanıcıyla bağlanır. Yönetici CLI'ı da RLS'ye tabi `shedu_admin` rolüyle
+  çalışır: uygulama rolünün yetkilerini miras alır, ek olarak yalnızca bayrak ve sürüm
+  tablolarına yazar ve kiracılar arası özetleri yalnızca toplam döndüren ayrıcalıklı yordamlarla
+  okur. Açılışta her ikili kendi rolünü doğrular: API yönetim rolünün yetkileriyle, CLI uygulama
+  rolüyle başlamaz.
+- **Kiracı bağlamı:** API her işlemde `SET LOCAL app.org_id = '<yoldaki organizasyon>'` yapar;
+  organizasyon kimliği istek yolundan gelir ve aynı işlemde üyelikle doğrulanır. Ayar yoksa hiçbir
+  kiracı satırı görünmez; geçersiz değer hata verir. Kişinin kendi üyeliklerini ve kendisine
+  gelen davetleri okuma politikaları organizasyon bağlamı gerektirmez.
+- **Ayrıcalıklı yordamlar:** bütün `SECURITY DEFINER` yordamları `search_path = pg_catalog,
+  public, pg_temp` ile çalışır (geçici şema en sonda; aksi halde ilişki adlarında en önce aranır)
+  ve PUBLIC'e kapalıdır; SQL testi bunu katalogdan denetler.
 - **Kiracılar arası bağlantı:** bölüm, zon, yetki ve komut kayıtları bileşik yabancı anahtarla
   aynı organizasyonun aynı paneline bağlanmak zorundadır.
 - **Komutlar:** `(user_id, idempotency_key)` tekildir; bir bölümde aynı anda yalnızca bir komut
@@ -75,22 +83,35 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
   olup olmadığı belli olmaz.
 - **Parola:** en az 15, en fazla 128 karakter; yaygın, tekrarlı, ardışık ve kişisel bilgi içeren
   parolalar reddedilir; argon2id.
-- **Access token:** HS256, 10 dakika, `iss`/`aud`/`typ` zorunlu. Her istekte kullanıcının etkin ve
-  oturumun iptal edilmemiş olduğu veritabanından kontrol edilir; çıkış anında etkilidir.
+- **Access token:** HS256, 10 dakika, `iss`/`aud`/`typ` zorunlu. Her istekte oturumun etkin olduğu
+  veritabanından kontrol edilir; çıkış anında etkilidir.
+- **Oturum ailesi:** her giriş bir `session_families` satırı açar. Oturumun etkin olup olmadığı tek
+  kuralla belirlenir (`session_active()`): aile iptal edilmemiş, en fazla 90 günlük, kullanıcı
+  etkin ve ailede yenilenebilir bir token var. HTTP, WebSocket, push alıcısı, oturum listesi ve
+  dışa aktarma aynı kuralı kullanır.
 - **Refresh token:** 30 gün, her kullanımda yenilenir. Kullanılmış bir token yeniden gelirse bütün
   oturum ailesi iptal edilir ve denetim kaydına yazılır. İstemci aynı oturumun yenilemesini tek
   seferde yapmalıdır (single-flight). Oturumun mutlak ömrü 90 gündür: yenileme ile uzamaz, dolunca
-  access token da geçersiz olur ve yeniden giriş gerekir.
+  access token da geçersiz olur ve yeniden giriş gerekir. Yenileme ve iptal aile satırını
+  kilitleyerek sıralanır: iptalle yarışan yenileme iptal edilmiş ailede yeni token bırakamaz.
+- **Kimlik bilgisi sürümü:** parola sıfırlama ve ikinci faktörün açılıp kapanması
+  `credential_version`'ı artırır ve bekleyen ikinci adım biletlerini geçersiz kılar. Parola veya
+  ikinci adım doğrulandıktan sonra oturum açılırken sürüm satır kilidiyle yeniden okunur; arada
+  değiştiyse oturum açılmaz.
 - **Deneme sınırları:** hesap, IP ve bütün sistem için ayrı sayaçlar; PostgreSQL'de, bütün API
   kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır. Kod
   başına 5 denemeye ek olarak hesap başına 24 saatte en fazla 20 başarısız doğrulama (SMS
   kodunda telefon, ikinci adımda kullanıcı başına); dolunca o hesapta doğru kod da kabul edilmez.
+  Bu sınır aynı işlemde ve hesap başına kilitli denetlenir; paralel denemelerle aşılamaz. Sayaç
+  sabit 24 saatlik pencerededir: pencere sınırında en fazla 40 ardışık hata olabilir (NIST en
+  fazla 100 ister).
   Bu sayaçlar başkası tarafından tüketilebilir (kurbanın girişi geçici olarak engellenebilir);
   kalıcı kilit olmadığı için bilerek kabul edilen bir dengedir.
 - **Dışarıya açılma:** API varsayılan olarak yalnızca `127.0.0.1`'i dinler. Dışarıdan yalnızca
   TLS'li ters vekil üzerinden erişilir; doğrudan erişime kapalıdır (NET-02). Ters vekil arkasında
   gerçek istemci IP'si için güvenilir vekil listesi henüz yapılandırılmadı (NET-03).
-- **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı TLS istemiyorsa veya
+- **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı sunucu sertifikasını ve
+  ana makine adını doğrulamıyorsa (ayrıştırılmış etkin `sslmode` `verify-full` değilse) veya
   sırlar (`SHEDU_JWT_SECRET`, `SHEDU_HMAC_SECRET`, `SHEDU_DATA_KEY`) kısa ya da aynıysa API
   başlamaz. Üretimde `SHEDU_DB_ROLE` zorunludur ve her ortamda açılışta bağlantı rolü denetlenir:
   süper kullanıcı, BYPASSRLS yetkili rol veya tabloların sahibi RLS'den muaf olduğu için API ve
@@ -113,9 +134,12 @@ Uç noktalar (`/v1/auth/mfa`): `GET` (durum), `POST totp/setup`, `POST totp/conf
   kullanımlık, 5 denemelik bir biletle (`mfa_token`) ikinci adımı tamamlar. Kişi başına ve kaynak
   başına deneme sınırı vardır.
 - **Zorunluluk:** işletme ve izleme merkezi organizasyonlarının sahibi, yöneticileri ve
-  operatörleri (personel), ikinci adımı tamamlanmamış oturumla o organizasyona hiçbir istekte,
-  WebSocket'te veya push bildiriminde erişemez. Ev kullanıcıları ve işletmedeki sıradan üyeler
-  için isteğe bağlıdır. MFA kapatılınca bütün oturumların doğrulaması düşer.
+  operatörleri (personel), ikinci adımı tamamlanmamış oturumla o organizasyonun verisine hiçbir
+  istekte, WebSocket'te veya push bildiriminde erişemez; dışa aktarma da (organizasyondaki yetki
+  ve komut kayıtlarını içerdiği için) ikinci adımı ister. `GET /v1/me` yalnızca kişinin kendi
+  üyelik özetini (organizasyon adı, türü, rolü) gösterir; istemci MFA kurulumunu buna göre ister.
+  Ev kullanıcıları ve işletmedeki sıradan üyeler için isteğe bağlıdır. MFA kapatılınca bütün
+  oturumların doğrulaması düşer.
 
 ## Panel ve komut API'si
 
@@ -151,10 +175,22 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
 
 - **Geçmiş:** yeniden eskiye, imleçli sayfalama; üye yalnızca yetkili bölümlerinin olaylarını ve
   panel düzeyindeki olayları (bağlantı, güç, panik) görür.
-- **Dağıtım:** panel olayı yazılınca dağıtıcı olayı `FOR UPDATE SKIP LOCKED` ile alır, alıcıları
-  yetkiye göre bulur, gönderir, `push_deliveries`'e teslim kaydı yazar ve olayı bildirildi
-  işaretler. Birden fazla API kopyası aynı olayı iki kez göndermez; süreç çökerse 15 saniyelik
-  tarama bekleyen olayları yeniden dener. Alarm bildirimi kaybolmaz.
+- **Dağıtım (kalıcı kuyruk):** panel olayı yazılınca dağıtıcı olayı `FOR UPDATE SKIP LOCKED` ile
+  alır, alıcıları yetkiye göre bulur, her cihaz için `push_deliveries`'e `pending` bir teslim işi
+  yazar ve olayı dağıtıldı işaretler. Birden fazla API kopyası aynı olayı iki kez dağıtmaz.
+  Her iş kısa bir işlemde 30 saniyelik süreyle alınır (`sending`), sağlayıcıya veritabanı işlemi
+  dışında gönderilir ve sonuç ayrı işlemde yazılır. Geçici hata artan aralıklarla (5 sn – 5 dk)
+  en fazla 6 kez denenir; deneme hakkı veya bir saatlik süre dolarsa iş `failed` olur ve hata
+  olarak loglanır. Geçersiz token denenmez, cihazdan silinir. Süreç gönderim sırasında kesilirse
+  süre dolunca iş yeniden alınır; 5 saniyelik tarama kaçırılan olayları ve zamanı gelen işleri
+  yakalar. Teslim en az bir kezdir: sağlayıcının kabulü ile sonucun yazılması arasındaki kesintide
+  bildirim ikinci kez gidebilir; sağlayıcı bağdaştırıcısı olay başına sabit `collapse_key`'i
+  (APNs `apns-collapse-id`, FCM `collapse_key`) kullanarak cihazda tekilleştirir.
+- **Paylaşılan zon:** bir zon birden fazla bölümdeyse alarm, alarma geçen her bölüm için ayrı
+  kritik olay olarak yazılır (yalnızca o bölümü gören de bildirim alır); bypass zonun ait olduğu
+  her bölümde bypass yetkisi ister; panel ayrıntısı görünmeyen bölümlerin kimliğini göstermez.
+  Zon bilgisi taşıyan olay bir bölüme ait olmalıdır, bağlantı olayları panel düzeyindedir
+  (veritabanı kısıtı).
 - **Alıcılar:** yöneticiler ve o bölümü görmeye yetkili üyeler; yalnızca etkin oturumu olan ve
   token'ı kayıtlı cihazlar. Çıkışta, oturum kapatmada ve parola sıfırlamada token silinir. Aynı
   token başka hesaba kaydedilirse eski hesaptan kaldırılır.
@@ -245,7 +281,11 @@ haklarının teknik karşılığıdır; aydınlatma metni ve hukuki kararlar aç
 - **Silme talebi (30 gün geri alınabilir):** talep hesabı hemen kapatır: bütün oturumlar biter,
   push token'ları silinir, hesap bildirim almaz. Kalıcı silme 30 gün sonraya planlanır ve kişiye
   SMS ile bildirilir. Bu sürede tam doğrulamayla (parola ve MFA açıksa ikinci adım) giriş yapan
-  kişinin talebi iptal olur; yalnızca parola yetmez. Parolasını unutan kişi bu sürede parola
+  kişinin talebi iptal olur; yalnızca parola yetmez. Süre dolduktan sonra (silme işi henüz
+  çalışmamış olsa da) giriş reddedilir, talep geri alınamaz. Talep hesap satırını kilitler: aynı
+  anda kabul edilen davet veya bu kişiye yapılan sahiplik devri ya talepten önce biter (talep onu
+  görür) ya da sonra sıralanır ve kapanmış hesabı görüp reddedilir. Silme talebi bekleyen hesaba
+  sahiplik devredilemez. Parolasını unutan kişi bu sürede parola
   sıfırlayıp giriş yapabilir. Başka üyesi olan organizasyonun sahibi talep edemez, önce
   sahipliği devretmelidir (yanıt hangi organizasyonlar olduğunu söyler).
 - **Kalıcı silme (anonimleştirme ve yok etme):** API'deki silme işi saatte bir süresi dolan
@@ -298,8 +338,8 @@ shedu-admin user enable --phone +90… --reason "…"
   panellerin markası gerçek panele verilemez; aynı marka ve seri numarası ikinci kez eklenemez.
 - **Kullanıcıyı kapatma:** bütün oturumlar ve push token'ları hemen iptal edilir; yeniden
   açılınca kişi normal giriş yapar.
-- **Üretim:** `DATABASE_URL` TLS (`sslmode=verify-full` veya `require`) istemiyorsa araç
-  başlamaz. Sunucuya erişim (SSH, anahtar, yetki) dağıtım tarafında kısıtlanır (OPS-02).
+- **Üretim:** `DATABASE_URL`'in ayrıştırılmış etkin TLS modu `verify-full` değilse araç başlamaz
+  (`require` sunucu sertifikasını doğrulamaz). Sunucuya erişim (SSH, anahtar, yetki) dağıtım tarafında kısıtlanır (OPS-02).
 
 ## Özellik bayrakları
 
@@ -350,23 +390,27 @@ Uç nokta: `POST /v1/organizations/{org_id}/panels/{panel_id}/ai-summary` `{"hou
 `period_start`, `period_end`, `truncated`.
 
 ```
-Uygulama ──> API: yetki (paneli görme), bayrak, sıklık ve maliyet bütçesi
-                  görünür olaylar (en yeni 500), kesin sayılar (SQL) ──commit──┐
+Uygulama ──> API: yetki (paneli görme), bayrak, sıklık sınırı
+                  görünür olaylar (en yeni 500) ve kesin sayılar (tek sorgu), güncel bağlantı
+                  en kötü durum tahminini bütçeden ayır (ai_reserve) ──commit──┐
              API ──iç ağ, Bearer servis token'ı──> AI servisi ──> Claude (yapılandırılmış çıktı)
              API <── özet metni + harcama ──┘
-             API: harcamayı deftere yaz (ayrı işlem), denetim kaydı, yanıt
+             API: rezervasyonu gerçek harcamayla kapat (ayrı işlem), denetim kaydı, yanıt
 ```
 
 - **Varsayılan kapalı:** `ai_event_summary` bayrağı tanımlanmadıkça özellik 403
   `feature_disabled` döner. Olaylar yurt dışındaki model sağlayıcısına gittiği için bayrak, KVKK
   aktarım ve rıza kararı verilene kadar açılmaz (açık sorular 5, 11, 12).
-- **Veri azaltma (AI-02):** AI servisine panel adı, organizasyonun saat dilimi, dönem ve olaylar
-  (tür, alarm türü, kip, bölüm ve zon adı, kaynak, zaman) gider. Organizasyon veya kullanıcı
+- **Veri azaltma (AI-02):** AI servisine panel adı, organizasyonun saat dilimi, dönem, olaylar
+  (tür, alarm türü, kip, bölüm ve zon adı, kaynak, zaman), dönemin kesin sayıları (`counts`) ve
+  panelin güncel bağlantı durumu (`connection`) gider. Organizasyon veya kullanıcı
   kimliği, telefon, PIN, token gitmez. Bölüm yetkisi uygulanır: üye görmediği bölümün olayını
   özette de göremez.
 - **Kesin bilgi koddan gelir:** sayılar ve "dikkat gerekiyor mu?" (alarm, güç sorunu veya hâlâ
-  süren bağlantı kopması) API'de SQL ile hesaplanır, AI yanıtından alınmaz. Liste 500 olayla
-  kısaltılsa bile sayılar bütün dönemi kapsar. Metin `ai_generated: true` ile işaretlenir;
+  süren bağlantı kopması) API'de SQL ile hesaplanır, AI yanıtından alınmaz. Sayılar ve liste tek
+  sorguda (aynı anlık görüntüde) okunur; liste 500 olayla kısaltılsa bile sayılar bütün dönemi
+  kapsar ve modele de bu sayılar verilir, model sayıları listeden saymaz. Bağlantı durumu dönemle
+  sınırlı değildir: dönem başlamadan kopmuş ve hâlâ kopuk panel de dikkat ister. Metin `ai_generated: true` ile işaretlenir;
   istemci bunu kullanıcıya gösterir ve metni HTML veya Markdown olarak değil düz metin olarak
   basar.
 - **Model (AI-01):** varsayılan `claude-opus-5-5`, düşük çaba, `max_tokens` 4096, JSON şemalı
@@ -375,20 +419,27 @@ Uygulama ──> API: yetki (paneli görme), bayrak, sıklık ve maliyet bütçe
   sistem prompt'u içlerindeki talimatların uygulanmamasını söyler. Güvenlik reddinde sunucu
   tarafı yedek model denenir (`fallbacks: "default"`); hepsi reddederse 422 `ai_refused`.
 - **Maliyet (AI-03):** iki katman. Sıklık: kullanıcı başına saatte 10, organizasyon başına günde
-  50 özet. Harcama: her çağrıdan önce `ai_usage` defterinden son 24 saat okunur. Kullanıcı 1 $,
-  organizasyon 5 $, bütün sistem 20 $ (`SHEDU_AI_DAILY_BUDGET_USD`) sınırına ulaştıysa model
-  çağrılmaz (429). Her çağrının harcaması sonucu ne olursa olsun (başarı, ret, hata) çağrı döner
-  dönmez deftere yazılır; yedek model denemeleri de sayılır (`usage.iterations`). Sonucu
-  bilinmeyen çağrı (zaman aşımı, düşen servis) istek boyutundan temkinli bir tahminle yazılır.
-  Defter yalnızca eklenir, yabancı anahtarı yoktur: hesap silinse de harcama kalır. Uygulama
-  rolü satırları okuyamaz; yalnızca toplam döndüren `ai_spend_last_day()` fonksiyonunu
-  çağırabilir. Sınırı yalnızca o an süren çağrılar aşabilir. AI servisi fiyatı bilinmeyen bir
-  modelle başlamaz.
+  50 özet. Harcama: her çağrıdan önce en kötü durum tahmini (istek boyutundan giriş, `max_tokens`
+  çıktı, en pahalı fiyat, asıl ve yedek model için iki çalışma) `ai_reserve()` ile kullanıcı 3 $,
+  organizasyon 10 $ ve bütün sistem 20 $ (`SHEDU_AI_DAILY_BUDGET_USD`) son 24 saat bütçesinden
+  **ayrılır**; sığmıyorsa model çağrılmaz (429). Rezervasyonlar tek kilitle sıralanır: eşzamanlı
+  çağrılar aynı boş bütçeyi iki kez kullanamaz. Çağrı bitince gerçek harcama rezervasyonu kapatan
+  ayrı satır olarak yazılır (başarı, ret, hata); yedek model denemeleri de sayılır
+  (`usage.iterations`). AI servisi her hata yanıtında `may_be_billed` bildirir: faturalanmayan
+  hata sıfırla, sonucu bilinmeyen çağrı (zaman aşımı, düşen servis, okunamayan yanıt) tahminle
+  kapanır. Süreç kesilirse veya kayıt yazılamazsa rezervasyon açık kalır ve tahminiyle sayılmaya
+  devam eder; çağrı ve kayıt ayrı görevde yürür, istemci bağlantıyı koparsa da tamamlanır. AI
+  servisi SDK'nın kendi yeniden denemesini kapatır. Defter yalnızca eklenir, başka tabloya
+  yabancı anahtarı yoktur: hesap silinse de harcama kalır. Uygulama rolü satırları okuyamaz;
+  yalnızca toplam döndüren `ai_spend_last_day()` ve `ai_reserve()` yordamlarını çağırabilir. AI
+  servisi fiyatı bilinmeyen bir modelle başlamaz.
 - **AI servisine bağlantı (ARC-04, NET-01):** `SHEDU_AI_URL` ve `SHEDU_AI_TOKEN` (en az 32
   karakter, diğer sırlardan farklı) birlikte verilir; yoksa özellik 503 döner. Loopback dışında
   yalnızca HTTPS kabul edilir. Yönlendirme izlenmez, vekil sunucu kullanılmaz, yanıt 64 KB ile
-  sınırlıdır, istek 75 saniyede zaman aşımına uğrar. AI servisi token'ı sabit zamanlı karşılaştırır;
-  token'sız yapılandırılırsa hiçbir isteğe yanıt vermez. Şema ve dokümantasyon yayınlanmaz.
+  sınırlıdır, istek 75 saniyede zaman aşımına uğrar. AI servisinde saf ASGI bir kapı token'ı
+  gövde okunmadan sabit zamanlı karşılaştırır ve gövdeyi 1 MiB ile sınırlar; doğrulama hatası
+  istek içeriğini yansıtmaz. Token'sız yapılandırılırsa özet ucu 503 döner (yalnızca `/health`
+  açıktır). Şema ve dokümantasyon yayınlanmaz.
 - **Kayıt (LOG-02):** denetim kaydına (`ai.summary_generated`, `ai.summary_failed`) olay sayısı,
   model, token ve maliyet yazılır; özet metni ve olay içeriği yazılmaz. AI servisi de içerik
   loglamaz.

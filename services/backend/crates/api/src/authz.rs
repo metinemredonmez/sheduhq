@@ -83,7 +83,10 @@ pub struct OrgContext {
     pub role: Role,
 }
 
-/// İşlemi başlatır, kullanıcı ve kiracı bağlamını ayarlar ve üyeliği doğrular.
+/// İşlemi başlatır, kullanıcı ve kiracı bağlamını ayarlar ve üyeliği doğrular. Üyelik satırı işlem
+/// boyunca paylaşımlı kilitlenir: aynı anda yapılan rol değişikliği veya üyelikten çıkarma bu
+/// işlem bitene kadar bekler; işlem eski rolle karar verip yeni rol yürürlükteyken yazamaz
+/// (AZ-05, BUS-01).
 pub async fn begin(
     state: &AppState,
     user: AuthUser,
@@ -95,7 +98,8 @@ pub async fn begin(
         "SELECT m.role, o.kind,
                 EXISTS (SELECT 1 FROM session_factors f WHERE f.family_id = $3 AND f.user_id = $1)
            FROM memberships m JOIN organizations o ON o.id = m.organization_id
-          WHERE m.user_id = $1 AND m.organization_id = $2",
+          WHERE m.user_id = $1 AND m.organization_id = $2
+            FOR SHARE OF m",
     )
     .bind(user.user_id)
     .bind(organization_id)
@@ -175,12 +179,18 @@ pub async fn permissions(
         return Ok(Permissions::ALL);
     }
 
+    // Yetki kayıtları işlem boyunca paylaşımlı kilitlenir: eşzamanlı geri alma veya değişiklik,
+    // bu yetkiye dayanan yazım bitene kadar bekler (AZ-05). Saniyeye çevirmede güvenli yöne
+    // yuvarlanır: başlangıç yukarı, bitiş aşağı (kesirli saniyede pencere erken açılmaz, geç
+    // kapanmaz).
     let grants: Vec<GrantRow> = sqlx::query_as(
         "SELECT id, partition_id, can_view_events, can_arm, can_disarm, can_bypass, always_open,
-                extract(epoch FROM valid_from)::bigint, extract(epoch FROM expires_at)::bigint
+                ceil(extract(epoch FROM valid_from))::bigint,
+                floor(extract(epoch FROM expires_at))::bigint
            FROM access_grants
           WHERE user_id = $1 AND panel_id = $2 AND organization_id = $4
-            AND ($3::uuid IS NULL OR partition_id IS NULL OR partition_id = $3)",
+            AND ($3::uuid IS NULL OR partition_id IS NULL OR partition_id = $3)
+            FOR SHARE",
     )
     .bind(ctx.user.user_id)
     .bind(panel_id)
@@ -280,14 +290,17 @@ pub async fn visible_partitions(
     Ok(Some(rows.into_iter().filter_map(|(p,)| p).collect()))
 }
 
-/// Organizasyonun saat dilimindeki şu an (erişim pencereleri bu saate göre değerlendirilir).
+/// Organizasyonun saat dilimindeki şu an (erişim pencereleri bu saate göre değerlendirilir). İşlem
+/// başlangıcı (`now()`) değil, karar anı (`clock_timestamp()`) kullanılır: komut yolu bölüm
+/// kilidini beklerken pencere kapanmışsa karar kapanmış pencereye göre verilir (BUS-01).
 async fn local_moment(conn: &mut PgConnection) -> ApiResult<LocalMoment> {
     let (unix, day, minute): (i64, i32, i32) = sqlx::query_as(
-        "SELECT extract(epoch FROM now())::bigint,
-                extract(isodow FROM now() AT TIME ZONE o.time_zone)::int,
-                (extract(hour FROM now() AT TIME ZONE o.time_zone) * 60
-                 + extract(minute FROM now() AT TIME ZONE o.time_zone))::int
-           FROM organizations o WHERE o.id = app_current_org()",
+        "SELECT floor(extract(epoch FROM t.at))::bigint,
+                extract(isodow FROM t.at AT TIME ZONE o.time_zone)::int,
+                (extract(hour FROM t.at AT TIME ZONE o.time_zone) * 60
+                 + extract(minute FROM t.at AT TIME ZONE o.time_zone))::int
+           FROM organizations o, (SELECT clock_timestamp() AS at) t
+          WHERE o.id = app_current_org()",
     )
     .fetch_one(conn)
     .await?;
@@ -317,22 +330,14 @@ fn to_window(day: i16, start: i16, end: i16) -> Option<AccessWindow> {
     })
 }
 
-/// Oturum hâlâ geçerli mi? (kullanıcı etkin ve oturum ailesi iptal edilmemiş)
+/// Oturum hâlâ geçerli mi? Kural SQL'deki `session_active` ile tek yerde tanımlıdır.
 pub async fn session_active(conn: &mut PgConnection, user: AuthUser) -> Result<bool, sqlx::Error> {
-    let active: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM users u
-          WHERE u.id = $1 AND u.status = 'active'
-            AND EXISTS (SELECT 1 FROM refresh_tokens r
-                         WHERE r.family_id = $2 AND r.user_id = $1 AND r.revoked_at IS NULL)
-            AND (SELECT min(f.created_at) FROM refresh_tokens f WHERE f.family_id = $2)
-                > now() - make_interval(days => $3)",
-    )
-    .bind(user.user_id)
-    .bind(user.session_id)
-    .bind(crate::auth::tokens::SESSION_MAX_DAYS)
-    .fetch_optional(conn)
-    .await?;
-    Ok(active.is_some())
+    let (active,): (bool,) = sqlx::query_as("SELECT session_active($2, $1)")
+        .bind(user.user_id)
+        .bind(user.session_id)
+        .fetch_one(conn)
+        .await?;
+    Ok(active)
 }
 
 /// İşlemin organizasyonunun türü (`home`, `business`, `monitoring_center`).

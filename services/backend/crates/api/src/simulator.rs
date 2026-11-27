@@ -12,6 +12,46 @@ use crate::{AppState, audit, db::set_context};
 /// (panel, bölüm, tür, zonlar, bölüm numarası)
 type CompletedCommand = (Uuid, Uuid, String, Option<Vec<i16>>, i16);
 
+/// Kabul edilip bu kadar süre içinde tamamlanmayan sanal komut takılmış sayılır (süreç yeniden
+/// başladı veya tamamlama başarısız oldu).
+const STALE_AFTER_SECS: i32 = 30;
+
+/// Takılan sanal komutları açılışta ve dakikada bir tamamlar (BUS-01, ARC-05). Komut kalıcı olarak
+/// `accepted` durumunda bekler; süreç içindeki zamanlayıcı kaybolsa da tarama onu bulur ve aynı
+/// koşullu güncellemeyle (`status = 'accepted'`) bir kez tamamlar. Böylece bölümdeki bekleyen
+/// komut kısıtı sonraki komutları kalıcı olarak engellemez.
+pub fn start_recovery(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match recover_stale(&state, STALE_AFTER_SECS).await {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(count, "takılan sanal panel komutları tamamlandı"),
+                Err(error) => tracing::error!(?error, "takılan sanal komut taraması başarısız"),
+            }
+        }
+    })
+}
+
+/// `max_age_secs` saniyeden eski, hâlâ `accepted` sanal komutları tamamlar; tamamlanan sayısını
+/// döner.
+pub async fn recover_stale(state: &AppState, max_age_secs: i32) -> Result<usize, sqlx::Error> {
+    let stale: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT id, organization_id FROM stale_simulated_commands($1, 100)")
+            .bind(max_age_secs)
+            .fetch_all(&state.db)
+            .await?;
+    let mut completed = 0;
+    for (command_id, organization_id) in stale {
+        if complete(state, organization_id, command_id).await? {
+            completed += 1;
+        }
+    }
+    Ok(completed)
+}
+
 pub fn schedule(state: AppState, organization_id: Uuid, command_id: Uuid) {
     tokio::spawn(async move {
         tokio::time::sleep(state.simulator_delay).await;
@@ -21,11 +61,13 @@ pub fn schedule(state: AppState, organization_id: Uuid, command_id: Uuid) {
     });
 }
 
+/// Komutu tamamlar; komut zaten tamamlandıysa (başka kopya veya tarama) hiçbir şey yapmaz.
+/// Tamamladıysa `true`.
 async fn complete(
     state: &AppState,
     organization_id: Uuid,
     command_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, None, Some(organization_id)).await?;
 
@@ -42,7 +84,7 @@ async fn complete(
     .await?;
     let Some((panel_id, partition_id, kind, zones, partition_number)) = done else {
         tx.commit().await?;
-        return Ok(());
+        return Ok(false);
     };
 
     let new_state = match kind.as_str() {
@@ -92,5 +134,6 @@ async fn complete(
         },
     )
     .await?;
-    tx.commit().await
+    tx.commit().await?;
+    Ok(true)
 }

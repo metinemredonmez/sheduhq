@@ -12,6 +12,9 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # SHA'ya sabitli aksiyonları ve satır sonundaki "# vX.Y.Z" yorumunu birlikte günceller.
+  # Dependabot iş akışındaki services.image, Rust ve uv sabitlerini taramaz; ci.yml'de elle
+  # güncellenir (OPS-04).
   - package-ecosystem: github-actions
     directory: /
     schedule:

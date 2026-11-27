@@ -1,17 +1,25 @@
 //! Push bildirimleri.
 //!
-//! Panel olayı yazıldığında veritabanı bildirim gönderir; dağıtıcı olayı **kilitleyerek** alır
-//! (`FOR UPDATE SKIP LOCKED`), alıcıları yetkiye göre bulur, gönderir, teslim kaydını yazar ve
-//! olayı "bildirildi" işaretler. Böylece:
-//! - birden fazla API kopyası aynı olayı iki kez göndermez;
-//! - gönderim sırasında süreç çökerse işlem geri alınır, düzenli tarama olayı yeniden dener:
-//!   alarm bildirimi kaybolmaz.
+//! Teslim kalıcı bir kuyrukla yapılır (BUS-02, ARC-05):
+//! 1. Panel olayı yazılınca dağıtıcı olayı **kilitleyerek** alır (`FOR UPDATE SKIP LOCKED`),
+//!    alıcıları yetkiye göre bulur, her alıcı cihaz için `pending` bir teslim işi yazar ve olayı
+//!    "dağıtıldı" işaretler. Birden fazla API kopyası aynı olayı iki kez dağıtmaz.
+//! 2. Her iş kısa bir işlemde süreli olarak alınır (`sending`, `lease_until`), sağlayıcıya
+//!    **veritabanı işlemi dışında** gönderilir ve sonuç ayrı bir işlemde yazılır. Sağlayıcıyı
+//!    beklerken bağlantı veya kilit tutulmaz.
+//! 3. Geçici hata artan aralıklarla yeniden denenir; deneme hakkı veya süre dolarsa iş `failed`
+//!    olur ve hata olarak loglanır. Süreç gönderim sırasında kesilirse süre dolunca iş yeniden
+//!    alınır: bildirim kaybolmaz (en az bir kez). Aynı bildirimin ikinci kez gitmesi yalnızca
+//!    sağlayıcının kabulü ile sonucun yazılması arasındaki kesintide olur; sağlayıcı bağdaştırıcısı
+//!    `collapse_key`'i (APNs `apns-collapse-id`, FCM `collapse_key`) kullanarak cihazda tekilleştirir.
+//! 4. Kaçırılan olaylar ve zamanı gelen işler düzenli taramayla yakalanır.
 //!
-//! Alıcılar: organizasyonun yöneticileri, operatörleri ve o panelde (bölüm düzeyinde) geçerli görme yetkisi olan
-//! üyeler; yalnızca etkin oturumu olan ve push token'ı kayıtlı cihazlar. Çıkış yapılmış cihaza
-//! bildirim gitmez.
+//! Alıcılar: organizasyonun yöneticileri, operatörleri ve o panelde (bölüm düzeyinde) geçerli görme
+//! yetkisi olan üyeler; yalnızca etkin oturumu (`session_active`) olan ve push token'ı kayıtlı
+//! cihazlar. Çıkış yapılmış cihaza bildirim gitmez; gönderim anında token silinmişse iş iptal olur.
 //!
 //! Gerçek sağlayıcılar (FCM, APNs) henüz bağlanmadı; üretimde sağlayıcı yoksa API başlamaz.
+//! Bağdaştırıcının gönderim zaman aşımı `LEASE_SECS`'ten kısa olmalıdır.
 
 use std::{
     future::Future,
@@ -69,12 +77,20 @@ pub struct PushMessage {
     pub panel_id: Uuid,
     pub event_id: i64,
     pub kind: String,
+    /// Aynı bildirimin tekrarını cihazda tekilleştirme anahtarı (APNs `apns-collapse-id`, FCM
+    /// `collapse_key`). Olay başına sabittir.
+    pub collapse_key: String,
 }
 
 pub type PushFuture<'a> = Pin<Box<dyn Future<Output = Result<(), PushError>> + Send + 'a>>;
 
-#[derive(Debug)]
-pub struct PushError;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    /// Geçici hata (ağ, sağlayıcı yoğunluğu, yapılandırma): yeniden denenir.
+    Transient,
+    /// Token geçersiz veya cihaz sağlayıcıda kayıtlı değil: yeniden denenmez, token silinir.
+    InvalidToken,
+}
 
 pub trait PushSender: Send + Sync {
     fn send<'a>(&'a self, message: &'a PushMessage) -> PushFuture<'a>;
@@ -85,7 +101,7 @@ pub struct DisabledPush;
 
 impl PushSender for DisabledPush {
     fn send<'a>(&'a self, _message: &'a PushMessage) -> PushFuture<'a> {
-        Box::pin(async { Err(PushError) })
+        Box::pin(async { Err(PushError::Transient) })
     }
 }
 
@@ -104,10 +120,12 @@ impl PushSender for DevConsolePush {
     }
 }
 
-/// Testler için: gönderilen bildirimleri bellekte tutar.
+/// Testler için: gönderilen bildirimleri bellekte tutar; istenirse sonraki gönderimleri geçici
+/// hatayla düşürür.
 #[derive(Default, Clone)]
 pub struct RecordingPush {
     sent: Arc<Mutex<Vec<PushMessage>>>,
+    failures: Arc<Mutex<usize>>,
 }
 
 impl RecordingPush {
@@ -117,11 +135,26 @@ impl RecordingPush {
             .map(|sent| sent.clone())
             .unwrap_or_default()
     }
+
+    /// Sonraki `count` gönderim geçici hata verir.
+    pub fn fail_next(&self, count: usize) {
+        if let Ok(mut failures) = self.failures.lock() {
+            *failures = count;
+        }
+    }
 }
 
 impl PushSender for RecordingPush {
     fn send<'a>(&'a self, message: &'a PushMessage) -> PushFuture<'a> {
         Box::pin(async move {
+            let failing = self.failures.lock().is_ok_and(|mut failures| {
+                let fail = *failures > 0;
+                *failures = failures.saturating_sub(1);
+                fail
+            });
+            if failing {
+                return Err(PushError::Transient);
+            }
             if let Ok(mut sent) = self.sent.lock() {
                 sent.push(message.clone());
             }
@@ -130,12 +163,30 @@ impl PushSender for RecordingPush {
     }
 }
 
+/// Alınmış işin süresi: süreç bu sürede sonucu yazamazsa iş yeniden alınır.
+const LEASE_SECS: f64 = 30.0;
+/// Bir teslim işinin en fazla deneme sayısı.
+const MAX_ATTEMPTS: i16 = 6;
+/// Bu kadar eski bildirim artık gönderilmez: bir saat sonra gelen alarm bildirimi yanıltıcıdır.
+const MAX_AGE_MINUTES: i32 = 60;
+
+/// Geçici hatadan sonra bir sonraki denemeye kadar bekleme (saniye).
+fn retry_delay_secs(attempts: i16) -> f64 {
+    match attempts {
+        ..=1 => 5.0,
+        2 => 15.0,
+        3 => 60.0,
+        4 => 120.0,
+        _ => 300.0,
+    }
+}
+
 /// Olay bildirimlerini dinleyen dağıtıcı ve kaçırılan olaylar için düzenli tarama.
 pub fn start_dispatcher(state: &AppState) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     tokio::spawn(async move {
         let mut events = state.events.subscribe();
-        let mut sweep = tokio::time::interval(Duration::from_secs(15));
+        let mut sweep = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
                 received = events.recv() => match received {
@@ -159,15 +210,25 @@ pub fn start_dispatcher(state: &AppState) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Bildirimi bekleyen olayları (birkaç saniyeden eski) yeniden dağıtır.
+/// Kaçırılan olayları (birkaç saniyeden eski, dağıtılmamış) dağıtır ve zamanı gelen teslim
+/// işlerini (yeniden deneme, süresi dolmuş alınmış iş) gönderir. İşlenen olay ve iş sayısını döner.
 pub async fn sweep_pending(state: &AppState) -> Result<usize, sqlx::Error> {
     let pending: Vec<(i64, Uuid)> =
         sqlx::query_as("SELECT id, organization_id FROM pending_panel_events(100)")
             .fetch_all(&state.db)
             .await?;
-    let count = pending.len();
+    let mut count = pending.len();
     for (id, organization_id) in pending {
         dispatch(state, organization_id, id).await?;
+    }
+    let due: Vec<(i64, Uuid)> =
+        sqlx::query_as("SELECT id, organization_id FROM due_push_deliveries(200)")
+            .fetch_all(&state.db)
+            .await?;
+    for (id, organization_id) in due {
+        if deliver(state, organization_id, id).await? != Delivery::Skipped {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -184,20 +245,35 @@ type EventRow = (
     Option<String>,
     Option<String>,
 );
-type Recipient = (Uuid, Uuid, String, String);
 
-/// Tek bir olayın bildirimlerini gönderir. Olay başka bir kopya tarafından işleniyorsa veya zaten
-/// bildirildiyse hiçbir şey yapmaz.
+/// Tek bir olayı dağıtır ve oluşan teslim işlerini hemen gönderir; gönderilen bildirim sayısını
+/// döner. Olay başka bir kopya tarafından işleniyorsa veya zaten dağıtıldıysa hiçbir şey yapmaz.
 pub async fn dispatch(
     state: &AppState,
     organization_id: Uuid,
     event_id: i64,
 ) -> Result<usize, sqlx::Error> {
+    let deliveries = fan_out(state, organization_id, event_id).await?;
+    let mut sent = 0;
+    for id in deliveries {
+        if deliver(state, organization_id, id).await? == Delivery::Sent {
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
+
+/// Olayın alıcılarını bulur ve her cihaz için teslim işi yazar (tek ve kısa işlem).
+async fn fan_out(
+    state: &AppState,
+    organization_id: Uuid,
+    event_id: i64,
+) -> Result<Vec<i64>, sqlx::Error> {
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, None, Some(organization_id)).await?;
 
-    let claimed: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM panel_events
+    let claimed: Option<(Uuid, String, String, Option<i16>)> = sqlx::query_as(
+        "SELECT panel_id, kind, priority, partition_number FROM panel_events
           WHERE id = $1 AND organization_id = $2 AND notified_at IS NULL
           FOR UPDATE SKIP LOCKED",
     )
@@ -205,32 +281,18 @@ pub async fn dispatch(
     .bind(organization_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if claimed.is_none() {
+    let Some((panel_id, kind, priority, partition_number)) = claimed else {
         tx.commit().await?;
-        return Ok(0);
-    }
-
-    let (panel_id, kind, alarm_kind, arm_mode, priority, partition_number, zone_number, panel_name, partition_name, zone_name): EventRow =
-        sqlx::query_as(
-            "SELECT e.panel_id, e.kind, e.alarm_kind, e.arm_mode, e.priority, e.partition_number, e.zone_number,
-                    p.name, pt.name, z.name
-               FROM panel_events e
-               JOIN panels p ON p.id = e.panel_id
-               LEFT JOIN partitions pt ON pt.panel_id = e.panel_id AND pt.number = e.partition_number
-               LEFT JOIN zones z ON z.panel_id = e.panel_id AND z.number = e.zone_number
-              WHERE e.id = $1",
-        )
-        .bind(event_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        return Ok(Vec::new());
+    };
 
     // Kapatılabilen kategorideyse kişinin tercihi uygulanır; bilinmeyen tür ve alarm her zaman
     // gönderilir (şüphede bildirim gider).
     let muteable = notifications::category_of_event(&kind)
         .filter(|category| category.can_be_disabled())
         .map(notifications::category_name);
-    let recipients: Vec<Recipient> = sqlx::query_as(
-        "SELECT DISTINCT d.id, d.user_id, d.push_token, d.platform
+    let recipients: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT d.id, d.user_id
            FROM user_devices d
            JOIN memberships m ON m.user_id = d.user_id AND m.organization_id = $1
            JOIN organizations o ON o.id = m.organization_id
@@ -241,14 +303,16 @@ pub async fn dispatch(
                    SELECT 1 FROM notification_preferences np
                     WHERE np.user_id = d.user_id AND np.organization_id = $1
                       AND np.category = $4 AND NOT np.enabled))
-            AND EXISTS (SELECT 1 FROM refresh_tokens r
-                         WHERE r.device_id = d.id AND r.revoked_at IS NULL AND r.expires_at > now()
+            -- Cihazın oturumu etkin (HTTP ile aynı kural: iptal yok, 90 gün, yenilenebilir).
+            AND EXISTS (SELECT 1 FROM session_families f
+                         WHERE f.device_id = d.id AND f.user_id = d.user_id
+                           AND session_active(f.id, f.user_id)
                            -- Personel cihazı yalnızca ikinci adımı tamamlanmış oturumla (AUT-01;
                            -- kural authz::mfa_required ile aynı).
                            AND (o.kind NOT IN ('business', 'monitoring_center')
                                 OR m.role NOT IN ('owner', 'admin', 'operator')
-                                OR EXISTS (SELECT 1 FROM session_factors f
-                                            WHERE f.family_id = r.family_id AND f.user_id = d.user_id)))
+                                OR EXISTS (SELECT 1 FROM session_factors sf
+                                            WHERE sf.family_id = f.id AND sf.user_id = d.user_id)))
             AND (m.role IN ('owner', 'admin', 'operator') OR EXISTS (
                    SELECT 1 FROM access_grants g
                     WHERE g.user_id = d.user_id AND g.panel_id = $2 AND g.can_view_events
@@ -265,6 +329,123 @@ pub async fn dispatch(
     .await?;
 
     let priority = PushPriority::parse(&priority);
+    let mut deliveries = Vec::with_capacity(recipients.len());
+    for (device_id, user_id) in recipients {
+        let id: Option<(i64,)> = sqlx::query_as(
+            "INSERT INTO push_deliveries (organization_id, panel_event_id, user_id, device_id, priority, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')
+             ON CONFLICT (panel_event_id, device_id) DO NOTHING
+             RETURNING id",
+        )
+        .bind(organization_id)
+        .bind(event_id)
+        .bind(user_id)
+        .bind(device_id)
+        .bind(priority.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        deliveries.extend(id.map(|(id,)| id));
+    }
+
+    sqlx::query("UPDATE panel_events SET notified_at = now() WHERE id = $1")
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(deliveries)
+}
+
+/// Bir teslim işinin sonucu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// İş başka bir kopyada veya zamanı gelmemiş: dokunulmadı.
+    Skipped,
+    Sent,
+    /// Yeniden denenecek.
+    Retrying,
+    /// Gönderilmeyecek (deneme hakkı/süre doldu, token geçersiz, cihaz çıkış yaptı).
+    Abandoned,
+}
+
+/// Bir teslim işini alır, gönderir ve sonucunu yazar.
+async fn deliver(
+    state: &AppState,
+    organization_id: Uuid,
+    delivery_id: i64,
+) -> Result<Delivery, sqlx::Error> {
+    // 1. İş kısa bir işlemde süreli olarak alınır. Aynı işi iki kopya aynı anda alamaz: ikincisi
+    //    satır kilidini bekler ve koşulu yeniden değerlendirince işi alınmış bulur.
+    let mut tx = state.db.begin().await?;
+    set_context(&mut tx, None, Some(organization_id)).await?;
+    let claimed: Option<(i64, Uuid, Option<Uuid>, i16, String, bool)> = sqlx::query_as(
+        "UPDATE push_deliveries d
+            SET status = 'sending', attempts = d.attempts + 1, updated_at = now(),
+                lease_until = now() + make_interval(secs => $2)
+          WHERE d.id = $1
+            AND ((d.status = 'pending' AND d.next_attempt_at <= now())
+                 OR (d.status = 'sending' AND d.lease_until < now()))
+          RETURNING d.panel_event_id, d.user_id, d.device_id, d.attempts, d.priority,
+                    d.created_at < now() - make_interval(mins => $3)",
+    )
+    .bind(delivery_id)
+    .bind(LEASE_SECS)
+    .bind(MAX_AGE_MINUTES)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((event_id, user_id, device_id, attempt, priority, too_old)) = claimed else {
+        tx.commit().await?;
+        return Ok(Delivery::Skipped);
+    };
+
+    // Token gönderim anında okunur: arada çıkış yapılmışsa (token silindi) iş iptal olur.
+    let device: Option<(String, String)> = match device_id {
+        Some(device_id) => {
+            sqlx::query_as(
+                "SELECT push_token, platform FROM user_devices
+                  WHERE id = $1 AND user_id = $2 AND push_token IS NOT NULL",
+            )
+            .bind(device_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+        None => None,
+    };
+    let (Some((token, platform)), false) = (device, too_old) else {
+        finish(
+            &mut tx,
+            delivery_id,
+            attempt,
+            if too_old { "failed" } else { "cancelled" },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        if too_old {
+            tracing::error!(
+                event_id,
+                delivery_id,
+                "push bildirimi süresi dolduğu için gönderilmedi"
+            );
+        }
+        return Ok(Delivery::Abandoned);
+    };
+
+    let (panel_id, kind, alarm_kind, arm_mode, _, _, zone_number, panel_name, partition_name, zone_name): EventRow =
+        sqlx::query_as(
+            "SELECT e.panel_id, e.kind, e.alarm_kind, e.arm_mode, e.priority, e.partition_number, e.zone_number,
+                    p.name, pt.name, z.name
+               FROM panel_events e
+               JOIN panels p ON p.id = e.panel_id
+               LEFT JOIN partitions pt ON pt.panel_id = e.panel_id AND pt.number = e.partition_number
+               LEFT JOIN zones z ON z.panel_id = e.panel_id AND z.number = e.zone_number
+              WHERE e.id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
     let (title, body) = text(
         &kind,
         alarm_kind.as_deref(),
@@ -274,51 +455,102 @@ pub async fn dispatch(
         zone_name.as_deref(),
         zone_number,
     );
+    let message = PushMessage {
+        token,
+        platform,
+        user_id,
+        priority: PushPriority::parse(&priority),
+        title,
+        body,
+        organization_id,
+        panel_id,
+        event_id,
+        kind,
+        collapse_key: format!("shedu-event-{event_id}"),
+    };
 
-    let mut sent = 0;
-    for (device_id, user_id, token, platform) in recipients {
-        let message = PushMessage {
-            token,
-            platform,
-            user_id,
-            priority,
-            title: title.clone(),
-            body: body.clone(),
-            organization_id,
-            panel_id,
-            event_id,
-            kind: kind.clone(),
-        };
-        let status = match state.push.send(&message).await {
-            Ok(()) => {
-                sent += 1;
-                "sent"
-            }
-            Err(_) => {
-                tracing::error!(event_id, %device_id, "push gönderilemedi");
-                "failed"
-            }
-        };
-        sqlx::query(
-            "INSERT INTO push_deliveries (organization_id, panel_event_id, user_id, device_id, priority, status)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(organization_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(device_id)
-        .bind(priority.as_str())
-        .bind(status)
-        .execute(&mut *tx)
-        .await?;
-    }
+    // 2. Gönderim veritabanı işlemi dışında.
+    let result = state.push.send(&message).await;
 
-    sqlx::query("UPDATE panel_events SET notified_at = now() WHERE id = $1")
-        .bind(event_id)
-        .execute(&mut *tx)
-        .await?;
+    // 3. Sonuç ayrı işlemde yazılır; yalnızca bu denemenin aldığı iş güncellenir.
+    let mut tx = state.db.begin().await?;
+    set_context(&mut tx, None, Some(organization_id)).await?;
+    let outcome = match result {
+        Ok(()) => {
+            finish(&mut tx, delivery_id, attempt, "sent", None).await?;
+            Delivery::Sent
+        }
+        Err(PushError::InvalidToken) => {
+            finish(&mut tx, delivery_id, attempt, "failed", None).await?;
+            sqlx::query(
+                "UPDATE user_devices SET push_token = NULL WHERE id = $1 AND push_token = $2",
+            )
+            .bind(device_id)
+            .bind(&message.token)
+            .execute(&mut *tx)
+            .await?;
+            tracing::warn!(
+                event_id,
+                delivery_id,
+                "push token geçersiz; cihazın token'ı silindi"
+            );
+            Delivery::Abandoned
+        }
+        Err(PushError::Transient) if attempt >= MAX_ATTEMPTS => {
+            finish(&mut tx, delivery_id, attempt, "failed", None).await?;
+            tracing::error!(
+                event_id,
+                delivery_id,
+                attempt,
+                "push bildirimi kalıcı olarak gönderilemedi"
+            );
+            Delivery::Abandoned
+        }
+        Err(PushError::Transient) => {
+            finish(
+                &mut tx,
+                delivery_id,
+                attempt,
+                "pending",
+                Some(retry_delay_secs(attempt)),
+            )
+            .await?;
+            tracing::warn!(
+                event_id,
+                delivery_id,
+                attempt,
+                "push gönderilemedi; yeniden denenecek"
+            );
+            Delivery::Retrying
+        }
+    };
     tx.commit().await?;
-    Ok(sent)
+    Ok(outcome)
+}
+
+/// Alınmış işin sonucunu yazar. `retry_in` verilirse iş o kadar saniye sonra yeniden denenir.
+async fn finish(
+    conn: &mut sqlx::PgConnection,
+    delivery_id: i64,
+    attempt: i16,
+    status: &'static str,
+    retry_in: Option<f64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE push_deliveries
+            SET status = $3, lease_until = NULL, updated_at = now(),
+                sent_at = CASE WHEN $3 = 'sent' THEN now() END,
+                next_attempt_at = CASE WHEN $4::float8 IS NULL THEN next_attempt_at
+                                       ELSE now() + make_interval(secs => $4) END
+          WHERE id = $1 AND status = 'sending' AND attempts = $2",
+    )
+    .bind(delivery_id)
+    .bind(attempt)
+    .bind(status)
+    .bind(retry_in)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 fn alarm_label(alarm_kind: Option<&str>) -> &'static str {
@@ -411,6 +643,7 @@ mod tests {
             panel_id: Uuid::new_v4(),
             event_id: 1,
             kind: "alarm".into(),
+            collapse_key: "shedu-event-1".into(),
         };
         assert!(
             !serde_json::to_string(&message)

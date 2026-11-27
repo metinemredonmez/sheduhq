@@ -172,9 +172,17 @@ pub async fn panel_detail(
     .bind(panel_id)
     .fetch_all(&mut *tx)
     .await?;
+    // Paylaşılan zonda görünmeyen bölümlerin kimlikleri de yanıttan çıkarılır (AZ-04).
+    let sees_all = ctx.role.sees_all_panels();
     let zones = zones
         .into_iter()
-        .filter(|z| ctx.role.sees_all_panels() || z.partitions.iter().any(|p| visible.contains(p)))
+        .filter(|z| sees_all || z.partitions.iter().any(|p| visible.contains(p)))
+        .map(|mut z| {
+            if !sees_all {
+                z.partitions.retain(|p| visible.contains(p));
+            }
+            z
+        })
         .collect();
 
     let outputs = if ctx.role.is_manager() {

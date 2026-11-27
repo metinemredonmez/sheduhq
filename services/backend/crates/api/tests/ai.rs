@@ -28,10 +28,14 @@ enum Mode {
     Answer,
     /// Model reddetti; harcama bildirilir.
     Refuse,
-    /// Model çağrılamadı; harcama yok.
+    /// Sağlayıcı faturalamadan reddetti (ör. yoğunluk): harcama yok.
     Fail,
+    /// Sağlayıcıya istek gitti ama yanıt gelmedi (zaman aşımı): harcama bilinmiyor.
+    Timeout,
     /// Servis beklenmedik biçimde düştü (JSON olmayan 500): harcama bilinmiyor.
     Crash,
+    /// Yanıtı geciktirir (eşzamanlı rezervasyon testi).
+    Slow,
 }
 
 /// (Authorization başlığı, istek gövdesi)
@@ -66,9 +70,12 @@ async fn fake_summary(
         .map(str::to_owned);
     fake.requests.lock().expect("kilit").push((auth, body));
     let mode = *fake.mode.lock().expect("kilit");
+    if mode == Mode::Slow {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
     match mode {
         // Sayılar ve dikkat işareti bilerek yanlış: API bunları kullanmamalı.
-        Mode::Answer => (
+        Mode::Answer | Mode::Slow => (
             StatusCode::OK,
             Json(json!({
                 "summary": "  Garajda   bir alarm oldu.\n",
@@ -98,7 +105,12 @@ async fn fake_summary(
             .into_response(),
         Mode::Fail => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "detail": "ai_unavailable", "usage": null })),
+            Json(json!({ "detail": "ai_unavailable", "usage": null, "may_be_billed": false })),
+        )
+            .into_response(),
+        Mode::Timeout => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "detail": "ai_unavailable", "usage": null, "may_be_billed": true })),
         )
             .into_response(),
         Mode::Crash => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response(),
@@ -229,15 +241,31 @@ fn summary_path(org: &str, panel: &str) -> String {
     format!("/v1/organizations/{org}/panels/{panel}/ai-summary")
 }
 
-/// Defterdeki harcamalar: (sonuç, mikro-dolar), eskiden yeniye.
+/// Defterdeki kapanmış harcamalar (rezervasyon satırları hariç): (sonuç, mikro-dolar), eskiden
+/// yeniye.
 async fn ledger(app: &TestApp, org: &str) -> Vec<(String, i64)> {
     sqlx::query_as(
-        "SELECT outcome, cost_microusd FROM ai_usage WHERE organization_id = $1::uuid ORDER BY id",
+        "SELECT outcome, cost_microusd FROM ai_usage
+          WHERE organization_id = $1::uuid AND outcome <> 'reserved' ORDER BY id",
     )
     .bind(org)
     .fetch_all(&app.admin)
     .await
     .expect("defter")
+}
+
+/// Kapanmamış rezervasyon sayısı.
+async fn open_reservations(app: &TestApp, org: &str) -> i64 {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM ai_usage r
+          WHERE r.organization_id = $1::uuid AND r.outcome = 'reserved'
+            AND NOT EXISTS (SELECT 1 FROM ai_usage s WHERE s.reservation_id = r.id)",
+    )
+    .bind(org)
+    .fetch_one(&app.admin)
+    .await
+    .expect("rezervasyon");
+    count
 }
 
 async fn audit_actions(app: &TestApp, org: &str) -> Vec<(String, Value)> {
@@ -385,6 +413,8 @@ async fn summary_sends_only_visible_minimal_data(_: PgPoolOptions, connect: PgCo
     assert_eq!(
         keys,
         [
+            "connection",
+            "counts",
             "events",
             "panel_name",
             "period_end",
@@ -394,6 +424,11 @@ async fn summary_sends_only_visible_minimal_data(_: PgPoolOptions, connect: PgCo
         ]
     );
     assert_eq!(sent["time_zone"], "Europe/Istanbul");
+    // Kesin sayılar ve güncel bağlantı durumu API'den gider (model listeden saymaz).
+    assert_eq!(sent["counts"]["total"], 4);
+    assert_eq!(sent["counts"]["alarms"], 1);
+    assert_eq!(sent["counts"]["disconnected"], 1);
+    assert_eq!(sent["connection"], "disconnected");
     let events = sent["events"].as_array().expect("olaylar");
     assert_eq!(events.len(), 4);
     let alarm = events.iter().find(|e| e["kind"] == "alarm").expect("alarm");
@@ -461,6 +496,17 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
     let (_, sent) = fake.requests().pop().expect("istek");
     assert_eq!(sent["events"].as_array().map(Vec::len), Some(500));
     assert_eq!(sent["truncated"], true);
+    assert_eq!(
+        sent["counts"]["armed"], 520,
+        "sayılar listeden değil, dönemden"
+    );
+    // Sonraki adımlar küçük istekle: büyük isteğin rezervasyonu (~1,2 $) bütçe sınırını sınar,
+    // burada sonuç türleri sınanıyor.
+    sqlx::query("DELETE FROM panel_events WHERE panel_id = $1::uuid")
+        .bind(&panel)
+        .execute(&app.admin)
+        .await
+        .expect("olayları sil");
 
     // Model reddi ve kesinti sabit kodlara dönüşür, denetime yazılır.
     fake.set(Mode::Refuse);
@@ -469,7 +515,7 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
         (status, body["error"].as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, Some("ai_refused"))
     );
-    for mode in [Mode::Fail, Mode::Crash] {
+    for mode in [Mode::Fail, Mode::Timeout, Mode::Crash] {
         fake.set(mode);
         let (status, body) = app.post_auth(&path, json!({}), &owner).await;
         assert_eq!(
@@ -483,23 +529,36 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
         .filter(|(action, _)| action == "ai.summary_failed")
         .map(|(_, d)| d["reason"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(failed, ["ai_refused", "ai_unavailable", "ai_unavailable"]);
-    // Harcama sonuçtan bağımsız yazılır: ret bildirilen tutarla, model çağrılamadıysa hiç,
-    // servis düştüyse en kötü durum tahminiyle.
+    assert_eq!(
+        failed,
+        [
+            "ai_refused",
+            "ai_unavailable",
+            "ai_unavailable",
+            "ai_unavailable"
+        ]
+    );
+    // Her çağrı rezervasyonunu kapatır: ret bildirilen tutarla, faturalanmayan hata sıfırla, sonucu
+    // bilinmeyen çağrı (zaman aşımı, servis düştü) en kötü durum tahminiyle.
     let spent = ledger(&app, &org).await;
     let outcomes: Vec<&str> = spent.iter().map(|(o, _)| o.as_str()).collect();
-    assert_eq!(outcomes, ["success", "refused", "unknown"]);
-    assert_eq!(spent[1].1, 1200);
-    // En az: 4096 çıktı token'ı en pahalı katmandan (50 µ$/token).
-    assert!(
-        spent[2].1 >= 204_800,
-        "tahmin temkinli olmalı: {}",
-        spent[2].1
+    assert_eq!(
+        outcomes,
+        ["success", "refused", "failed", "unknown", "unknown"]
     );
+    assert_eq!(spent[1].1, 1200);
+    assert_eq!(spent[2].1, 0);
+    // En az: iki model çalışması × 4096 çıktı token'ı en pahalı katmandan (50 µ$/token).
+    assert!(
+        spent[3].1 >= 2 * 204_800,
+        "tahmin temkinli olmalı: {}",
+        spent[3].1
+    );
+    assert_eq!(open_reservations(&app, &org).await, 0);
 
-    // Kullanıcı başına saatte 10 özet: 4 kullanıldı, 6 daha geçer, 11. reddedilir ve AI'ya gitmez.
+    // Kullanıcı başına saatte 10 özet: 5 kullanıldı, 5 daha geçer, 11. reddedilir ve AI'ya gitmez.
     fake.set(Mode::Answer);
-    for _ in 0..6 {
+    for _ in 0..5 {
         assert_eq!(
             app.post_auth(&path, json!({}), &owner).await.0,
             StatusCode::OK
@@ -510,7 +569,7 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(fake.requests().len(), before);
 
-    // Servise bağlanılamıyor: istek gitmedi, harcama yazılmaz; kısa sürede 503.
+    // Servise bağlanılamıyor: istek gitmedi, rezervasyon sıfırla kapanır; kısa sürede 503.
     use_ai(&mut app, "http://127.0.0.1:9");
     let (other, _, other_org) = app.user(MEMBER).await;
     let (other_panel, _) = demo(&app, &other, &other_org).await;
@@ -521,7 +580,52 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
         (status, body["error"].as_str()),
         (StatusCode::SERVICE_UNAVAILABLE, Some("ai_unavailable"))
     );
-    assert!(ledger(&app, &other_org).await.is_empty());
+    assert_eq!(ledger(&app, &other_org).await, [("failed".to_owned(), 0)]);
+    assert_eq!(open_reservations(&app, &other_org).await, 0);
+}
+
+/// Eşzamanlı çağrılar aynı boş bütçeyi iki kez ayıramaz (AI-03): bütçe tek bir rezervasyona
+/// yetiyorsa ikinci istek modele hiç gitmeden reddedilir.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_calls_cannot_share_the_same_budget(
+    _: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let mut app = app(connect).await;
+    let (url, fake) = start_fake().await;
+    // Küçük bir demo isteğinin rezervasyonu ~0,46 $: sistem bütçesi yalnızca bir tanesine yeter.
+    use_ai_with(
+        &mut app,
+        AiClient::new(&url, TOKEN)
+            .expect("istemci")
+            .with_global_budget(700_000),
+    );
+    enable_flag(&app).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let (panel, _) = demo(&app, &owner, &org).await;
+    let path = summary_path(&org, &panel);
+    fake.set(Mode::Slow);
+
+    let (first, second) = tokio::join!(
+        app.post_auth(&path, json!({}), &owner),
+        app.post_auth(&path, json!({}), &owner),
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS],
+        "{first:?} {second:?}"
+    );
+    assert_eq!(fake.requests().len(), 1, "ikinci istek modele gitmemeli");
+    assert_eq!(open_reservations(&app, &org).await, 0);
+
+    // Rezervasyon kapanınca gerçek harcama (küçük) sayılır: bütçe yeniden açılır.
+    fake.set(Mode::Answer);
+    assert_eq!(
+        app.post_auth(&path, json!({}), &owner).await.0,
+        StatusCode::OK
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

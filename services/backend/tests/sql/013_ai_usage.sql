@@ -20,12 +20,15 @@ BEGIN
 END
 $$;
 
--- Harcama kimliklere yabancı anahtarla bağlı değildir: hesap silinse de kalır.
+-- Harcama kimliklere yabancı anahtarla bağlı değildir: hesap silinse de kalır. Tek yabancı
+-- anahtar, kapanış satırını kendi rezervasyonuna bağlar (aynı tablo).
 DO $$
 BEGIN
     ASSERT NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conrelid = 'ai_usage'::regclass AND contype = 'f'
-    ), 'defterde yabancı anahtar olmamalı';
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'ai_usage'::regclass AND contype = 'f'
+           AND confrelid <> 'ai_usage'::regclass
+    ), 'defterde başka tabloya yabancı anahtar olmamalı';
 END
 $$;
 

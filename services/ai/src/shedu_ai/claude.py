@@ -5,8 +5,11 @@
 - Düşük çaba (effort: low) ve sınırlı `max_tokens`: özet kısa, maliyet düşük (AI-03).
 - Güvenlik sınıflandırıcısı reddederse sunucu tarafında varsayılan yedek modele geçilir
   (`fallbacks: "default"`); bütün zincir reddederse `Refused`.
-- Zaman aşımı ve yeniden deneme sınırlı; hata durumunda `Unavailable`. Alarm yolu AI'ya bağlı
-  değildir: özet gelmezse yalnızca özet gösterilmez.
+- Zaman aşımı 30 saniye, SDK'nın kendi yeniden denemesi kapalı; hata durumunda `Unavailable`.
+  Alarm yolu AI'ya bağlı değildir: özet gelmezse yalnızca özet gösterilmez.
+- Yanıt gelmeyen hatada faturalama belirsizliği `may_be_billed` ile bildirilir (AI-03): zaman
+  aşımı ve bağlantı hatasında istek sağlayıcıya ulaşmış ve model çalışmış olabilir (true);
+  sağlayıcının hata yanıtı (429, 4xx, 5xx, 529) faturalanmaz (false).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ DEFAULT_MODEL = "claude-opus-5-5"
 # Rust API, sonucu bilinmeyen çağrının maliyet tahmininde bu sınırı kullanır (ai.rs).
 MAX_TOKENS = 4096
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+CLIENT_TIMEOUT_SECONDS = 30.0
 
 
 def request_params(model: str, system: str, user: str) -> dict[str, object]:
@@ -73,7 +77,11 @@ class ClaudeWriter:
     @classmethod
     def from_environment(cls, model: str) -> ClaudeWriter:
         # Kimlik bilgisi SDK'nın standart sırasıyla ortamdan okunur (ANTHROPIC_API_KEY vb.).
-        client = anthropic.AsyncAnthropic(timeout=30.0, max_retries=1)
+        # SDK'nın yeniden denemesi kapalı (max_retries=0): Rust API her özet için tek çağrılık
+        # bütçe rezervasyonu yapar ve harcamayı tek yanıttan yazar. SDK'nın sessiz tekrarı
+        # (zaman aşımı, bağlantı, 429, 5xx) faturayı katlayabilir; zaman aşımından sonraki tekrarda
+        # ilk denemenin harcaması hiç görünmez. Tekrar gerekiyorsa kararı API verir (AI-03).
+        client = anthropic.AsyncAnthropic(timeout=CLIENT_TIMEOUT_SECONDS, max_retries=0)
         return cls(client, model)
 
     async def write(self, system: str, user: str) -> tuple[Draft, Usage]:
@@ -81,15 +89,19 @@ class ClaudeWriter:
             response = await self._client.beta.messages.create(
                 **request_params(self._model, system, user)
             )
-        except anthropic.RateLimitError as error:
-            raise Unavailable("hız sınırı") from error
+        # Sıra önemli: APITimeoutError, APIConnectionError'ın; RateLimitError, APIStatusError'ın
+        # alt sınıfıdır.
         except anthropic.APITimeoutError as error:
-            raise Unavailable("zaman aşımı") from error
+            # İstek gitmiş, model çalışmış olabilir; yanıt gelmediği için harcama bilinmez.
+            raise Unavailable("zaman aşımı", may_be_billed=True) from error
         except anthropic.APIConnectionError as error:
-            raise Unavailable("bağlantı") from error
+            raise Unavailable("bağlantı", may_be_billed=True) from error
+        except anthropic.RateLimitError as error:
+            # Sağlayıcının hata yanıtı faturalanmaz.
+            raise Unavailable("hız sınırı", may_be_billed=False) from error
         except anthropic.APIStatusError as error:
             log.warning("model hatası: durum %s", error.status_code)
-            raise Unavailable("model hatası") from error
+            raise Unavailable("model hatası", may_be_billed=False) from error
 
         # Yanıt geldiyse harcama oldu: hangi sonuç olursa olsun kullanım bildirilir.
         usage = billed_usage(response)

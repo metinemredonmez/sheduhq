@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options: PgConnectOptions = config.database_url.parse()?;
     let pool = db::connect(options, config.database_role.clone()).await?;
     // RLS'yi aşan bir rolle (süper kullanıcı, tablo sahibi) başlamak yerine dur (AZ-02, EXC-01).
-    db::verify_least_privilege(&pool).await?;
+    db::verify_least_privilege(&pool, db::Service::Api).await?;
     let mut state = AppState::new(
         pool.clone(),
         &config.jwt_secret,
@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.start_event_listener();
     state.start_push_dispatcher();
     state.start_erasure_job();
+    state.start_simulator_recovery();
 
     // Eski deneme sayacı pencerelerini saatte bir temizle.
     tokio::spawn(async move {

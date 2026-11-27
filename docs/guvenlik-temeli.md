@@ -40,7 +40,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bölüm başına tek yoldaki komutu ve denetim kaydının değiştirilemezliğini test eder. Testlerin
   bozulunca kaldığı (RLS kapatma, yanlış beklenti) yerelde doğrulandı. API katmanı henüz bu
   bağlamı kullanmadığı için durumlar "Doğrulanacak" kalır.
-- **KEY-02:** CI'da gitleaks ile her push'ta sır taraması yapılır.
+- **KEY-02:** CI'da gitleaks ile `main`'e her push'ta ve her pull request'te sır taraması yapılır.
 - **AUT-02, AUT-03, PWD-01, SES-02, SES-04, SES-05, TOK-01 (kod düzeyi):**
   `services/backend/crates/api/tests/auth.rs` (17 entegrasyon testi, gerçek PostgreSQL, uygulama
   rolüyle) ve birim testleri; kod tek kullanımı ve 5 deneme sınırı, amaca bağlılık, hesabın
@@ -163,9 +163,9 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   kişinin davetinin kabul edilmemesi ve kalıcı silmenin takılmaması; hesap başına 24 saatte 20
   başarısız doğrulama sınırı (SMS ve ikinci adım).
 - **AI olay özeti (AI-01, AI-02, AI-03, LOG-02, ARC-04):**
-  `services/backend/crates/api/tests/ai.rs` (4 entegrasyon testi, gerçek PostgreSQL ve yerel
-  sahte AI servisi), `services/backend/tests/sql/013_ai_usage.sql` ve `services/ai/tests`
-  (41 test, sahte model istemcisi): bayrak kapalıyken 403, servis yokken 503, üye olmayana 404;
+  `services/backend/crates/api/tests/ai.rs` (5 entegrasyon testi, gerçek PostgreSQL ve yerel
+  sahte AI servisi), `services/backend/tests/sql/013_ai_usage.sql`, `014_audit_fixes.sql` ve
+  `services/ai/tests` (104 test, sahte model istemcisi): bayrak kapalıyken 403, servis yokken 503, üye olmayana 404;
   AI servisine kimlik, telefon ve görünmeyen bölümün olayı gitmez; sayılar ve dikkat işareti
   AI'nın yanlış değerlerinden değil SQL'den gelir; 500 olay sınırında sayılar yine kesin; ret,
   hata ve düşen servis sabit kodlara döner ve harcaması deftere yazılır; bağlanılamayınca
@@ -174,8 +174,36 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bile değiştiremez, yabancı anahtarı yoktur. AI servisinde: veri bloğunu kapatmaya çalışan zon
   adı kaçışlanır, tanımsız alan ve kimlik reddedilir, yedek model denemeleri faturaya katılır,
   fiyatsız modelle başlanmaz. Bütçe kontrolü, ret harcaması ve bölüm filtresi bozulduğunda ilgili
-  testin kaldığı yerelde doğrulandı. Rust'ın ürettiği istek Python servisinin modeliyle uçtan uca
-  bir kez doğrulandı. Gerçek modelle çağrı yapılmadı.
+  testin kaldığı yerelde doğrulandı. Rust API'si gerçek AI servisine (sahte model yazıcısıyla)
+  bağlanarak yeni sözleşme uçtan uca doğrulandı (27 Kasım 2026). Gerçek modelle çağrı yapılmadı.
+- **İkinci denetim (27 Kasım 2026, commit `aec05ed` üzerinde, Codex):** 20 bulgu kodda doğrulandı;
+  hepsi düzeltildi veya aşağıda kalan risk olarak yazıldı. Regresyon testleri:
+  `services/backend/crates/api/tests/audit_fixes.rs` (11 test), `ai.rs`, `hardening.rs`,
+  `config.rs` birim testleri, `tests/sql/014_audit_fixes.sql`, `services/ai/tests`. Hesap başına
+  hata sınırının kilidi kaldırılınca paralel deneme testinin kaldığı yerelde doğrulandı.
+
+  | No | Kontrol | Düzeltme | Durum |
+  |---|---|---|---|
+  | S01 | BUS-02, ARC-05 | Kalıcı push teslim kuyruğu: gönderim işlem dışında, süreli iş alma, geçici hatada yeniden deneme, kalıcı hatada log, olay başına `collapse_key` | Geçti (yerel) |
+  | S02 | SES-04, SES-05 | `session_families`: yenileme ve iptal aile satırını kilitler; kimlik bilgisi sürümü; sıfırlama ve faktör değişimi bekleyen ikinci adım biletlerini geçersiz kılar | Geçti (yerel) |
+  | S03 | AUT-03 | Numara değişimi eski numaranın sıfırlama kodlarını iptal eder; sıfırlama güncel numarayı satır kilidiyle ister | Geçti (yerel) |
+  | S04 | AI-03 | Çağrı öncesi atomik rezervasyon (`ai_reserve`), `may_be_billed`, açık rezervasyon tahminle sayılır, çağrı ayrı görevde, SDK yeniden denemesi kapalı | Geçti (yerel) |
+  | S05 | SES-04 | Tek oturum kuralı (`session_active`): HTTP, WebSocket, push, oturum listesi, dışa aktarma | Geçti (yerel) |
+  | S06 | AUT-01, DAT-02 | Personelin dışa aktarması ikinci adım ister; `/v1/me` yalnızca üyelik özeti (belgelendi) | Geçti (yerel) |
+  | S07 | AUT-02, RES-01 | Hata sınırı aynı işlemde kilitli; ikinci adımda havuzdan ikinci bağlantı istenmez | Geçti (yerel) |
+  | S08 | AZ-05 | Her ikili kendi rolünü doğrular (API uygulama rolü, CLI yönetim rolü) | Geçti (yerel); veritabanında zorunlu yönetim denetim kaydı kaldı |
+  | S09 | AZ-03, DAT-05 | Devralan etkin olmalı; devir, davet kabulü ve silme talebi hesap satırı kilidiyle sıralanır | Geçti (yerel) |
+  | S10 | AZ-04, BUS-02 | Paylaşılan zonda bypass her bölümde yetki ister; alarm her bölüme ayrı olay | Geçti (yerel) |
+  | S11 | BUS-01, ARC-05 | Takılan sanal komut açılışta ve dakikada bir tamamlanır | Geçti (yerel) |
+  | S12 | AUT-03 | Hesaba bağlı parola kuralı kod doğrulandıktan sonra; kurala takılan istek kodu tüketmez | Geçti (yerel) |
+  | S13 | DAT-05 | Silme talebi süresi dolunca geri alınamaz, giriş reddedilir | Geçti (yerel) |
+  | S14 | AZ-02, AZ-05 | Bütün ayrıcalıklı yordamlarda `pg_temp` en sonda, PUBLIC'e kapalı; katalog testi | Geçti (yerel) |
+  | S15 | AZ-04, AI-02 | Paylaşılan zonun görünmeyen bölüm kimliği yanıttan çıkar; zon olayı bölüme bağlı, bağlantı olayı panel düzeyinde (kısıt); AI bağlantı sorgusu bölümsüz olaylarla sınırlı | Geçti (yerel) |
+  | S16 | NET-01 | Ayrıştırılmış etkin TLS modu denetlenir, yalnızca `verify-full` | Geçti (yerel) |
+  | S17 | RES-01, ARC-04 | AI servisinde gövde okunmadan kimlik doğrulama, 1 MiB sınır, doğrulama hatasında içerik yansıtılmaz | Geçti (yerel) |
+  | S18 | AI-01, AI-02 | Kesin sayılar ve güncel bağlantı durumu API'den modele gider; liste ve sayılar tek sorguda | Geçti (yerel) |
+  | S19 | AZ-05, BUS-01 | Üyelik ve yetki satırları işlem boyunca paylaşımlı kilitli; karar anı `clock_timestamp()`, saniye yuvarlaması güvenli yöne | Geçti (yerel) |
+  | S20 | OPS-04 | CI aksiyonları commit SHA'sına, PostgreSQL imajları özete, Rust ve uv kesin sürüme sabitlendi | CI'da doğrulanacak |
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -214,10 +242,29 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   - Rıza amaçları ve metin sürümleri taslaktır (`taslak-1`); aydınlatma metni ve rıza metinleri
     onaylanınca migration'la güncellenecek. Ticari ileti onayı için İYS (İleti Yönetim Sistemi)
     entegrasyonu yok.
-  - AI-03: aynı anda süren çağrılar sınırı aşabilir (her biri kontrolden geçtiği an sınırın
-    altındaydı); en fazla saatlik sıklık sınırı kadar. Sonucu bilinmeyen çağrının tahmini AI
-    servisinin `max_tokens` ve en pahalı fiyat değerine dayanır; bunlar iki yerde tutulur
-    (`ai.rs`, `pricing.py`). Fiyat tablosu elle güncellenir.
+  - AI-03: rezervasyon tahmini giriş token'ını istek baytının yarısıyla sayar; bu tokenleştirme
+    için kesin bir üst sınır değil, temkinli bir tahmindir (gerçek kullanımın birkaç katı). Gerçek
+    harcama her zaman sağlayıcının bildirdiği kullanımla yazılır; tahmin yalnızca sonucu bilinmeyen
+    çağrıda ve rezervasyon sırasında kullanılır. Tahmin AI servisinin `max_tokens` ve en pahalı
+    fiyat değerine dayanır; bunlar iki yerde tutulur (`ai.rs`, `pricing.py`). Fiyat tablosu elle
+    güncellenir. Sonucu bilinmeyen iki büyük çağrı (500 olay) kullanıcının günlük bütçesini
+    doldurabilir (temkinli taraf).
+  - AZ-05, LOG-01 (ikinci denetim, S08): yönetim rolü bayrak ve sürüm tablolarına doğrudan
+    yazabilir; gerekçe ve denetim kaydı yönetim aracında aynı işlemde yazılır ama veritabanında
+    zorunlu değildir. Yönetim yazıları gerekçe isteyen ayrıcalıklı yordamlara taşınacak.
+  - BUS-02 (ikinci denetim): push teslimi en az bir kezdir; sağlayıcı kabulü ile sonucun yazılması
+    arasındaki kesintide bildirim ikinci kez gidebilir. Sağlayıcı bağdaştırıcısı `collapse_key`'i
+    kullanmalı ve gönderim zaman aşımı iş süresinden (30 sn) kısa olmalıdır; bağdaştırıcılar henüz
+    yazılmadı.
+  - AZ-05 (ikinci denetim, S19): üyelik ve yetki satırlarının paylaşımlı kilidi okuma isteklerinde
+    de alınır (satır başlığına yazar); yük artınca yalnızca yazan isteklere daraltılabilir.
+  - Belge ve kod (ikinci denetim): bildirim merkezinde toplu "okundu" sınırı, sonradan görünür
+    olan bölümün eski olaylarını da okunmuş sayar; sürüm politikasında `minimum <= latest` yalnızca
+    yönetim aracında denetlenir, SQL kısıtı yok; kalıcı silmeden sonra güvenlik kayıtlarında kişi
+    kimliği takma ad olarak kalır (serbest metinli yönetim gerekçelerine kişisel veri yazılmamalı).
+  - OPS-04 (ikinci denetim): `infra/docker-compose.yml`'deki geliştirme imajı, `runs-on:
+    ubuntu-latest` ve Python yama sürümü sabit değil; servis imajı özetleri ve Rust/uv sürümleri
+    Dependabot'la değil elle güncellenir.
   - AI-02: istemciler (web, mobil) henüz yok; özet metninin düz metin olarak basılması ve "yapay
     zekâ ile üretildi" etiketi istemci yazılırken test edilecek.
   - KVKK: `ai_event_summary` bayrağı, yurt dışına aktarım ve rıza kararı (açık sorular 5, 11,

@@ -323,6 +323,15 @@ pub async fn transfer_ownership(
         return Err(ApiError::BadRequest("cannot_transfer_to_self"));
     }
 
+    // Devralan hesap etkin olmalı: silme talebi bekleyen veya kapatılmış hesap tek sahip
+    // yapılamaz. Hesap satırı paylaşımlı kilitlenir; devralanın aynı anda başlattığı silme talebi
+    // devirden sonra sıralanır ve sahip olduğunu görür (AZ-03, DAT-05). Kilit sırası her yolda
+    // aynı: önce hesap, sonra üyelik.
+    let target_active: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM users WHERE id = $1 AND status = 'active' FOR SHARE")
+            .bind(request.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let target: Option<(String,)> = sqlx::query_as(
         "SELECT role FROM memberships WHERE user_id = $1 AND organization_id = $2 FOR UPDATE",
     )
@@ -333,6 +342,9 @@ pub async fn transfer_ownership(
     let (target_role,) = target.ok_or(ApiError::NotFound)?;
     if target_role != "admin" {
         return Err(ApiError::Conflict("target_must_be_admin"));
+    }
+    if target_active.is_none() {
+        return Err(ApiError::Conflict("target_not_active"));
     }
 
     if !reauth::verify_password(&state, ctx.user.user_id, request.password).await? {

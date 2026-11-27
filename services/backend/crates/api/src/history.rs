@@ -256,22 +256,31 @@ pub async fn simulate_alarm(
     .bind(always_active)
     .fetch_all(&mut *tx)
     .await?;
-    let Some((_, partition_number)) = partitions.first().copied() else {
+    if partitions.is_empty() {
         return Err(ApiError::Conflict("partition_not_armed"));
-    };
+    }
 
-    let (event_id,): (i64,) = sqlx::query_as(
-        "INSERT INTO panel_events (organization_id, panel_id, partition_number, zone_number, kind, alarm_kind,
-                                   priority, occurred_at, source)
-         VALUES ($1, $2, $3, $4, 'alarm', $5, 'critical', now(), 'simulator') RETURNING id",
-    )
-    .bind(org_id)
-    .bind(panel_id)
-    .bind(partition_number)
-    .bind(request.zone_number)
-    .bind(&alarm_kind)
-    .fetch_one(&mut *tx)
-    .await?;
+    // Zon birden fazla bölümdeyse alarma geçen her bölüm için ayrı kritik olay yazılır: yalnızca o
+    // bölümü görebilen alıcı da bildirimi alır (AZ-04, BUS-02).
+    let mut numbers: Vec<i16> = partitions.iter().map(|(_, number)| *number).collect();
+    numbers.sort_unstable();
+    let mut event_ids: Vec<i64> = Vec::with_capacity(numbers.len());
+    for partition_number in numbers {
+        let (event_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO panel_events (organization_id, panel_id, partition_number, zone_number, kind, alarm_kind,
+                                       priority, occurred_at, source)
+             VALUES ($1, $2, $3, $4, 'alarm', $5, 'critical', now(), 'simulator') RETURNING id",
+        )
+        .bind(org_id)
+        .bind(panel_id)
+        .bind(partition_number)
+        .bind(request.zone_number)
+        .bind(&alarm_kind)
+        .fetch_one(&mut *tx)
+        .await?;
+        event_ids.push(event_id);
+    }
+    let event_id = event_ids[0];
     audit::record(
         &mut tx,
         audit::Event {
@@ -281,10 +290,17 @@ pub async fn simulate_alarm(
             target_type: Some("panel_event"),
             target_id: Some(&event_id.to_string()),
             outcome: audit::Outcome::Success,
-            details: json!({ "panel_id": panel_id, "zone_number": request.zone_number }),
+            details: json!({
+                "panel_id": panel_id,
+                "zone_number": request.zone_number,
+                "event_ids": event_ids,
+            }),
         },
     )
     .await?;
     tx.commit().await?;
-    Ok((StatusCode::ACCEPTED, Json(json!({ "event_id": event_id }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "event_id": event_id, "event_ids": event_ids })),
+    ))
 }

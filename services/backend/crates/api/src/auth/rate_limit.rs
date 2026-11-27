@@ -237,6 +237,24 @@ pub async fn ensure_available(
     }
 }
 
+/// Hesap başına hata sınırını kilitleyerek denetler (AUT-02). Aynı hesabın eşzamanlı doğrulamaları
+/// çağıran işlem bitene kadar sıralanır: denetim ile başarısız denemenin sayılması arasına başka
+/// bir deneme giremez, sınır paralel isteklerle aşılamaz. Yalnızca bir işlem (transaction) içinde
+/// çağrılmalıdır; kilit işlem sonunda bırakılır.
+pub async fn lock_and_ensure_available(
+    conn: &mut PgConnection,
+    hmac_secret: &[u8],
+    budget: Budget,
+    value: &str,
+) -> ApiResult<()> {
+    let key = rate_key(hmac_secret, budget.scope, value);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(encode($1, 'hex'), 0))")
+        .bind(&key)
+        .execute(&mut *conn)
+        .await?;
+    ensure_available(conn, hmac_secret, budget, value).await
+}
+
 /// Başarısız denemeyi sayar; sınır bu denemeyle dolsa da hata döndürmez (bir sonraki deneme
 /// `ensure_available` ile reddedilir).
 pub async fn record_failure(

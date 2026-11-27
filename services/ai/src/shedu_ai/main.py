@@ -2,28 +2,34 @@
 
 Kurallar (bkz. docs/mimari.md):
 - Bu servis kullanıcıya açık değildir; yalnızca iç ağdan, servis kimliğiyle (paylaşılan token)
-  Rust API'si çağırır (ARC-04). Token yoksa veya yanlışsa istek reddedilir; servis token'sız
-  yapılandırılmışsa hiçbir isteğe yanıt vermez (EXC-01).
+  Rust API'si çağırır (ARC-04). Kimlik doğrulama ve 1 MiB gövde sınırı, FastAPI gövdeyi okumadan
+  önce saf ASGI kapısında uygulanır (`gate.py`, RES-01). Token yoksa veya yanlışsa istek gövdesi
+  okunmadan reddedilir; servis token'sız yapılandırılmışsa hiçbir isteğe yanıt vermez (EXC-01).
 - Veritabanına erişmez; API yalnızca o isteğe ait, azaltılmış ve tek kiracılı veriyi
   gönderir (AI-02).
 - Modelin aracı yoktur; alarmı kuramaz, kapatamaz, kimseyi çağıramaz (AI-01).
 - Maliyet bütçesi API'de (kullanıcı ve organizasyon başına) ve burada (olay sayısı, max_tokens,
-  düşük çaba) uygulanır (AI-03).
+  düşük çaba, tek deneme) uygulanır (AI-03). 200 dışındaki her yanıt
+  `{"detail", "usage", "may_be_billed"}` biçimindedir; API harcamayı buna göre deftere yazar.
 - PIN, token, telefon numarası veya kullanıcı kimliği prompt'a girmez; olay içerikleri log'a
-  yazılmaz (LOG-02).
+  yazılmaz, doğrulama hatası istek içeriğini yanıta yansıtmaz (LOG-02).
 """
 
 from __future__ import annotations
 
-import hmac
 import logging
 import os
+import re
 from dataclasses import dataclass
+from http import HTTPStatus
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .claude import DEFAULT_MODEL, ClaudeWriter
+from .gate import AUTHENTICATED, ServiceGate, error_content
 from .pricing import is_priced
 from .summary import (
     ModelError,
@@ -37,6 +43,7 @@ from .summary import (
 
 log = logging.getLogger(__name__)
 MIN_TOKEN_LEN = 32
+_CODE = re.compile(r"[a-z_]+")
 
 
 @dataclass(frozen=True)
@@ -57,41 +64,64 @@ class Settings:
         return cls(service_token=token, model=model)
 
 
+def _status_code(status: int) -> str:
+    try:
+        return HTTPStatus(status).phrase.lower().replace(" ", "_").replace("-", "_")
+    except ValueError:
+        return "http_error"
+
+
 def create_app(settings: Settings, writer: Writer | None) -> FastAPI:
     app = FastAPI(
         title="Shedu AI",
-        version="0.2.0",
+        version="0.3.0",
         # İç servis: dokümantasyon ve şema yayınlanmaz.
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
     )
+    # Tek doğru kaynak: kimlik doğrulama ve gövde sınırı (ARC-04, RES-01).
+    app.add_middleware(ServiceGate, token=settings.service_token, ready=writer is not None)
 
-    def authorize(authorization: str | None = Header(default=None)) -> None:
-        if settings.service_token is None or writer is None:
-            raise HTTPException(status_code=503, detail="not_configured")
-        expected = f"Bearer {settings.service_token}"
-        if authorization is None or not hmac.compare_digest(
-            authorization.encode(), expected.encode()
-        ):
-            raise HTTPException(status_code=401, detail="unauthorized")
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
+        # Hata ayrıntıları (input, loc, msg) istek içeriğini taşır; yanıta ve log'a yazılmaz.
+        log.info("geçersiz istek: %d hata", len(error.errors()))
+        return JSONResponse(
+            status_code=422, content=error_content("invalid_request", may_be_billed=False)
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, error: StarletteHTTPException) -> JSONResponse:
+        # 404, 405 ve kendi kodlarımız da aynı hata sözleşmesiyle döner.
+        detail = error.detail
+        own = isinstance(detail, str) and _CODE.fullmatch(detail) is not None
+        code = detail if own else _status_code(error.status_code)
+        return JSONResponse(
+            status_code=error.status_code,
+            content=error_content(code, may_be_billed=False),
+            headers=error.headers,
+        )
 
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
     def failure(status: int, code: str, error: ModelError) -> JSONResponse:
-        # Model yanıt verdiyse harcama bildirilir; API maliyet defterine yazar (AI-03).
+        # Model yanıt verdiyse harcama bildirilir; vermediyse faturalanmış olabilir mi (AI-03).
         usage = error.usage.model_dump() if error.usage is not None else None
-        return JSONResponse(status_code=status, content={"detail": code, "usage": usage})
+        log.warning("özet üretilemedi: %s (%s) may_be_billed=%s", code, error, error.may_be_billed)
+        return JSONResponse(
+            status_code=status,
+            content=error_content(code, usage, may_be_billed=error.may_be_billed),
+        )
 
-    @app.post(
-        "/v1/summaries/events",
-        dependencies=[Depends(authorize)],
-        response_model=SummaryResponse,
-    )
-    async def event_summary(body: SummaryRequest) -> SummaryResponse | JSONResponse:
-        if writer is None:  # authorize zaten engeller; tip denetimi için
+    @app.post("/v1/summaries/events", response_model=SummaryResponse)
+    async def event_summary(
+        request: Request, body: SummaryRequest
+    ) -> SummaryResponse | JSONResponse:
+        # İkinci savunma: kapı kaldırılırsa veya atlanırsa istek işlenmez (EXC-01).
+        if request.scope.get(AUTHENTICATED) is not True or writer is None:
             raise HTTPException(status_code=503, detail="not_configured")
         try:
             result = await summarize(body, writer)

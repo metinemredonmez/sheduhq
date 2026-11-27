@@ -11,11 +11,13 @@
 //!   yanıtından alınmaz. AI servisinden yalnızca anlatım metni gelir ve yanıtta
 //!   `ai_generated` ile işaretlenir.
 //! - Bütçe iki katmanlıdır (AI-03). Sıklık: kullanıcı başına saatte 10, organizasyon başına günde
-//!   50 özet. Maliyet: her çağrıdan önce `ai_usage` defterinden son 24 saatin harcaması okunur;
-//!   kullanıcı, organizasyon veya bütün sistem sınırı dolduysa çağrı yapılmaz. Her çağrının
-//!   harcaması, sonucu ne olursa olsun, çağrı döner dönmez deftere yazılır. Sonucu bilinmeyen
-//!   çağrı (zaman aşımı, kopan bağlantı) en kötü durum tahminiyle yazılır. Sınırı yalnızca o an
-//!   süren çağrılar aşabilir. Servise en fazla 500 olay gider.
+//!   50 özet. Maliyet: çağrıdan önce en kötü durum tahmini `ai_reserve()` ile kullanıcı,
+//!   organizasyon ve sistem bütçesinden **ayrılır**; rezervasyonlar tek kilitle sıralandığı için
+//!   eşzamanlı çağrılar aynı boş bütçeyi iki kez kullanamaz. Çağrı bitince gerçek harcama
+//!   rezervasyonu kapatan ayrı bir defter satırı olarak yazılır. Sonucu bilinmeyen çağrı (zaman
+//!   aşımı, kopan bağlantı, okunamayan yanıt) tahminle kapanır; süreç kesilirse veya kayıt
+//!   yazılamazsa rezervasyon açık kalır ve tahminiyle sayılmaya devam eder. Çağrı ve kayıt ayrı bir
+//!   görevde yürür: istemci bağlantıyı koparsa da tamamlanır. Servise en fazla 500 olay gider.
 //! - AI servisi yalnızca iç ağdan, paylaşılan servis token'ıyla çağrılır. Yönlendirme izlenmez,
 //!   vekil sunucu kullanılmaz ve yanıt boyutu sınırlıdır. Loopback dışında yalnızca HTTPS kabul
 //!   edilir.
@@ -30,7 +32,7 @@ use axum::{
     extract::{Path, State},
     routing::post,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use reqwest::{
     StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue},
@@ -61,11 +63,14 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MIN_TOKEN_LEN: usize = 32;
 /// AI servisinin kendi model zaman aşımı ve bir yeniden denemesi bu sürenin içinde kalır.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
-/// Son 24 saatte kullanıcı başına en fazla harcama (mikro-dolar): 1 $. Opus 5.5 ile tipik bir
-/// özet 0,01–0,03 $, en büyük istek (500 olay) yaklaşık 0,20 $ tutar.
-pub const USER_DAILY_MICROUSD: i64 = 1_000_000;
-/// Son 24 saatte organizasyon başına en fazla harcama: 5 $.
-pub const ORG_DAILY_MICROUSD: i64 = 5_000_000;
+/// Son 24 saatte kullanıcı başına en fazla harcama (mikro-dolar): 3 $. Opus 5.5 ile tipik bir
+/// özet 0,01–0,03 $, en büyük istek (500 olay) yaklaşık 0,20 $ tutar. Çağrı öncesi ayrılan en kötü
+/// durum tahmini bunun birkaç katıdır (en büyük istekte yaklaşık 1,45 $). Sınır, sonucu bilinmeyen
+/// en büyük bir çağrı tahminle yazıldıktan sonra da bir sonrakinin rezervasyonu sığacak kadar
+/// geniştir: tek bir kesinti kullanıcıyı bir gün kilitlemez.
+pub const USER_DAILY_MICROUSD: i64 = 3_000_000;
+/// Son 24 saatte organizasyon başına en fazla harcama: 10 $.
+pub const ORG_DAILY_MICROUSD: i64 = 10_000_000;
 /// Bütün sistem için varsayılan günlük sınır: 20 $ (`SHEDU_AI_DAILY_BUDGET_USD`).
 pub const DEFAULT_GLOBAL_DAILY_USD: u32 = 20;
 /// Sonucu bilinmeyen çağrının tahmini için AI servisinin sınırları (services/ai: `MAX_TOKENS`,
@@ -75,6 +80,9 @@ const PRICIEST_INPUT_MICROUSD_PER_TOKEN: i64 = 10;
 const PRICIEST_OUTPUT_MICROUSD_PER_TOKEN: i64 = 50;
 /// Sistem prompt'u ve sabit metinler için pay (token).
 const PROMPT_OVERHEAD_TOKENS: i64 = 2048;
+/// Bir özet isteğinde faturalanabilecek en fazla model çalışması: asıl model ve güvenlik reddinde
+/// sağlayıcının yedek modeli. AI servisi SDK'nın kendi yeniden denemesini kapatır.
+const MAX_MODEL_RUNS: i64 = 2;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route(
@@ -178,15 +186,14 @@ impl AiClient {
         self
     }
 
-    async fn summarize(&self, request: &ServiceRequest<'_>) -> Reply {
-        let unavailable = |spend: Option<Spend>| Reply {
+    /// Hazır istek gövdesiyle AI servisini çağırır. Harcama her durumda belirlenir: servis
+    /// bildirdiyse o, istek kesinlikle faturalanmadıysa sıfır, bilinmiyorsa `reserved` (en kötü
+    /// durum tahmini).
+    async fn summarize(&self, payload: Vec<u8>, reserved: &Spend) -> Reply {
+        let unavailable = |spend: Spend| Reply {
             result: Err(AiError::Unavailable),
             spend,
         };
-        let Ok(payload) = serde_json::to_vec(request) else {
-            return unavailable(None);
-        };
-        let unknown = Spend::unknown(payload.len());
         let sent = self
             .http
             .post(self.endpoint.clone())
@@ -204,7 +211,11 @@ impl AiClient {
                     "AI servisine ulaşılamadı"
                 );
                 // Bağlantı kurulamadıysa istek gitmedi; kurulduysa model çalışmış olabilir.
-                return unavailable((!error.is_connect()).then_some(unknown));
+                return unavailable(if error.is_connect() {
+                    Spend::none()
+                } else {
+                    reserved.clone()
+                });
             }
         };
         let status = response.status();
@@ -216,30 +227,37 @@ impl AiClient {
                 }
                 Ok(Some(_)) => {
                     tracing::warn!("AI servisinin yanıtı çok büyük");
-                    return unavailable(Some(unknown.clone()));
+                    return unavailable(reserved.clone());
                 }
                 Ok(None) => break,
-                Err(_) => return unavailable(Some(unknown.clone())),
+                Err(_) => return unavailable(reserved.clone()),
             }
         }
         if status == StatusCode::OK {
             return match serde_json::from_slice::<ServiceResponse>(&body) {
                 Ok(answer) => Reply {
-                    spend: Some(answer.spend.clone()),
+                    spend: answer.spend.clone(),
                     result: Ok(answer),
                 },
                 Err(_) => {
                     tracing::warn!("AI servisinin yanıtı okunamadı");
-                    unavailable(Some(unknown.clone()))
+                    unavailable(reserved.clone())
                 }
             };
         }
-        // Servis hata gövdesinde modelin harcamasını bildirir. Gövde okunamıyorsa servis
-        // beklenmedik biçimde düşmüştür: harcama bilinmiyor sayılır.
+        // Servis hata gövdesinde modelin harcamasını ve faturalanmış olabilir mi bilgisini
+        // bildirir. Gövde okunamıyorsa servis beklenmedik biçimde düşmüştür: harcama bilinmiyor.
         let error = serde_json::from_slice::<ServiceError>(&body).ok();
         let spend = match &error {
-            Some(error) => error.usage.clone(),
-            None => Some(unknown.clone()),
+            Some(ServiceError {
+                usage: Some(usage), ..
+            }) => usage.clone(),
+            Some(ServiceError {
+                usage: None,
+                may_be_billed: false,
+                ..
+            }) => Spend::none(),
+            _ => reserved.clone(),
         };
         let refused = status == StatusCode::UNPROCESSABLE_ENTITY
             && error
@@ -259,10 +277,10 @@ impl AiClient {
     }
 }
 
-/// AI servisine yapılan çağrının sonucu ve harcaması (harcama yoksa `None`).
+/// AI servisine yapılan çağrının sonucu ve harcaması.
 struct Reply {
     result: Result<ServiceResponse, AiError>,
-    spend: Option<Spend>,
+    spend: Spend,
 }
 
 /// Bir çağrının harcaması. AI servisi bildirir; bilinmiyorsa tahmin edilir.
@@ -281,39 +299,56 @@ struct Spend {
 }
 
 impl Spend {
-    /// Sonucu bilinmeyen çağrının temkinli tahmini. Prompt, isteğin kısaltılmış biçimidir; JSON
-    /// ve Türkçe metinde token başına 2 bayttan fazla düşer, bu yüzden giriş token'ı bayt
-    /// sayısının yarısıyla sayılır. Çıktı `max_tokens` sınırında, ikisi de en pahalı katmanın
-    /// fiyatıyla. Gerçek maliyetin birkaç katıdır, ama en büyük istekte bile kullanıcının günlük
-    /// sınırının altında kalır: tek bir kesinti kullanıcıyı bir gün kilitlemez.
-    fn unknown(payload_bytes: usize) -> Self {
+    /// Çağrı öncesi ayrılan ve sonucu bilinmeyen çağrıda yazılan en kötü durum tahmini. Prompt,
+    /// isteğin kısaltılmış biçimidir; JSON ve Türkçe metinde token başına 2 bayttan fazla düşer,
+    /// bu yüzden giriş token'ı bayt sayısının yarısıyla sayılır. Çıktı `max_tokens` sınırında,
+    /// ikisi de en pahalı katmanın fiyatıyla ve faturalanabilecek en fazla model çalışması kadar.
+    /// Gerçek maliyetin birkaç katıdır, ama en büyük istekte bile kullanıcının günlük sınırının
+    /// altında kalır: tek bir kesinti kullanıcıyı bir gün kilitlemez.
+    fn upper_bound(payload_bytes: usize) -> Self {
         let input_tokens = i64::try_from(payload_bytes / 2)
             .unwrap_or(i64::MAX / 4)
             .saturating_add(PROMPT_OVERHEAD_TOKENS);
+        let per_run = input_tokens
+            .saturating_mul(PRICIEST_INPUT_MICROUSD_PER_TOKEN)
+            .saturating_add(SERVICE_MAX_OUTPUT_TOKENS * PRICIEST_OUTPUT_MICROUSD_PER_TOKEN);
         Self {
             model: None,
             input_tokens: 0,
             output_tokens: 0,
-            cost_microusd: input_tokens
-                .saturating_mul(PRICIEST_INPUT_MICROUSD_PER_TOKEN)
-                .saturating_add(SERVICE_MAX_OUTPUT_TOKENS * PRICIEST_OUTPUT_MICROUSD_PER_TOKEN),
+            cost_microusd: per_run.saturating_mul(MAX_MODEL_RUNS),
             estimated: true,
+        }
+    }
+
+    /// Sağlayıcıya faturalanan bir istek gitmedi.
+    fn none() -> Self {
+        Self {
+            model: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microusd: 0,
+            estimated: false,
         }
     }
 }
 
-/// AI servisine giden istek. Kimlik, telefon, PIN, token yok (AI-02).
+/// AI servisine giden istek. Kimlik, telefon, PIN, token yok (AI-02). Kesin sayılar (`counts`)
+/// ve güncel bağlantı durumu (`connection`) burada hesaplanır; liste kısaltılsa da model sayıları
+/// listeden saymaz.
 #[derive(Serialize)]
 struct ServiceRequest<'a> {
     panel_name: &'a str,
     time_zone: &'a str,
     period_start: DateTime<Utc>,
     period_end: DateTime<Utc>,
-    events: Vec<ServiceEvent>,
+    events: &'a [ServiceEvent],
     truncated: bool,
+    counts: &'a Stats,
+    connection: Option<&'a str>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ServiceEvent {
     occurred_at: DateTime<Utc>,
     kind: String,
@@ -338,6 +373,13 @@ struct ServiceResponse {
 struct ServiceError {
     detail: serde_json::Value,
     usage: Option<Spend>,
+    /// `false`: sağlayıcıya faturalanan istek kesinlikle gitmedi. Alan yoksa temkinli: `true`.
+    #[serde(default = "billed_by_default")]
+    may_be_billed: bool,
+}
+
+fn billed_by_default() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -347,7 +389,7 @@ pub struct SummaryRequest {
     hours: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Default, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Default, sqlx::FromRow)]
 pub struct Stats {
     total: i64,
     alarms: i64,
@@ -374,18 +416,6 @@ pub struct SummaryView {
     /// AI'ya yalnızca en yeni olaylar gitti.
     truncated: bool,
 }
-
-type EventRow = (
-    DateTime<Utc>,
-    String,
-    Option<String>,
-    Option<String>,
-    String,
-    Option<i16>,
-    Option<String>,
-    Option<i16>,
-    Option<String>,
-);
 
 fn clip(text: &str, max: usize) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -433,7 +463,7 @@ pub async fn event_summary(
         &org_id.to_string(),
     )
     .await?;
-    // Maliyet bütçesi: defterdeki son 24 saatin harcaması (AI-03).
+    // Sınır zaten dolduysa veri toplanmaz (kesin denetim aşağıda, rezervasyonla).
     let (user_spent, org_spent, global_spent): (i64, i64, i64) = sqlx::query_as(
         "SELECT user_microusd, org_microusd, global_microusd FROM ai_spend_last_day()",
     )
@@ -443,15 +473,7 @@ pub async fn event_summary(
         || org_spent >= ORG_DAILY_MICROUSD
         || global_spent >= ai.global_daily_microusd
     {
-        tracing::warn!(
-            user = user_spent >= USER_DAILY_MICROUSD,
-            organization = org_spent >= ORG_DAILY_MICROUSD,
-            global = global_spent >= ai.global_daily_microusd,
-            "AI harcama sınırı doldu"
-        );
-        return Err(ApiError::TooManyRequests {
-            retry_after_secs: 3600,
-        });
+        return Err(budget_exhausted());
     }
 
     let partitions = authz::visible_partition_numbers(&mut tx, &ctx, panel_id).await?;
@@ -466,25 +488,48 @@ pub async fn event_summary(
     .await?
     .ok_or(ApiError::NotFound)?;
 
-    let period_end = Utc::now();
+    // Mikrosaniyeye kesilir: PostgreSQL ve AI servisi zamanı bu çözünürlükte tutar; dönem sınırı
+    // üç tarafta aynı anı gösterir.
+    let period_end = Utc::now().trunc_subsecs(6);
     let period_start = period_end - chrono::Duration::hours(hours);
     let fetch_limit = i64::try_from(MAX_EVENTS + 1).unwrap_or(i64::MAX);
-    let mut rows: Vec<EventRow> = sqlx::query_as(
-        "SELECT e.occurred_at, e.kind, e.alarm_kind, e.arm_mode, e.source,
-                e.partition_number, pt.name, e.zone_number, z.name
-           FROM panel_events e
-           LEFT JOIN partitions pt
-                  ON pt.panel_id = e.panel_id AND pt.number = e.partition_number
-                 AND pt.organization_id = e.organization_id
-           LEFT JOIN zones z
-                  ON z.panel_id = e.panel_id AND z.number = e.zone_number
-                 AND z.organization_id = e.organization_id
-          WHERE e.panel_id = $1 AND e.organization_id = $2
-            AND e.occurred_at > $3 AND e.occurred_at <= $4
-            AND ($5::smallint[] IS NULL OR e.partition_number IS NULL
-                 OR e.partition_number = ANY($5))
-          ORDER BY e.occurred_at DESC, e.id DESC
-          LIMIT $6",
+    // Sayılar ve liste tek sorguda (tek anlık görüntü): liste hiçbir zaman sayılardan fazla olay
+    // içermez, araya giren olay ikisinden birinde eksik kalmaz.
+    let window: PeriodRow = sqlx::query_as(
+        "WITH visible AS (
+             SELECT e.id, e.occurred_at, e.kind, e.alarm_kind, e.arm_mode, e.source,
+                    e.partition_number, e.zone_number
+               FROM panel_events e
+              WHERE e.panel_id = $1 AND e.organization_id = $2
+                AND e.occurred_at > $3 AND e.occurred_at <= $4
+                AND ($5::smallint[] IS NULL OR e.partition_number IS NULL
+                     OR e.partition_number = ANY($5))
+         )
+         SELECT count(*) AS total,
+                count(*) FILTER (WHERE kind = 'alarm') AS alarms,
+                count(*) FILTER (WHERE kind = 'armed') AS armed,
+                count(*) FILTER (WHERE kind = 'disarmed') AS disarmed,
+                count(*) FILTER (WHERE kind = 'disconnected') AS disconnected,
+                count(*) FILTER (WHERE kind = 'power_problem') AS power_problems,
+                coalesce((
+                    SELECT jsonb_agg(jsonb_build_object(
+                               'occurred_at', l.occurred_at, 'kind', l.kind,
+                               'alarm_kind', l.alarm_kind, 'arm_mode', l.arm_mode,
+                               'source', l.source,
+                               'partition', CASE WHEN l.partition_number IS NOT NULL
+                                    THEN coalesce(pt.name, 'Bölüm ' || l.partition_number) END,
+                               'zone', CASE WHEN l.zone_number IS NOT NULL
+                                    THEN coalesce(z.name, 'Zon ' || l.zone_number) END)
+                           ORDER BY l.occurred_at DESC, l.id DESC)
+                      FROM (SELECT * FROM visible ORDER BY occurred_at DESC, id DESC LIMIT $6) l
+                      LEFT JOIN partitions pt
+                             ON pt.panel_id = $1 AND pt.number = l.partition_number
+                            AND pt.organization_id = $2
+                      LEFT JOIN zones z
+                             ON z.panel_id = $1 AND z.number = l.zone_number
+                            AND z.organization_id = $2
+                ), '[]'::jsonb) AS events
+           FROM visible",
     )
     .bind(panel_id)
     .bind(org_id)
@@ -492,112 +537,173 @@ pub async fn event_summary(
     .bind(period_end)
     .bind(&partitions)
     .bind(fetch_limit)
-    .fetch_all(&mut *tx)
-    .await?;
-    let truncated = rows.len() > MAX_EVENTS;
-    rows.truncate(MAX_EVENTS);
-
-    let stats: Stats = sqlx::query_as(
-        "SELECT count(*) AS total,
-                count(*) FILTER (WHERE kind = 'alarm') AS alarms,
-                count(*) FILTER (WHERE kind = 'armed') AS armed,
-                count(*) FILTER (WHERE kind = 'disarmed') AS disarmed,
-                count(*) FILTER (WHERE kind = 'disconnected') AS disconnected,
-                count(*) FILTER (WHERE kind = 'power_problem') AS power_problems
-           FROM panel_events
-          WHERE panel_id = $1 AND organization_id = $2
-            AND occurred_at > $3 AND occurred_at <= $4
-            AND ($5::smallint[] IS NULL OR partition_number IS NULL
-                 OR partition_number = ANY($5))",
-    )
-    .bind(panel_id)
-    .bind(org_id)
-    .bind(period_start)
-    .bind(period_end)
-    .bind(&partitions)
     .fetch_one(&mut *tx)
     .await?;
-    // Bağlantı olayları panel düzeyindedir (bölümsüz).
-    let last_connectivity: Option<(String,)> = sqlx::query_as(
+    let stats = Stats {
+        total: window.total,
+        alarms: window.alarms,
+        armed: window.armed,
+        disarmed: window.disarmed,
+        disconnected: window.disconnected,
+        power_problems: window.power_problems,
+    };
+    let mut events: Vec<ServiceEvent> =
+        serde_json::from_value(window.events.0).map_err(|_| ApiError::Internal)?;
+    let truncated = events.len() > MAX_EVENTS;
+    events.truncate(MAX_EVENTS);
+
+    // Güncel bağlantı durumu dönemle sınırlı değildir: dönem başlamadan kopmuş ve hâlâ kopuk
+    // panel de dikkat ister. Bağlantı olayları panel düzeyindedir (bölümsüz).
+    let connection: Option<(String,)> = sqlx::query_as(
         "SELECT kind FROM panel_events
-          WHERE panel_id = $1 AND organization_id = $2
-            AND occurred_at > $3 AND occurred_at <= $4
-            AND kind IN ('connected', 'disconnected')
+          WHERE panel_id = $1 AND organization_id = $2 AND occurred_at <= $3
+            AND kind IN ('connected', 'disconnected') AND partition_number IS NULL
           ORDER BY occurred_at DESC, id DESC
           LIMIT 1",
     )
     .bind(panel_id)
     .bind(org_id)
-    .bind(period_start)
     .bind(period_end)
     .fetch_optional(&mut *tx)
     .await?;
-    // AI çağrısı uzun sürebilir: veritabanı işlemi önce kapanır (bütçe sayacı da kalıcı olur).
-    tx.commit().await?;
-
+    let connection = connection.map(|(kind,)| kind);
     let needs_attention = stats.alarms > 0
         || stats.power_problems > 0
-        || last_connectivity.is_some_and(|(kind,)| kind == "disconnected");
-    let events: Vec<ServiceEvent> = rows
-        .into_iter()
-        .map(
-            |(occurred_at, kind, alarm_kind, arm_mode, source, pn, pname, zn, zname)| {
-                ServiceEvent {
-                    occurred_at,
-                    kind,
-                    alarm_kind,
-                    arm_mode,
-                    partition: pn.map(|n| pname.unwrap_or_else(|| format!("Bölüm {n}"))),
-                    zone: zn.map(|n| zname.unwrap_or_else(|| format!("Zon {n}"))),
-                    source,
-                }
-            },
-        )
-        .collect();
+        || connection.as_deref() == Some("disconnected");
+
     let event_count = events.len();
-    let service_request = ServiceRequest {
+    let payload = serde_json::to_vec(&ServiceRequest {
         panel_name: &panel_name,
         time_zone: &time_zone,
         period_start,
         period_end,
-        events,
+        events: &events,
+        truncated,
+        counts: &stats,
+        connection: connection.as_deref(),
+    })
+    .map_err(|_| ApiError::Internal)?;
+    let reserved = Spend::upper_bound(payload.len());
+
+    // En kötü durum tahmini bütçeden ayrılır (işlemin son adımı: rezervasyon kilidi kısa tutulur).
+    // AI çağrısı uzun sürebilir: veritabanı işlemi çağrıdan önce kapanır.
+    let reservation: (Option<i64>,) =
+        sqlx::query_as("SELECT ai_reserve('event_summary', $1, $2, $3, $4)")
+            .bind(reserved.cost_microusd)
+            .bind(USER_DAILY_MICROUSD)
+            .bind(ORG_DAILY_MICROUSD)
+            .bind(ai.global_daily_microusd)
+            .fetch_one(&mut *tx)
+            .await?;
+    let Some(reservation_id) = reservation.0 else {
+        return Err(budget_exhausted());
+    };
+    tx.commit().await?;
+
+    // Çağrı, harcama kaydı ve denetim kaydı ayrı görevde: istemci bağlantıyı koparsa da (işleyici
+    // iptal edilse de) sonuna kadar yürür ve rezervasyon kapanır.
+    let call = Call {
+        user_id: user.user_id,
+        org_id,
+        panel_id,
+        hours,
+        event_count,
+        truncated,
+        reservation_id,
+        reserved,
+    };
+    let view = Pending {
+        needs_attention,
+        stats,
+        period_start,
+        period_end,
         truncated,
     };
-    let reply = ai.summarize(&service_request).await;
-    // Harcama önce ve ayrı işlemde yazılır: denetim kaydı başarısız olsa da defterde kalır.
-    if let Some(spend) = &reply.spend {
-        let outcome = match (&reply.result, spend.estimated) {
-            (_, true) => "unknown",
-            (Ok(_), false) => "success",
-            (Err(AiError::Refused), false) => "refused",
-            (Err(AiError::Unavailable), false) => "failed",
-        };
-        record_spend(&state, user.user_id, org_id, spend, outcome).await?;
+    let task = tokio::spawn(complete_summary(state.clone(), ai, payload, call, view));
+    task.await.map_err(|_| ApiError::Internal)?.map(Json)
+}
+
+fn budget_exhausted() -> ApiError {
+    tracing::warn!("AI harcama sınırı doldu");
+    ApiError::TooManyRequests {
+        retry_after_secs: 3600,
     }
-    let cost = reply.spend.as_ref().map_or(0, |s| s.cost_microusd);
+}
+
+#[derive(sqlx::FromRow)]
+struct PeriodRow {
+    total: i64,
+    alarms: i64,
+    armed: i64,
+    disarmed: i64,
+    disconnected: i64,
+    power_problems: i64,
+    events: sqlx::types::Json<serde_json::Value>,
+}
+
+/// Rezervasyonu yapılmış çağrının bilgileri.
+struct Call {
+    user_id: Uuid,
+    org_id: Uuid,
+    panel_id: Uuid,
+    hours: i64,
+    event_count: usize,
+    truncated: bool,
+    reservation_id: i64,
+    reserved: Spend,
+}
+
+/// Yanıtın kodla hesaplanan kısmı.
+struct Pending {
+    needs_attention: bool,
+    stats: Stats,
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+    truncated: bool,
+}
+
+async fn complete_summary(
+    state: AppState,
+    ai: std::sync::Arc<AiClient>,
+    payload: Vec<u8>,
+    call: Call,
+    view: Pending,
+) -> ApiResult<SummaryView> {
+    let reply = ai.summarize(payload, &call.reserved).await;
+    // Harcama önce ve ayrı işlemde yazılır: denetim kaydı başarısız olsa da defterde kalır.
+    // Yazılamazsa rezervasyon açık kalır ve tahminiyle sayılır.
+    let outcome = match (&reply.result, reply.spend.estimated) {
+        (_, true) => "unknown",
+        (Ok(_), false) => "success",
+        (Err(AiError::Refused), false) => "refused",
+        (Err(AiError::Unavailable), false) => "failed",
+    };
+    settle(&state, &call, &reply.spend, outcome).await?;
+    let cost = reply.spend.cost_microusd;
 
     let mut audit_tx = state.db.begin().await?;
-    set_context(&mut audit_tx, Some(user.user_id), Some(org_id)).await?;
+    set_context(&mut audit_tx, Some(call.user_id), Some(call.org_id)).await?;
     let response = match reply.result {
         Ok(answer) => {
             audit::record(
                 &mut audit_tx,
                 audit::Event {
-                    organization_id: Some(org_id),
-                    actor_user_id: Some(user.user_id),
+                    organization_id: Some(call.org_id),
+                    actor_user_id: Some(call.user_id),
                     action: "ai.summary_generated",
                     target_type: Some("panel"),
-                    target_id: Some(&panel_id.to_string()),
+                    target_id: Some(&call.panel_id.to_string()),
                     outcome: audit::Outcome::Success,
                     details: json!({
-                        "hours": hours,
-                        "event_count": event_count,
-                        "truncated": truncated,
+                        "hours": call.hours,
+                        "event_count": call.event_count,
+                        "truncated": call.truncated,
                         "generated": answer.generated,
                         "model": answer.spend.model,
                         "input_tokens": answer.spend.input_tokens,
                         "output_tokens": answer.spend.output_tokens,
                         "cost_microusd": cost,
+                        "reserved_microusd": call.reserved.cost_microusd,
                     }),
                 },
             )
@@ -613,11 +719,11 @@ pub async fn event_summary(
                     .collect(),
                 ai_generated: answer.generated,
                 model: answer.spend.model,
-                needs_attention,
-                stats,
-                period_start,
-                period_end,
-                truncated,
+                needs_attention: view.needs_attention,
+                stats: view.stats,
+                period_start: view.period_start,
+                period_end: view.period_end,
+                truncated: view.truncated,
             })
         }
         Err(error) => {
@@ -628,17 +734,18 @@ pub async fn event_summary(
             audit::record(
                 &mut audit_tx,
                 audit::Event {
-                    organization_id: Some(org_id),
-                    actor_user_id: Some(user.user_id),
+                    organization_id: Some(call.org_id),
+                    actor_user_id: Some(call.user_id),
                     action: "ai.summary_failed",
                     target_type: Some("panel"),
-                    target_id: Some(&panel_id.to_string()),
+                    target_id: Some(&call.panel_id.to_string()),
                     outcome: audit::Outcome::Failure,
                     details: json!({
-                        "hours": hours,
-                        "event_count": event_count,
+                        "hours": call.hours,
+                        "event_count": call.event_count,
                         "reason": code,
                         "cost_microusd": cost,
+                        "reserved_microusd": call.reserved.cost_microusd,
                     }),
                 },
             )
@@ -650,34 +757,35 @@ pub async fn event_summary(
         }
     };
     audit_tx.commit().await?;
-    response.map(Json)
+    response
 }
 
-/// Harcamayı maliyet defterine yazar (kendi işleminde, kullanıcı ve organizasyon bağlamıyla).
-async fn record_spend(
+/// Rezervasyonu gerçek (veya bilinmiyorsa tahmini) harcamayla kapatır: defter yalnızca eklenir,
+/// kapatma ayrı bir satırdır (kendi işleminde, kullanıcı ve organizasyon bağlamıyla).
+async fn settle(
     state: &AppState,
-    user_id: Uuid,
-    organization_id: Uuid,
+    call: &Call,
     spend: &Spend,
     outcome: &'static str,
 ) -> ApiResult<()> {
     let mut tx = state.db.begin().await?;
-    set_context(&mut tx, Some(user_id), Some(organization_id)).await?;
+    set_context(&mut tx, Some(call.user_id), Some(call.org_id)).await?;
     sqlx::query(
         "INSERT INTO ai_usage (organization_id, user_id, feature, model, input_tokens, output_tokens,
-                               cost_microusd, outcome)
-         VALUES ($1, $2, 'event_summary', $3, $4, $5, $6, $7)",
+                               cost_microusd, outcome, reservation_id)
+         VALUES ($1, $2, 'event_summary', $3, $4, $5, $6, $7, $8)",
     )
-    .bind(organization_id)
-    .bind(user_id)
+    .bind(call.org_id)
+    .bind(call.user_id)
     .bind(spend.model.as_deref().filter(|m| !m.is_empty()).map(|m| clip(m, 100)))
     .bind(spend.input_tokens.max(0))
     .bind(spend.output_tokens.max(0))
     .bind(spend.cost_microusd.max(0))
     .bind(outcome)
+    .bind(call.reservation_id)
     .execute(&mut *tx)
     .await
-    .inspect_err(|_| tracing::error!("AI harcaması deftere yazılamadı"))?;
+    .inspect_err(|_| tracing::error!("AI harcaması deftere yazılamadı; rezervasyon açık kaldı"))?;
     tx.commit().await?;
     Ok(())
 }
@@ -730,14 +838,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_spend_grows_with_the_request_but_stays_below_the_user_budget() {
-        let small = Spend::unknown(1_000).cost_microusd;
+    fn reservation_covers_every_billable_run_and_fits_the_user_budget() {
+        let small = Spend::upper_bound(1_000).cost_microusd;
         // 500 olaylık tipik istek yaklaşık 90 KB.
-        let large = Spend::unknown(100_000).cost_microusd;
-        // 4096 çıktı token'ı × 50 + (1000 / 2 + 2048) × 10
-        assert_eq!(small, 204_800 + 25_480);
+        let large = Spend::upper_bound(100_000).cost_microusd;
+        // İki model çalışması × (4096 çıktı token'ı × 50 + (1000 / 2 + 2048) × 10)
+        assert_eq!(small, 2 * (204_800 + 25_480));
         assert!(large > small);
-        assert!(large < USER_DAILY_MICROUSD, "{large}");
+        // Sonucu bilinmeyen en büyük çağrıdan sonra bir sonrakinin rezervasyonu da sığar.
+        assert!(2 * large < USER_DAILY_MICROUSD, "{large}");
+        assert!(Spend::upper_bound(100_000).estimated);
+        assert_eq!(Spend::none().cost_microusd, 0);
+        assert!(!Spend::none().estimated);
+    }
+
+    #[test]
+    fn service_error_without_billing_flag_is_treated_as_billed() {
+        let error: ServiceError =
+            serde_json::from_str(r#"{"detail": "ai_unavailable", "usage": null}"#).expect("json");
+        assert!(error.may_be_billed);
+        let error: ServiceError = serde_json::from_str(
+            r#"{"detail": "unauthorized", "usage": null, "may_be_billed": false}"#,
+        )
+        .expect("json");
+        assert!(!error.may_be_billed);
     }
 
     #[test]

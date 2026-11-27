@@ -411,6 +411,19 @@ pub async fn accept(
 ) -> ApiResult<Json<serde_json::Value>> {
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, Some(user.user_id), None).await?;
+    // Davet edenin hesap satırı paylaşımlı kilitlenir. Davet edenin aynı anda başlattığı silme
+    // talebi hesap satırını önce kilitler: ya kabul talepten önce biter (talep yeni üyeyi görür ve
+    // sahipliğin devrini ister) ya da talepten sonra sıralanır ve kapanmış hesabın davetini
+    // reddeder (AZ-03). Kilit sırası her yolda aynı: önce hesap, sonra davet.
+    sqlx::query(
+        "SELECT 1 FROM users
+          WHERE id = (SELECT invited_by FROM invitations
+                       WHERE id = $1 AND phone = app_current_user_phone())
+          FOR SHARE",
+    )
+    .bind(invitation_id)
+    .execute(&mut *tx)
+    .await?;
     let accepted: Option<(Uuid, String)> = sqlx::query_as(
         "UPDATE invitations i SET accepted_at = now(), accepted_by = $2
           WHERE i.id = $1 AND i.phone = app_current_user_phone() AND i.expires_at > now()

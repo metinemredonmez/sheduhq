@@ -259,11 +259,34 @@ pub async fn create_command(
 
     let permissions =
         authz::permissions(&mut tx, &ctx, panel_id, Some(request.partition_id)).await?;
-    let allowed = match request.kind {
+    let mut allowed = match request.kind {
         CommandKind::ArmAway | CommandKind::ArmStay | CommandKind::ArmNight => permissions.arm,
         CommandKind::Disarm => permissions.disarm,
         CommandKind::BypassZones | CommandKind::UnbypassZones => permissions.bypass,
     };
+    // Bypass zonun kendisini değiştirir: zon başka bölümlerde de kullanılıyorsa o bölümleri de
+    // etkiler. Bu yüzden zonun ait olduğu her bölümde bypass yetkisi gerekir (AZ-04).
+    if allowed && is_bypass {
+        let shared: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT zp.partition_id
+               FROM zones z JOIN zone_partitions zp ON zp.zone_id = z.id
+              WHERE z.panel_id = $1 AND z.number = ANY($2) AND zp.partition_id <> $3",
+        )
+        .bind(panel_id)
+        .bind(zones_db.as_deref().unwrap_or_default())
+        .bind(request.partition_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (partition_id,) in shared {
+            if !authz::permissions(&mut tx, &ctx, panel_id, Some(partition_id))
+                .await?
+                .bypass
+            {
+                allowed = false;
+                break;
+            }
+        }
+    }
     if !allowed {
         // Hiç görme yetkisi yoksa panelin varlığı da belli edilmez.
         if !permissions.view {

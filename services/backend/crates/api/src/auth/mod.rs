@@ -2,7 +2,7 @@
 
 pub mod codes;
 pub mod extract;
-mod handlers;
+pub(crate) mod handlers;
 pub mod mfa;
 pub mod password;
 pub mod profile;

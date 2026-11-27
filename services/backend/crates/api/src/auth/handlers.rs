@@ -14,7 +14,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Acquire, PgConnection};
+use sqlx::{Acquire, PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
@@ -229,31 +229,37 @@ pub(super) async fn issue_code(
     Ok(())
 }
 
-/// Kodu doğrular ve tüketir. Ayrı ve hemen kalıcı hale gelen bir işlemde çalışır: yanlış
-/// denemeler sonraki adımlar başarısız olsa bile sayılır. Kod tek kullanımlıktır, en fazla
-/// 5 deneme hakkı vardır (AUT-03). Başarılıysa koda bağlı kullanıcı kimliğini döner.
+/// Doğrulanmış kod: tüketildi olarak işaretlendi ama işlem henüz kalıcı değil. Çağıran, kodun
+/// bağlı olduğu değişikliği aynı işlemde yapar ve işlemi tamamlar. İşlem geri alınırsa (ör. yeni
+/// parola hesaba bağlı bir kurala takıldı) kod tüketilmemiş kalır.
+pub(super) struct ConsumedCode {
+    pub(super) tx: Transaction<'static, Postgres>,
+    /// Kodun düzenlendiği kullanıcı (kayıt kodunda yok).
+    pub(super) user_id: Option<Uuid>,
+}
+
+/// Kodu doğrular ve tüketir. Kod tek kullanımlıktır, en fazla 5 deneme hakkı vardır (AUT-03).
+/// Yanlış denemeler hemen kalıcı olur: sonraki adımlar başarısız olsa bile sayılır. Hesap başına
+/// 24 saatlik hata sınırı aynı işlemde ve kilitli denetlenir (AUT-02).
 pub(super) async fn consume_code(
     state: &AppState,
     purpose: Purpose,
     phone: &str,
     code: &str,
-) -> ApiResult<Option<Uuid>> {
+) -> ApiResult<ConsumedCode> {
     let invalid = ApiError::BadRequest("invalid_code");
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
         return Err(invalid);
     }
-    {
-        let mut conn = state.db.acquire().await?;
-        rate_limit::ensure_available(
-            &mut conn,
-            &state.hmac_secret,
-            rate_limit::CODE_FAILURES_PER_PHONE,
-            phone,
-        )
-        .await?;
-    }
 
     let mut tx = state.db.begin().await?;
+    rate_limit::lock_and_ensure_available(
+        &mut tx,
+        &state.hmac_secret,
+        rate_limit::CODE_FAILURES_PER_PHONE,
+        phone,
+    )
+    .await?;
     let row: Option<(Uuid, Vec<u8>, i16, Option<Uuid>)> = sqlx::query_as(
         "SELECT id, code_hash, attempts, user_id FROM verification_codes
           WHERE phone = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > now()
@@ -278,8 +284,7 @@ pub(super) async fn consume_code(
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
-        return Ok(user_id);
+        return Ok(ConsumedCode { tx, user_id });
     }
 
     sqlx::query(
@@ -326,8 +331,37 @@ pub(super) async fn create_session(
     .await?;
 
     let family_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO session_families (id, user_id, device_id) VALUES ($1, $2, $3)")
+        .bind(family_id)
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&mut *conn)
+        .await?;
     let refresh = insert_refresh(conn, user_id, Some(device_id), family_id).await?;
     Ok((family_id, refresh))
+}
+
+/// Parola veya ikinci adım doğrulandıktan sonra, oturum açılmadan hemen önce çağrılır: hesap hâlâ
+/// giriş yapabilir durumda ve kimlik bilgisi doğrulamadan beri değişmemiş olmalı (SES-04). Satır
+/// paylaşımlı kilitlenir; eşzamanlı parola sıfırlama ya bu oturum açıldıktan sonra sıralanır (ve
+/// onu kapatır) ya da önce biter (ve burada sürüm tutmaz).
+pub(super) async fn ensure_credentials_unchanged(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    version: i32,
+) -> ApiResult<()> {
+    let current: Option<(i32,)> = sqlx::query_as(
+        "SELECT credential_version FROM users
+          WHERE id = $1 AND status IN ('active', 'pending_deletion')
+          FOR SHARE",
+    )
+    .bind(user_id)
+    .fetch_optional(conn)
+    .await?;
+    match current {
+        Some((current,)) if current == version => Ok(()),
+        _ => Err(ApiError::Unauthorized),
+    }
 }
 
 async fn insert_refresh(
@@ -371,13 +405,24 @@ pub(super) fn token_response(
 }
 
 /// Oturum ailesini iptal eder ve o cihazın push token'ını siler: çıkış yapılmış cihaza alarm
-/// bildirimi gitmez.
+/// bildirimi gitmez. Önce aile satırı güncellenir (kilitlenir): eşzamanlı bir yenileme ya iptalden
+/// önce biter ve ürettiği token aşağıda iptal edilir, ya da iptal edilmiş aileyi görüp reddedilir
+/// (SES-04). İptal edilen aile sayısını döner (0 veya 1).
 async fn revoke_family(
     conn: &mut PgConnection,
     family_id: Uuid,
     user_id: Uuid,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
+    let revoked = sqlx::query(
+        "UPDATE session_families SET revoked_at = now()
+          WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(family_id)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = now()
           WHERE family_id = $1 AND user_id = $2 AND revoked_at IS NULL",
     )
@@ -387,13 +432,52 @@ async fn revoke_family(
     .await?;
     sqlx::query(
         "UPDATE user_devices SET push_token = NULL
-          WHERE user_id = $2 AND id IN (SELECT device_id FROM refresh_tokens WHERE family_id = $1)",
+          WHERE user_id = $2 AND id = (SELECT device_id FROM session_families WHERE id = $1)",
     )
     .bind(family_id)
     .bind(user_id)
     .execute(conn)
     .await?;
-    Ok(result.rows_affected())
+    Ok(revoked)
+}
+
+/// Kullanıcının bütün oturumlarını (`keep` verilirse o aile hariç) kapatır ve kapanan cihazların
+/// push token'ını siler. Parola sıfırlama, ikinci faktörün açılması, silme talebi ve hesabın
+/// kapatılması bunu kullanır. Aileler önce kilitlenerek iptal edilir; eşzamanlı yenilemenin
+/// ürettiği token bu işlemde görülür ve iptal edilir (SES-04). İptal edilen token sayısını döner.
+pub(crate) async fn revoke_user_sessions(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    keep: Option<Uuid>,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE session_families SET revoked_at = now()
+          WHERE user_id = $1 AND revoked_at IS NULL AND ($2::uuid IS NULL OR id <> $2)",
+    )
+    .bind(user_id)
+    .bind(keep)
+    .execute(&mut *conn)
+    .await?;
+    let tokens = sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now()
+          WHERE user_id = $1 AND revoked_at IS NULL AND ($2::uuid IS NULL OR family_id <> $2)",
+    )
+    .bind(user_id)
+    .bind(keep)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE user_devices SET push_token = NULL
+          WHERE user_id = $1
+            AND ($2::uuid IS NULL
+                 OR id IS DISTINCT FROM (SELECT device_id FROM session_families WHERE id = $2))",
+    )
+    .bind(user_id)
+    .bind(keep)
+    .execute(conn)
+    .await?;
+    Ok(tokens)
 }
 
 async fn hash_password(password: String) -> ApiResult<String> {
@@ -446,12 +530,14 @@ pub async fn register_complete(
         let mut conn = state.db.acquire().await?;
         limit(&state, &mut conn, rate_limit::VERIFY_PER_IP, &ip_of(&addr)).await?;
     }
-    consume_code(&state, Purpose::Register, &phone, &request.code).await?;
+    // Kod ve hesap aynı işlemde: kayıt başarısız olursa (ör. numara bu arada kaydedildi) kod
+    // tüketilmemiş kalır.
+    let ConsumedCode { mut tx, .. } =
+        consume_code(&state, Purpose::Register, &phone, &request.code).await?;
     let password_hash = hash_password(request.password).await?;
 
     let user_id = Uuid::new_v4();
     let organization_id = Uuid::new_v4();
-    let mut tx = state.db.begin().await?;
     set_context(&mut tx, Some(user_id), Some(organization_id)).await?;
 
     let inserted = sqlx::query(
@@ -535,8 +621,9 @@ pub async fn login(
     .await?;
     limit(&state, &mut conn, rate_limit::LOGIN_GLOBAL, "all").await?;
 
-    let user: Option<(Uuid, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, password_hash, status FROM users WHERE phone = $1 OR email = $1",
+    let user: Option<(Uuid, Option<String>, String, i32)> = sqlx::query_as(
+        "SELECT id, password_hash, status, credential_version FROM users
+          WHERE phone = $1 OR email = $1",
     )
     .bind(&identifier)
     .fetch_optional(&mut *conn)
@@ -545,7 +632,7 @@ pub async fn login(
     // Bilinmeyen kullanıcıda da bir hash doğrulanır; yanıt süresi hesabın varlığını belli etmez.
     let stored_hash = user
         .as_ref()
-        .and_then(|(_, hash, _)| hash.clone())
+        .and_then(|(_, hash, _, _)| hash.clone())
         .unwrap_or_else(|| state.dummy_hash.to_string());
     let candidate = request.password;
     let password_ok = candidate.chars().count() <= password::MAX_CHARS
@@ -553,16 +640,16 @@ pub async fn login(
             .await
             .map_err(|_| ApiError::Internal)?;
 
-    let user_id = match user {
+    let (user_id, credential_version) = match user {
         // Silme bekleyen hesap tam doğrulamayla giriş yaparsa talep iptal olur (aşağıda; MFA
         // açıksa ikinci adımdan sonra).
-        Some((id, Some(_), status))
+        Some((id, Some(_), status, version))
             if password_ok && (status == "active" || status == "pending_deletion") =>
         {
-            id
+            (id, version)
         }
         other => {
-            let target = other.map(|(id, _, _)| id.to_string());
+            let target = other.map(|(id, _, _, _)| id.to_string());
             audit::record(
                 &mut conn,
                 audit::Event {
@@ -581,11 +668,15 @@ pub async fn login(
     };
 
     // İkinci faktör açıksa oturum açılmaz; kısa ömürlü bir biletle ikinci adım istenir (AUT-01).
-    if let Some(challenge) = mfa::start_challenge(&mut conn, user_id, &request.device).await? {
+    if let Some(challenge) =
+        mfa::start_challenge(&mut conn, user_id, credential_version, &request.device).await?
+    {
         return Ok(Json(LoginResponse::MfaRequired(challenge)));
     }
 
     let mut tx = conn.begin().await?;
+    // Parola doğrulanırken sıfırlanmış veya ikinci faktör açılmışsa oturum açılmaz.
+    ensure_credentials_unchanged(&mut tx, user_id, credential_version).await?;
     let cancelled = privacy::cancel_scheduled_erasure(&mut tx, user_id).await?;
     let (session_id, refresh_token) = create_session(&mut tx, user_id, &request.device).await?;
     audit::record(
@@ -632,17 +723,27 @@ pub async fn refresh(
     let hash = tokens::refresh_token_hash(&request.refresh_token).ok_or(ApiError::Unauthorized)?;
 
     let mut tx = conn.begin().await?;
+    // Aile satırı kilitlenir: aynı ailenin iptali ve yenilemesi sıralanır (SES-04). Kilit
+    // alındıktan sonraki sorgular iptalin sonucunu görür.
+    let family: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT f.id FROM session_families f
+          WHERE f.id = (SELECT family_id FROM refresh_tokens WHERE token_hash = $1)
+          FOR UPDATE",
+    )
+    .bind(&hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if family.is_none() {
+        tx.commit().await?;
+        return Err(ApiError::Unauthorized);
+    }
     let rotated: Option<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
         "UPDATE refresh_tokens r SET used_at = now()
-           FROM users u
           WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.revoked_at IS NULL
-            AND r.expires_at > now() AND u.id = r.user_id AND u.status = 'active'
-            AND (SELECT min(f.created_at) FROM refresh_tokens f WHERE f.family_id = r.family_id)
-                > now() - make_interval(days => $2)
+            AND r.expires_at > now() AND session_active(r.family_id, r.user_id)
           RETURNING r.user_id, r.family_id, r.device_id",
     )
     .bind(&hash)
-    .bind(tokens::SESSION_MAX_DAYS)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -670,7 +771,7 @@ pub async fn refresh(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((user_id, family_id)) = reused {
-        let revoked = revoke_family(&mut tx, family_id, user_id).await?;
+        let revoked = revoke_family(&mut tx, family_id, user_id).await? > 0;
         tracing::warn!(
             revoked,
             "kullanılmış refresh token yeniden geldi; aile iptal edildi"
@@ -684,7 +785,7 @@ pub async fn refresh(
                 target_type: Some("session"),
                 target_id: Some(&family_id.to_string()),
                 outcome: audit::Outcome::Denied,
-                details: json!({ "revoked_tokens": revoked }),
+                details: json!({ "family_revoked": revoked }),
             },
         )
         .await?;
@@ -751,13 +852,13 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> ApiResult<Json<Vec<SessionSummary>>> {
+    // Etkin oturum kuralı HTTP ve push ile aynı (`session_active`): 90 günü dolan aile listelenmez.
     let mut sessions: Vec<SessionSummary> = sqlx::query_as(
-        "SELECT r.family_id AS id, d.platform, d.name,
-                min(r.created_at) AS started_at, max(r.created_at) AS last_active_at
-           FROM refresh_tokens r LEFT JOIN user_devices d ON d.id = r.device_id
-          WHERE r.user_id = $1
-          GROUP BY r.family_id, d.platform, d.name
-         HAVING bool_or(r.revoked_at IS NULL AND r.used_at IS NULL AND r.expires_at > now())
+        "SELECT f.id, d.platform, d.name, f.created_at AS started_at,
+                (SELECT max(r.created_at) FROM refresh_tokens r WHERE r.family_id = f.id)
+                    AS last_active_at
+           FROM session_families f LEFT JOIN user_devices d ON d.id = f.device_id
+          WHERE f.user_id = $1 AND session_active(f.id, f.user_id)
           ORDER BY last_active_at DESC",
     )
     .bind(user.user_id)
@@ -843,44 +944,58 @@ pub async fn reset_complete(
         limit(&state, &mut conn, rate_limit::VERIFY_PER_IP, &ip_of(&addr)).await?;
     }
 
-    let profile: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT display_name, email FROM users WHERE phone = $1")
-            .bind(&phone)
-            .fetch_optional(&state.db)
-            .await?;
-    let (display_name, email) = profile.unwrap_or_default();
+    // Hesaptan bağımsız parola kuralları kod doğrulanmadan önce; hesaba bağlı olanlar (ad, e-posta)
+    // ancak kod doğrulandıktan sonra uygulanır. Geçersiz kodla gelen isteğin yanıtı hesabın profil
+    // verisine göre değişmez (AUT-03).
+    password::validate_new(&request.new_password, &[phone.as_str()])
+        .map_err(|rejection| ApiError::BadRequest(rejection.code()))?;
+
+    let ConsumedCode { mut tx, user_id } =
+        consume_code(&state, Purpose::PasswordReset, &phone, &request.code).await?;
+    let user_id = user_id.ok_or(ApiError::BadRequest("invalid_code"))?;
+    // Kod düzenlendiği numaraya bağlıdır: hesabın numarası o arada değiştiyse kod parolayı
+    // değiştiremez (AUT-03). Hesap satırı kilitlenir; numara değişimi bununla sıralanır.
+    let profile: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT display_name, email FROM users
+          WHERE id = $1 AND phone = $2 AND status IN ('active', 'pending_deletion')
+          FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(&phone)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((display_name, email)) = profile else {
+        tx.commit().await?;
+        return Err(ApiError::BadRequest("invalid_code"));
+    };
     let mut personal = vec![phone.as_str(), display_name.as_str()];
     if let Some(email) = email.as_deref() {
         personal.push(email);
     }
+    // Hesaba bağlı kurala takılırsa işlem geri alınır: kod tüketilmez, kişi başka bir parolayla
+    // aynı kodu yeniden deneyebilir.
     password::validate_new(&request.new_password, &personal)
         .map_err(|rejection| ApiError::BadRequest(rejection.code()))?;
-
-    let user_id = consume_code(&state, Purpose::PasswordReset, &phone, &request.code)
-        .await?
-        .ok_or(ApiError::BadRequest("invalid_code"))?;
     let password_hash = hash_password(request.new_password).await?;
 
-    let mut tx = state.db.begin().await?;
+    // Kimlik bilgisi sürümü artar: bu sırada doğrulanmış eski parola veya bekleyen ikinci adım
+    // bileti oturum açamaz (SES-04).
     sqlx::query(
-        "UPDATE users SET password_hash = $1, updated_at = now()
-          WHERE id = $2 AND status IN ('active', 'pending_deletion')",
+        "UPDATE users SET password_hash = $1, credential_version = credential_version + 1,
+                          updated_at = now()
+          WHERE id = $2",
     )
     .bind(&password_hash)
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE user_devices SET push_token = NULL WHERE user_id = $1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-    let revoked = sqlx::query(
-        "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    sqlx::query(
+        "UPDATE mfa_challenges SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL",
     )
     .bind(user_id)
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .await?;
+    let revoked = revoke_user_sessions(&mut tx, user_id, None).await?;
     audit::record(
         &mut tx,
         audit::Event {

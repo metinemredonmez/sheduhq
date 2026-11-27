@@ -18,7 +18,7 @@ use serde_json::json;
 use super::{
     AuthUser,
     codes::Purpose,
-    handlers::{consume_code, ip_of, issue_code, normalize_phone},
+    handlers::{ConsumedCode, consume_code, ip_of, issue_code, normalize_phone},
     mfa, rate_limit,
 };
 use crate::{
@@ -158,12 +158,13 @@ pub async fn phone_complete(
         )
         .await?;
     }
-    let bound = consume_code(&state, Purpose::PhoneChange, &new_phone, &request.code).await?;
-    if bound != Some(user.user_id) {
+    let ConsumedCode { mut tx, user_id } =
+        consume_code(&state, Purpose::PhoneChange, &new_phone, &request.code).await?;
+    if user_id != Some(user.user_id) {
+        tx.commit().await?;
         return Err(ApiError::BadRequest("invalid_code"));
     }
 
-    let mut tx = state.db.begin().await?;
     let old_phone = mfa::phone_of(&mut tx, user.user_id).await?;
     let updated = sqlx::query(
         "UPDATE users SET phone = $2, updated_at = now() WHERE id = $1 AND status = 'active'",
@@ -180,6 +181,16 @@ pub async fn phone_complete(
             other?;
         }
     }
+    // Eski numaraya gönderilmiş, henüz kullanılmamış kodlar geçersiz olur: eski numaranın yeni
+    // sahibi veya numarayı ele geçiren biri hesabın parolasını sıfırlayamaz (AUT-03).
+    sqlx::query(
+        "UPDATE verification_codes SET consumed_at = now()
+          WHERE consumed_at IS NULL AND (user_id = $1 OR phone = $2) AND purpose = 'password_reset'",
+    )
+    .bind(user.user_id)
+    .bind(old_phone.as_deref())
+    .execute(&mut *tx)
+    .await?;
     audit::record(
         &mut tx,
         audit::Event {
