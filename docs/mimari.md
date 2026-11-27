@@ -88,6 +88,32 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
 - **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı TLS istemiyorsa veya
   sırlar kısa ya da aynıysa API başlamaz.
 
+## Panel ve komut API'si
+
+Uç noktalar (`/v1/organizations/{org_id}`): `panels` (liste), `panels/{panel_id}` (ayrıntı: bölümler,
+zonlar, yöneticiye çıkışlar), `demo-panel` (sanal panel oluştur), `panels/{panel_id}/commands`
+(komut ver), `commands/{command_id}` (komut durumu), `events` (WebSocket).
+
+- **Yetki:** organizasyon kimliği yoldan gelir ama tek başına yetki vermez; her istekte üyelik
+  kontrol edilir. `owner`/`admin` bütün panellerde tam yetkili. Diğerleri yalnızca yetki kaydı olan
+  panelleri ve bölümleri görür; kurma, kapatma ve bypass ayrıca gün/saat penceresine bağlıdır.
+  Görme yetkisi olmayan biri panelin var olduğunu da öğrenemez (404); görebilen ama yetkisi
+  olmayan 403 alır.
+- **Komut türleri:** `arm_away`, `arm_stay`, `arm_night`, `disarm`, `bypass_zones`, `unbypass_zones`.
+- **Kurallar:** `shedu-domain` durum makinesi uygulanır (çevrimdışı panel, aynı durum, önce kapat,
+  kurmaya hazır değil, başka bölümün zonu). Reddedilen komut da `rejected` olarak kaydedilir.
+- **Tekrar anahtarı:** aynı anahtar aynı istekle gelirse ilk komut döner (200), farklı istekle
+  gelirse 422. Bir bölümde aynı anda tek komut yolda olabilir (409 `command_in_progress`).
+- **Sanal panel:** gerçek cihaza bağlı değildir; komutu kısa bir gecikmeyle tamamlar, bölüm
+  durumunu ve panel olayını yazar. Mağaza incelemesi ve deneme için; organizasyon başına bir tane.
+  Gerçek panellerde bu işi gateway yapacak.
+- **WebSocket:** veritabanı `shedu_events` kanalına yalnızca kimlik içeren bildirim gönderir; her
+  mesaj istemcinin kendi yetkisiyle yeniden okunur. `Authorization: Bearer` zorunlu; Origin başlığı
+  varsa `SHEDU_ALLOWED_ORIGINS` listesinde olmalı. Çıkış veya üyelik kaldırılınca bağlantı kapanır.
+  Kaçırılan olay olursa istemciye `resync` gönderilir.
+- **PIN:** panel kullanıcı kodu henüz alınmıyor; gateway ile birlikte, saklanmadan doğrudan panele
+  iletilecek şekilde eklenecek.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

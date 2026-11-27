@@ -106,3 +106,10 @@ pub async fn purge_old(conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
             .await?;
     Ok(result.rows_affected())
 }
+
+/// Panel komutları kullanıcı başına.
+pub const COMMAND_PER_USER: Budget = Budget {
+    scope: "command:user",
+    window_secs: 60,
+    limit: 30,
+};

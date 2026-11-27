@@ -17,8 +17,12 @@ pub enum ApiError {
     /// Kimlik doğrulanamadı. Neden (yanlış parola, bilinmeyen kullanıcı, iptal edilmiş oturum)
     /// bilerek ayırt edilmez.
     Unauthorized,
+    /// Kimlik doğru ama bu işleme yetkisi yok (ör. kapatma yetkisi veya erişim penceresi dışında).
+    Forbidden(&'static str),
     NotFound,
     Conflict(&'static str),
+    /// Aynı tekrar anahtarı farklı bir istekle kullanıldı.
+    Unprocessable(&'static str),
     /// Deneme sınırı aşıldı.
     TooManyRequests {
         retry_after_secs: u64,
@@ -37,8 +41,10 @@ impl IntoResponse for ApiError {
         let (status, code) = match self {
             Self::BadRequest(code) => (StatusCode::BAD_REQUEST, code),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Self::Forbidden(code) => (StatusCode::FORBIDDEN, code),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(code) => (StatusCode::CONFLICT, code),
+            Self::Unprocessable(code) => (StatusCode::UNPROCESSABLE_ENTITY, code),
             Self::TooManyRequests { retry_after_secs } => {
                 let mut response = (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -86,6 +92,13 @@ pub fn is_unique_violation(error: &sqlx::Error) -> bool {
         .as_database_error()
         .and_then(|db| db.code())
         .is_some_and(|code| code == "23505")
+}
+
+/// İhlal edilen kısıtın adı (ör. benzersiz indeks).
+pub fn violated_constraint(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(|db| db.constraint().map(str::to_owned))
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;

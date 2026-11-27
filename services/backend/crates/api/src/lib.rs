@@ -2,12 +2,17 @@
 
 pub mod audit;
 pub mod auth;
+pub mod authz;
+pub mod commands;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod events;
+pub mod panels;
+pub mod simulator;
 pub mod sms;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -20,7 +25,9 @@ use axum::{
 use serde::Serialize;
 use sqlx::PgPool;
 
-use crate::{auth::tokens::TokenKeys, sms::SmsSender};
+use tokio::sync::broadcast;
+
+use crate::{auth::tokens::TokenKeys, events::OrgEvent, sms::SmsSender};
 
 /// JSON gövdeleri için üst sınır; büyük gövdelerle kaynak tüketilmesini önler (RES-01).
 const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -34,6 +41,13 @@ pub struct AppState {
     /// Bilinmeyen kullanıcıyla girişte doğrulanan sahte hash; yanıt süresi hesabın varlığını
     /// belli etmez.
     pub dummy_hash: Arc<str>,
+    /// Veritabanı bildirimlerinden gelen olayların yayın kanalı (WebSocket istemcilerine).
+    pub events: broadcast::Sender<OrgEvent>,
+    /// Sanal panelde komutun tamamlanma gecikmesi.
+    pub simulator_delay: Duration,
+    /// WebSocket için izinli tarayıcı origin'leri. Boşsa Origin başlığı taşıyan her bağlantı
+    /// reddedilir (tarayıcı istemcileri BFF üzerinden bağlanır).
+    pub allowed_origins: Arc<[String]>,
 }
 
 #[derive(Debug)]
@@ -57,7 +71,15 @@ impl AppState {
             hmac_secret: Arc::from(hmac_secret),
             sms,
             dummy_hash: Arc::from(dummy_hash),
+            events: events::channel(),
+            simulator_delay: Duration::from_millis(800),
+            allowed_origins: Arc::from(Vec::new()),
         })
+    }
+
+    /// Veritabanı olay dinleyicisini başlatır (WebSocket akışı için).
+    pub fn start_event_listener(&self) -> tokio::task::JoinHandle<()> {
+        events::start_listener(self)
     }
 }
 
@@ -90,7 +112,13 @@ async fn security_headers(mut response: Response) -> Response {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .nest("/v1", auth::routes())
+        .nest(
+            "/v1",
+            auth::routes()
+                .merge(panels::routes())
+                .merge(commands::routes())
+                .merge(events::routes()),
+        )
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::map_response(security_headers))

@@ -10,7 +10,8 @@ rust-version = "1.94"
 publish = false
 
 [workspace.dependencies]
-axum = "0.8"
+shedu-domain = { path = "crates/domain" }
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +30,8 @@ subtle = "2.6"
 getrandom = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
 
 [workspace.lints.rust]
 # Güvenli olmayan Rust kodu yasak; gerekirse gerekçesiyle tek tek açılır.

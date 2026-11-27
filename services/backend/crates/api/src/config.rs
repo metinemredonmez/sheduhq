@@ -28,6 +28,8 @@ pub struct Config {
     pub jwt_secret: Vec<u8>,
     /// SMS kodları ve deneme sayacı anahtarları için HMAC anahtarı.
     pub hmac_secret: Vec<u8>,
+    /// WebSocket için izinli tarayıcı origin'leri (virgülle ayrılmış, ör. `https://app.example`).
+    pub allowed_origins: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -103,6 +105,14 @@ impl Config {
             return Err(ConfigError::SecretsMustDiffer);
         }
 
+        let allowed_origins = get("SHEDU_ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(str::to_owned)
+            .collect();
+
         Ok(Self {
             environment,
             addr,
@@ -110,6 +120,7 @@ impl Config {
             database_role,
             jwt_secret,
             hmac_secret,
+            allowed_origins,
         })
     }
 }

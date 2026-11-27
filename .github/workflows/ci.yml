@@ -47,8 +47,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all
-      - name: Entegrasyon testleri (giriş ve oturum, PostgreSQL 19)
-        run: cargo test --locked -p shedu-api --features db-tests --test auth
+      - name: Entegrasyon testleri (giriş, oturum, panel, komut, WebSocket; PostgreSQL 19)
+        run: cargo test --locked -p shedu-api --features db-tests
 
   ai:
     name: AI servisi (Python)

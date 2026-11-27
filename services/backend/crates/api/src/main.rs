@@ -30,8 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options: PgConnectOptions = config.database_url.parse()?;
     let pool = db::connect(options, config.database_role.clone()).await?;
-    let state = AppState::new(pool.clone(), &config.jwt_secret, &config.hmac_secret, sms)
+    let mut state = AppState::new(pool.clone(), &config.jwt_secret, &config.hmac_secret, sms)
         .map_err(|_| "uygulama durumu kurulamadı")?;
+    state.allowed_origins = config.allowed_origins.clone().into();
+    state.start_event_listener();
 
     // Eski deneme sayacı pencerelerini saatte bir temizle.
     tokio::spawn(async move {

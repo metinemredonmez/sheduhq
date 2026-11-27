@@ -43,6 +43,13 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   refresh yeniden kullanımında ailenin iptali, çıkışta access token'ın hemen geçersizleşmesi,
   başkasının oturumunun kapatılamaması, yanlış `alg`/`iss`/`aud`/`typ`/süre ile token reddi.
   Üretim ortamında çok kopyalı doğrulama yapılmadığı için durumlar "Doğrulanacak" kalır.
+- **AZ-01, AZ-04, BUS-01, BUS-02, API-04, SES-04 (panel ve komut):**
+  `services/backend/crates/api/tests/panels.rs` (12 entegrasyon testi): başka organizasyonun
+  paneli ne okunabilir ne yönetilebilir; üye yalnızca yetkili bölümü görür; kapatma yetkisi yoksa
+  403, pencere kapalıysa 403; aynı anahtarla tekrar aynı komut, farklı istekle 422; bölüm başına
+  tek yoldaki komut; reddedilen komutun kaydı; başka bölümün zonu bypass edilemez; WebSocket'te
+  token zorunlu, yabancı origin reddi, başka organizasyonun olayı gelmez, çıkıştan sonra bağlantı
+  kapanır.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
