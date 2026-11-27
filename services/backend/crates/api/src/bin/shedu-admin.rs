@@ -17,6 +17,8 @@
 //!   shedu-admin flag set camera_live --state on --rollout 0 --description "Canlı kamera" \
 //!       --reason "Pilotta denenecek"
 //!   shedu-admin flag override camera_live --org <ORG_ID> --state on --reason "Pilot müşteri"
+//!   shedu-admin app-version set --platform ios --minimum 1.2.0 --latest 1.4.0 \
+//!       --store-url https://apps.apple.com/app/id000 --reason "1.1 sürümünde giriş hatası"
 
 use std::{fs, path::PathBuf, process::ExitCode};
 
@@ -57,6 +59,30 @@ enum Command {
     /// Özellik bayrakları.
     #[command(subcommand)]
     Flag(FlagCommand),
+    /// Uygulama sürüm politikası (zorunlu güncelleme).
+    #[command(subcommand, name = "app-version")]
+    AppVersion(AppVersionCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum AppVersionCommand {
+    /// Platformların sürüm politikası.
+    List,
+    /// En düşük (altı zorunlu güncelleme, API reddeder) ve en güncel (altı öneri) sürüm.
+    Set {
+        /// ios, android veya web.
+        #[arg(long)]
+        platform: String,
+        #[arg(long)]
+        minimum: String,
+        #[arg(long)]
+        latest: String,
+        /// Yalnızca https://apps.apple.com/ veya https://play.google.com/ adresleri.
+        #[arg(long)]
+        store_url: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -365,6 +391,39 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(error)?;
             println!("{key} @ {org}: {state:?}");
+        }
+        Command::AppVersion(AppVersionCommand::List) => {
+            for v in admin::list_app_versions(&pool).await.map_err(error)? {
+                println!(
+                    "{:<8} en düşük {:<10} en güncel {:<10} {}",
+                    v.platform,
+                    v.minimum_version,
+                    v.latest_version,
+                    v.store_url.unwrap_or_default()
+                );
+            }
+        }
+        Command::AppVersion(AppVersionCommand::Set {
+            platform,
+            minimum,
+            latest,
+            store_url,
+            reason,
+        }) => {
+            let operator = operator(&cli, reason)?;
+            admin::set_app_version(
+                &pool,
+                &operator,
+                platform,
+                minimum,
+                latest,
+                store_url.as_deref(),
+            )
+            .await
+            .map_err(error)?;
+            println!(
+                "{platform}: en düşük {minimum}, en güncel {latest} (API 60 sn içinde uygular)"
+            );
         }
         Command::User(UserCommand::Enable { phone, reason }) => {
             let operator = operator(&cli, reason)?;

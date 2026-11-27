@@ -735,6 +735,105 @@ pub async fn set_flag_override(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Uygulama sürüm politikası
+// ---------------------------------------------------------------------------------------------
+
+/// Mağaza adresi yalnızca resmi mağazalara gidebilir; yanlış veya kötü niyetli bir adres
+/// kullanıcıya "güncelle" bağlantısı olarak gösterilmez.
+fn store_url(url: &str) -> AdminResult<String> {
+    let url = url.trim();
+    let allowed = ["https://apps.apple.com/", "https://play.google.com/"]
+        .iter()
+        .any(|prefix| url.starts_with(prefix));
+    if !allowed || url.len() > 500 || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(AdminError::Invalid(
+            "mağaza adresi (yalnızca https://apps.apple.com/ veya https://play.google.com/)",
+        ));
+    }
+    Ok(url.to_owned())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct AppVersionLine {
+    pub platform: String,
+    pub minimum_version: String,
+    pub latest_version: String,
+    pub store_url: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn list_app_versions(pool: &PgPool) -> AdminResult<Vec<AppVersionLine>> {
+    Ok(sqlx::query_as(
+        "SELECT platform, minimum_version, latest_version, store_url, updated_at
+           FROM app_versions ORDER BY platform",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Platformun en düşük ve en güncel sürümünü belirler. En düşük sürümün altındaki istemciler
+/// güncellemeye zorlanır ve API'den reddedilir.
+pub async fn set_app_version(
+    pool: &PgPool,
+    operator: &Operator,
+    platform: &str,
+    minimum: &str,
+    latest: &str,
+    url: Option<&str>,
+) -> AdminResult<()> {
+    if !matches!(platform, "ios" | "android" | "web") {
+        return Err(AdminError::Invalid("platform"));
+    }
+    let min: shedu_domain::version::AppVersion = minimum
+        .parse()
+        .map_err(|_| AdminError::Invalid("en düşük sürüm"))?;
+    let max: shedu_domain::version::AppVersion = latest
+        .parse()
+        .map_err(|_| AdminError::Invalid("en güncel sürüm"))?;
+    if min > max {
+        return Err(AdminError::Invalid(
+            "en düşük sürüm en güncelden büyük olamaz",
+        ));
+    }
+    let url = url.map(store_url).transpose()?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO app_versions (platform, minimum_version, latest_version, store_url)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (platform) DO UPDATE
+            SET minimum_version = EXCLUDED.minimum_version,
+                latest_version = EXCLUDED.latest_version,
+                store_url = EXCLUDED.store_url, updated_at = now()",
+    )
+    .bind(platform)
+    .bind(min.to_string())
+    .bind(max.to_string())
+    .bind(&url)
+    .execute(&mut *tx)
+    .await?;
+    audit::record(
+        &mut tx,
+        audit::Event {
+            organization_id: None,
+            actor_user_id: None,
+            action: "admin.app_version_set",
+            target_type: Some("app_version"),
+            target_id: Some(platform),
+            outcome: audit::Outcome::Success,
+            details: operator.details(json!({
+                "minimum_version": min.to_string(),
+                "latest_version": max.to_string(),
+                "store_url": url,
+            })),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +865,22 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(flag_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn store_url_must_be_an_official_store() {
+        assert!(store_url("https://apps.apple.com/tr/app/shedu/id123").is_ok());
+        assert!(store_url("https://play.google.com/store/apps/details?id=app.shedu").is_ok());
+        for bad in [
+            "http://apps.apple.com/x",
+            "https://apps.apple.com.evil.example/x",
+            "https://apps.apple.com@evil.example/x",
+            "https://evil.example/https://apps.apple.com/",
+            "javascript:alert(1)",
+            "https://play.google.com/x y",
+        ] {
+            assert!(store_url(bad).is_err(), "{bad}");
         }
     }
 

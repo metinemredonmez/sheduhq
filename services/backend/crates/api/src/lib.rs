@@ -1,6 +1,7 @@
 //! Shedu HTTP API.
 
 pub mod admin;
+pub mod app_version;
 pub mod audit;
 pub mod auth;
 pub mod authz;
@@ -63,6 +64,8 @@ pub struct AppState {
     pub allowed_origins: Arc<[String]>,
     /// Push sağlayıcısı. Varsayılan: devre dışı (her gönderim başarısız sayılır).
     pub push: Arc<dyn PushSender>,
+    /// Uygulama sürüm politikası önbelleği (varsayılan 60 saniye).
+    pub versions: Arc<app_version::VersionCache>,
 }
 
 #[derive(Debug)]
@@ -94,6 +97,7 @@ impl AppState {
             simulator_delay: Duration::from_millis(800),
             allowed_origins: Arc::from(Vec::new()),
             push: Arc::new(push::DisabledPush),
+            versions: Arc::new(app_version::VersionCache::new(Duration::from_secs(60))),
         })
     }
 
@@ -155,7 +159,13 @@ pub fn router(state: AppState) -> Router {
                 .merge(grants::routes())
                 .merge(privacy::routes())
                 .merge(notifications::routes())
-                .merge(features::routes()),
+                .merge(features::routes())
+                // Desteklenmeyen sürümdeki istemci reddedilir; sürüm kontrol ucu bunun dışındadır.
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    app_version::enforce,
+                ))
+                .merge(app_version::routes()),
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))

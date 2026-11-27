@@ -36,7 +36,7 @@ Geliştirme sırası: **backend → AI servisi → admin → web → mobil.** Ge
 - Olay geçmişi (tarih filtresi).
 - Panik butonları: polis, ambulans, itfaiye (basılı tutma ve onay ile).
 - Bağlı cihazlar ve oturumlar; uzaktan oturum kapatma.
-- Dil (TR/EN), profil, zorunlu güncelleme kontrolü.
+- Dil (TR/EN), profil, zorunlu güncelleme kontrolü. (Backend: zorunlu güncelleme kontrolü hazır.)
 
 ## Faz 2
 

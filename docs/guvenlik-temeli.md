@@ -137,6 +137,14 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   geçersiz anahtar ve yüzde reddedilir; API rolü bayrak yazamaz ve bütün ayarları okuyamaz;
   yönetici de RLS'ye tabidir. Acil kapatmanın önceliği ve rol ayrımı bozulduğunda ilgili testin
   kaldığı yerelde doğrulandı.
+- **Zorunlu güncelleme (EXT, AZ-05, API-02, LOG-01):** `services/backend/crates/api/tests/app_version.rs`
+  (3 entegrasyon testi), `tests/sql/011_app_versions.sql`, domain ve birim testleri ve aracın
+  yerel çalıştırılması: politika yokken her sürüm güncel; geçersiz platform, sürüm ve bilinmeyen
+  parametre reddedilir; sürümler sayısal karşılaştırılır; eski istemcinin istekleri ve girişi 426
+  alır, sürüm kontrolü ve sağlık ucu açık kalır; başlıksız istemci etkilenmez, bozuk başlık 400;
+  en düşük sürüm yükselince önceki istemci hemen reddedilir; mağaza adresi resmi mağaza dışına
+  (alt alan, `@`, yol içinde adres, http) gidemez; API rolü politikayı yazamaz. API'deki engel ve
+  sayısal karşılaştırma bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.

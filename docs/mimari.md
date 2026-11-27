@@ -292,6 +292,24 @@ shedu-admin flag override camera_live --org <ORG_ID> --state on|off|clear --reas
   bayrak yazamaz ve bütün organizasyon ayarlarını okuyamaz; her organizasyon yalnızca kendi
   ayarını görür. Her değişiklik gerekçeli ve denetim kaydındadır.
 
+## Zorunlu güncelleme kontrolü
+
+- **Kontrol:** `GET /v1/app-version?platform=ios&version=1.4.2` giriş gerektirmez; yanıt
+  `up_to_date`, `update_recommended` veya `update_required`, en düşük ve en güncel sürüm ve mağaza
+  adresidir. Uygulama açılışta sorar; zorunluysa güncelleme ekranını gösterir.
+- **API'de engel:** istemci `X-Shedu-App: ios/1.4.2` başlığını gönderir. En düşük sürümün
+  altındaki istemcinin bütün istekleri (giriş dahil) 426 `update_required` ile reddedilir; kontrol
+  ucu ve `/health` bunun dışındadır. Başlıksız istemciler (web arka yüzü, araçlar) etkilenmez;
+  bozuk başlık 400'dür. Başlık taklit edilebilir, bu bir güvenlik sınırı değildir; amaç dürüst eski
+  istemcileri bilinen hatalı sürümlerden uzaklaştırmaktır.
+- **Sürüm:** `MAJOR[.MINOR[.PATCH]]`, sayısal karşılaştırılır (1.10 > 1.9); ön sürüm eki kabul
+  edilmez. Politika yoksa hiçbir şey zorlanmaz. API politikayı 60 saniyelik önbellekle okur.
+- **Yönetim:** `shedu-admin app-version set --platform ios --minimum 1.2.0 --latest 1.4.0
+  --store-url https://apps.apple.com/… --reason "…"`. Mağaza adresi yalnızca
+  `https://apps.apple.com/` veya `https://play.google.com/` ile başlayabilir (API ve veritabanı
+  ayrı ayrı denetler); kullanıcıya sahte bir "güncelle" bağlantısı gösterilemez. API'nin rolü
+  politikayı değiştiremez.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

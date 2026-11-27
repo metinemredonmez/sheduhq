@@ -6,7 +6,9 @@
 //! - [`panel`]: bölüm (partition) durumları, komutlar ve komut sonuçları (BUS-01).
 //! - [`alarm`]: panelden gelen bildirimler ve öncelikleri.
 //! - [`access`]: gün ve saat bazlı erişim penceresi (AZ-01).
+//! - [`version`]: uygulama sürümü ve güncelleme kararı.
 
 pub mod access;
 pub mod alarm;
 pub mod panel;
+pub mod version;

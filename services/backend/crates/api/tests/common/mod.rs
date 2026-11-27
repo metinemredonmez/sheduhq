@@ -59,6 +59,8 @@ pub async fn app_with(connect: PgConnectOptions, simulator_delay: Duration) -> T
     )
     .expect("durum");
     state.simulator_delay = simulator_delay;
+    // Testlerde sürüm politikası değişikliği hemen görünsün.
+    state.versions = Arc::new(shedu_api::app_version::VersionCache::new(Duration::ZERO));
     let push = RecordingPush::default();
     state.push = Arc::new(push.clone());
     let router = shedu_api::router(state.clone())
