@@ -129,6 +129,14 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   denetim kaydında işlemi yapan ve gerekçe vardır, numara yoktur; üretimde TLS'siz bağlantıyla
   araç başlamaz. Rol ayrımı, push token silme ve ayrılmış marka kontrolü bozulduğunda ilgili
   testin kaldığı yerelde doğrulandı.
+- **Özellik bayrakları (AZ-02, AZ-05, LOG-01):** `services/backend/crates/api/tests/features.rs`
+  (2 entegrasyon testi), `tests/sql/010_feature_flags.sql`, birim testleri ve aracın yerel
+  çalıştırılması: tanımsız bayrak kapalıdır; pilot ayarı yalnızca o organizasyonda açar; üye
+  aynı değeri görür, üye olmayan göremez; organizasyon ayarı bayrağı kapatabilir ve kaldırılabilir;
+  acil kapatma pilot ayarını da ezer; kovalar sabit ve dengelidir; açıklamasız yeni bayrak,
+  geçersiz anahtar ve yüzde reddedilir; API rolü bayrak yazamaz ve bütün ayarları okuyamaz;
+  yönetici de RLS'ye tabidir. Acil kapatmanın önceliği ve rol ayrımı bozulduğunda ilgili testin
+  kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.

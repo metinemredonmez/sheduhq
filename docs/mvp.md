@@ -13,7 +13,8 @@ Geliştirme sırası: **backend → AI servisi → admin → web → mobil.** Ge
 - Kullanıcı → organizasyon → panel → bölüm yetki modeli, gün ve saat bazlı pencereler.
 - Komut API'si: durum makinesi ve idempotency.
 - Panel gateway, olay kaydı, push servisi, SMS sağlayıcısı, denetim kaydı.
-- Uyarı merkezi, özellik bayrakları, hata izleme (kişisel veri maskelenerek).
+- Uyarı merkezi, özellik bayrakları, hata izleme (kişisel veri maskelenerek). (Backend: özellik
+  bayrakları hazır.)
 - Dış adres kalkanı (kamera akışı, webhook): SSRF'e karşı.
 - KVKK: rıza defteri, veri dışa aktarma, 30 gün geri alınabilir hesap silme. (Backend hazır; rıza
   amaçları ve metin sürümleri hukuki onay bekliyor.)

@@ -529,6 +529,212 @@ pub async fn set_user_active(
     Ok(user_id)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Özellik bayrakları
+// ---------------------------------------------------------------------------------------------
+
+fn flag_key(key: &str) -> AdminResult<String> {
+    let valid = (2..=64).contains(&key.len())
+        && key.starts_with(|c: char| c.is_ascii_lowercase())
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if valid {
+        Ok(key.to_owned())
+    } else {
+        Err(AdminError::Invalid(
+            "bayrak anahtarı (küçük harf, rakam, _)",
+        ))
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct FlagLine {
+    pub key: String,
+    pub description: String,
+    pub enabled: bool,
+    pub rollout_percent: i16,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct FlagOverrideLine {
+    pub flag_key: String,
+    pub organization_id: Uuid,
+    pub enabled: bool,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Bütün bayraklar ve organizasyon ayarları; yalnızca yönetici rolüyle çalışır.
+pub async fn list_flags(pool: &PgPool) -> AdminResult<(Vec<FlagLine>, Vec<FlagOverrideLine>)> {
+    let flags = sqlx::query_as(
+        "SELECT key, description, enabled, rollout_percent, updated_at FROM feature_flags ORDER BY key",
+    )
+    .fetch_all(pool)
+    .await?;
+    let overrides = sqlx::query_as("SELECT * FROM admin_flag_overrides()")
+        .fetch_all(pool)
+        .await?;
+    Ok((flags, overrides))
+}
+
+pub struct FlagChange<'a> {
+    pub key: &'a str,
+    /// Yeni bayrakta zorunlu.
+    pub description: Option<&'a str>,
+    /// `false`: her organizasyonda kapalı (acil kapatma).
+    pub enabled: bool,
+    /// Verilmezse yeni bayrakta 100, mevcut bayrakta değişmez.
+    pub rollout_percent: Option<i16>,
+}
+
+/// Bayrağı oluşturur veya değiştirir; yeni oluşturulduysa `true`.
+pub async fn set_flag(
+    pool: &PgPool,
+    operator: &Operator,
+    change: FlagChange<'_>,
+) -> AdminResult<bool> {
+    let key = flag_key(change.key)?;
+    if change
+        .rollout_percent
+        .is_some_and(|p| !(0..=100).contains(&p))
+    {
+        return Err(AdminError::Invalid("yüzde (0–100)"));
+    }
+    let description = change
+        .description
+        .map(|d| text(d, 300, "açıklama"))
+        .transpose()?;
+
+    let mut tx = pool.begin().await?;
+    let existing: Option<(i16,)> =
+        sqlx::query_as("SELECT rollout_percent FROM feature_flags WHERE key = $1 FOR UPDATE")
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let created = existing.is_none();
+    let rollout = match existing {
+        None => {
+            let description = description
+                .clone()
+                .ok_or(AdminError::Invalid("yeni bayrak için açıklama"))?;
+            let rollout = change.rollout_percent.unwrap_or(100);
+            sqlx::query(
+                "INSERT INTO feature_flags (key, description, enabled, rollout_percent)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(&key)
+            .bind(&description)
+            .bind(change.enabled)
+            .bind(rollout)
+            .execute(&mut *tx)
+            .await?;
+            rollout
+        }
+        Some((current,)) => {
+            let rollout = change.rollout_percent.unwrap_or(current);
+            sqlx::query(
+                "UPDATE feature_flags
+                    SET enabled = $2, rollout_percent = $3,
+                        description = coalesce($4, description), updated_at = now()
+                  WHERE key = $1",
+            )
+            .bind(&key)
+            .bind(change.enabled)
+            .bind(rollout)
+            .bind(&description)
+            .execute(&mut *tx)
+            .await?;
+            rollout
+        }
+    };
+    audit::record(
+        &mut tx,
+        audit::Event {
+            organization_id: None,
+            actor_user_id: None,
+            action: "admin.flag_updated",
+            target_type: Some("feature_flag"),
+            target_id: Some(&key),
+            outcome: audit::Outcome::Success,
+            details: operator.details(json!({
+                "enabled": change.enabled,
+                "rollout_percent": rollout,
+                "created": created,
+            })),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(created)
+}
+
+/// Bir organizasyon için bayrağı açar veya kapatır; `None` organizasyon ayarını kaldırır.
+pub async fn set_flag_override(
+    pool: &PgPool,
+    operator: &Operator,
+    key: &str,
+    organization_id: Uuid,
+    value: Option<bool>,
+) -> AdminResult<()> {
+    let key = flag_key(key)?;
+    let mut tx = pool.begin().await?;
+    set_context(&mut tx, None, Some(organization_id)).await?;
+    let org: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM organizations WHERE id = app_current_org()")
+            .fetch_optional(&mut *tx)
+            .await?;
+    if org.is_none() {
+        return Err(AdminError::NotFound("organizasyon"));
+    }
+    let flag: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM feature_flags WHERE key = $1")
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if flag.is_none() {
+        return Err(AdminError::NotFound("bayrak"));
+    }
+    match value {
+        Some(enabled) => {
+            sqlx::query(
+                "INSERT INTO feature_flag_overrides (flag_key, organization_id, enabled)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (flag_key, organization_id)
+                 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()",
+            )
+            .bind(&key)
+            .bind(organization_id)
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "DELETE FROM feature_flag_overrides WHERE flag_key = $1 AND organization_id = $2",
+            )
+            .bind(&key)
+            .bind(organization_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    audit::record(
+        &mut tx,
+        audit::Event {
+            organization_id: Some(organization_id),
+            actor_user_id: None,
+            action: "admin.flag_override_set",
+            target_type: Some("feature_flag"),
+            target_id: Some(&key),
+            outcome: audit::Outcome::Success,
+            details: operator.details(json!({ "enabled": value })),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +752,21 @@ mod tests {
         serde_json::from_value::<PanelLayout>(json)
             .map_err(|_| AdminError::Invalid("json"))?
             .validate()
+    }
+
+    #[test]
+    fn flag_keys_are_simple_identifiers() {
+        assert!(flag_key("camera_live").is_ok());
+        for bad in [
+            "c",
+            "Camera",
+            "1camera",
+            "kamera-canlı",
+            "x y",
+            &"a".repeat(65),
+        ] {
+            assert!(flag_key(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

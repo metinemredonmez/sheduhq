@@ -271,6 +271,27 @@ shedu-admin user enable --phone +90… --reason "…"
 - **Üretim:** `DATABASE_URL` TLS (`sslmode=verify-full` veya `require`) istemiyorsa araç
   başlamaz. Sunucuya erişim (SSH, anahtar, yetki) dağıtım tarafında kısıtlanır (OPS-02).
 
+## Özellik bayrakları
+
+Uç nokta: `GET /v1/organizations/{org_id}/features` → `{"features": {"camera_live": true, …}}`.
+Uygulama hangi ekranı göstereceğine bununla karar verir; sunucu tarafında `features::is_enabled`
+kullanılır. Bayrakları yalnızca platform yöneticisi değiştirir:
+
+```
+shedu-admin flag list
+shedu-admin flag set camera_live --state on --rollout 0 --description "Canlı kamera" --reason "…"
+shedu-admin flag override camera_live --org <ORG_ID> --state on|off|clear --reason "…"
+```
+
+- **Değerlendirme:** kapalı bayrak her organizasyonda kapalıdır (acil kapatma, organizasyon
+  ayarını da ezer). Açıksa organizasyona özel ayar varsa o geçerlidir; yoksa organizasyonun
+  bayrak için sabit kovası (anahtar ve kimlikten SHA-256) ile yüzde uygulanır. Yüzde artınca
+  önceden açık organizasyonlar açık kalır. Tanımsız bayrak kapalıdır.
+- **Pilot:** açık, yüzde 0, pilot organizasyonlara `override … --state on`.
+- **Sınırlar:** bayrak yetki vermez, yalnızca özelliği gösterir veya gizler. API'nin rolü
+  bayrak yazamaz ve bütün organizasyon ayarlarını okuyamaz; her organizasyon yalnızca kendi
+  ayarını görür. Her değişiklik gerekçeli ve denetim kaydındadır.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

@@ -14,12 +14,15 @@
 //!   shedu-admin panel add --org <ORG_ID> --name "Merkez" --brand acme --serial SN-1 \
 //!       --layout panel.json --reason "Pilot panel montajı"
 //!   shedu-admin user disable --phone +905551112233 --reason "Cihaz çalındı bildirimi"
+//!   shedu-admin flag set camera_live --state on --rollout 0 --description "Canlı kamera" \
+//!       --reason "Pilotta denenecek"
+//!   shedu-admin flag override camera_live --org <ORG_ID> --state on --reason "Pilot müşteri"
 
 use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use shedu_api::{
-    admin::{self, ADMIN_ROLE, NewOrganization, NewPanel, Operator, PanelLayout},
+    admin::{self, ADMIN_ROLE, FlagChange, NewOrganization, NewPanel, Operator, PanelLayout},
     db,
     sms::mask_phone,
 };
@@ -51,6 +54,53 @@ enum Command {
     /// Kullanıcılar.
     #[command(subcommand)]
     User(UserCommand),
+    /// Özellik bayrakları.
+    #[command(subcommand)]
+    Flag(FlagCommand),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum OverrideState {
+    On,
+    Off,
+    /// Organizasyon ayarını kaldırır; genel kural uygulanır.
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum FlagCommand {
+    /// Bütün bayraklar ve organizasyon ayarları.
+    List,
+    /// Bayrağı oluşturur veya değiştirir. `off` her organizasyonda kapatır (acil kapatma).
+    Set {
+        key: String,
+        #[arg(long, value_enum)]
+        state: OnOff,
+        /// Açık bayrağın uygulanacağı organizasyon yüzdesi (0–100). Yeni bayrakta varsayılan 100.
+        #[arg(long)]
+        rollout: Option<i16>,
+        /// Yeni bayrakta zorunlu.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Bir organizasyon için bayrağı açar, kapatır veya ayarı kaldırır.
+    Override {
+        key: String,
+        #[arg(long)]
+        org: Uuid,
+        #[arg(long, value_enum)]
+        state: OverrideState,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -250,6 +300,71 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(error)?;
             println!("kapatıldı: {id} (oturumlar ve bildirimler iptal edildi)");
+        }
+        Command::Flag(FlagCommand::List) => {
+            let (flags, overrides) = admin::list_flags(&pool).await.map_err(error)?;
+            for f in flags {
+                println!(
+                    "{:<28} {:<4} %{:>3}  {}",
+                    f.key,
+                    if f.enabled { "açık" } else { "kapalı" },
+                    f.rollout_percent,
+                    f.description
+                );
+                for o in overrides.iter().filter(|o| o.flag_key == f.key) {
+                    println!(
+                        "    {}  {}",
+                        o.organization_id,
+                        if o.enabled { "açık" } else { "kapalı" }
+                    );
+                }
+            }
+        }
+        Command::Flag(FlagCommand::Set {
+            key,
+            state,
+            rollout,
+            description,
+            reason,
+        }) => {
+            let operator = operator(&cli, reason)?;
+            let created = admin::set_flag(
+                &pool,
+                &operator,
+                FlagChange {
+                    key,
+                    description: description.as_deref(),
+                    enabled: matches!(state, OnOff::On),
+                    rollout_percent: *rollout,
+                },
+            )
+            .await
+            .map_err(error)?;
+            println!(
+                "{key}: {}",
+                if created {
+                    "oluşturuldu"
+                } else {
+                    "güncellendi"
+                }
+            );
+        }
+        Command::Flag(FlagCommand::Override {
+            key,
+            org,
+            state,
+            reason,
+        }) => {
+            let operator = operator(&cli, reason)?;
+            let value = match state {
+                OverrideState::On => Some(true),
+                OverrideState::Off => Some(false),
+                OverrideState::Clear => None,
+            };
+            admin::set_flag_override(&pool, &operator, key, *org, value)
+                .await
+                .map_err(error)?;
+            println!("{key} @ {org}: {state:?}");
         }
         Command::User(UserCommand::Enable { phone, reason }) => {
             let operator = operator(&cli, reason)?;
