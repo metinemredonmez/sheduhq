@@ -7,7 +7,7 @@
 //! - gönderim sırasında süreç çökerse işlem geri alınır, düzenli tarama olayı yeniden dener:
 //!   alarm bildirimi kaybolmaz.
 //!
-//! Alıcılar: organizasyonun yöneticileri ve o panelde (bölüm düzeyinde) geçerli görme yetkisi olan
+//! Alıcılar: organizasyonun yöneticileri, operatörleri ve o panelde (bölüm düzeyinde) geçerli görme yetkisi olan
 //! üyeler; yalnızca etkin oturumu olan ve push token'ı kayıtlı cihazlar. Çıkış yapılmış cihaza
 //! bildirim gitmez.
 //!
@@ -229,7 +229,7 @@ pub async fn dispatch(
           WHERE d.push_token IS NOT NULL
             AND EXISTS (SELECT 1 FROM refresh_tokens r
                          WHERE r.device_id = d.id AND r.revoked_at IS NULL AND r.expires_at > now())
-            AND (m.role IN ('owner', 'admin') OR EXISTS (
+            AND (m.role IN ('owner', 'admin', 'operator') OR EXISTS (
                    SELECT 1 FROM access_grants g
                     WHERE g.user_id = d.user_id AND g.panel_id = $2 AND g.can_view_events
                       AND (g.valid_from IS NULL OR g.valid_from <= now())

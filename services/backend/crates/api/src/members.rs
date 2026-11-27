@@ -4,7 +4,10 @@
 //! - Kimse kendi rolünü değiştiremez.
 //! - Yalnızca kendinden alt roldeki biri yönetilir ve yalnızca kendinden alt bir rol atanır: sahip
 //!   yöneticiyi ve üyeyi, yönetici yalnızca üyeyi yönetir. Yönetici başkasını yönetici yapamaz.
-//! - Sahip tektir; çıkarılamaz, rolü değiştirilemez, ayrılamaz (veritabanı da engeller).
+//! - Sahip tektir; çıkarılamaz, rolü değiştirilemez, ayrılamaz (veritabanı da engeller). Sahiplik
+//!   yalnızca bir yöneticiye ve parolayla yeniden doğrulamadan sonra devredilir.
+//! - Operatör (izleme personeli) yalnızca işletme ve izleme merkezi organizasyonlarında olur; bütün
+//!   panelleri ve olayları görür, kimseyi yönetemez, kurma/kapatma için yetki kaydı gerekir.
 //!
 //! Değişiklik hemen geçerlidir (SES-04): rol ve üyelik her istekte, her WebSocket mesajında ve her
 //! push gönderiminde veritabanından okunur. Üyelik silinince panel yetkileri de silinir; yetkisini
@@ -23,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState, audit,
-    auth::AuthUser,
+    auth::{AuthUser, reauth},
     authz::{self, Role},
     error::{ApiError, ApiResult},
     invitations,
@@ -36,6 +39,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/organizations/{org_id}/members/{user_id}",
             axum::routing::patch(change_role).delete(remove),
+        )
+        .route(
+            "/organizations/{org_id}/ownership-transfer",
+            axum::routing::post(transfer_ownership),
         )
 }
 
@@ -64,6 +71,7 @@ pub struct MemberView {
 pub enum AssignableRole {
     Admin,
     Member,
+    Operator,
 }
 
 impl AssignableRole {
@@ -71,8 +79,17 @@ impl AssignableRole {
         match self {
             Self::Admin => Role::Admin,
             Self::Member => Role::Member,
+            Self::Operator => Role::Operator,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferRequest {
+    user_id: Uuid,
+    /// Sahibin güncel parolası: hassas işlem öncesi yeniden doğrulama.
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +175,9 @@ pub async fn change_role(
         .await?;
         tx.commit().await?;
         return Err(ApiError::Forbidden("not_permitted"));
+    }
+    if !authz::role_fits(&authz::organization_kind(&mut tx).await?, new_role) {
+        return Err(ApiError::Unprocessable("role_not_allowed"));
     }
     if current == new_role {
         tx.commit().await?;
@@ -274,4 +294,80 @@ pub async fn remove(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sahipliği bir yöneticiye devreder; önceki sahip yönetici olur. Yalnızca sahip, güncel
+/// parolasıyla yapabilir (AZ-05). Değişiklik veritabanında tek adımda yapılır.
+pub async fn transfer_ownership(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(org_id): Path<Uuid>,
+    Json(request): Json<TransferRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (mut tx, ctx) = authz::begin(&state, user, org_id).await?;
+    let denied = |reason: &'static str| audit::Event {
+        organization_id: Some(org_id),
+        actor_user_id: Some(ctx.user.user_id),
+        action: "organization.ownership_transfer",
+        target_type: Some("user"),
+        target_id: None,
+        outcome: audit::Outcome::Denied,
+        details: json!({ "reason": reason }),
+    };
+    if ctx.role != Role::Owner {
+        audit::record(&mut tx, denied("not_owner")).await?;
+        tx.commit().await?;
+        return Err(ApiError::Forbidden("not_permitted"));
+    }
+    if request.user_id == ctx.user.user_id {
+        return Err(ApiError::BadRequest("cannot_transfer_to_self"));
+    }
+
+    let target: Option<(String,)> = sqlx::query_as(
+        "SELECT role FROM memberships WHERE user_id = $1 AND organization_id = $2 FOR UPDATE",
+    )
+    .bind(request.user_id)
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (target_role,) = target.ok_or(ApiError::NotFound)?;
+    if target_role != "admin" {
+        return Err(ApiError::Conflict("target_must_be_admin"));
+    }
+
+    if !reauth::verify_password(&state, ctx.user.user_id, request.password).await? {
+        audit::record(&mut tx, denied("reauth_failed")).await?;
+        tx.commit().await?;
+        return Err(ApiError::Forbidden("reauth_failed"));
+    }
+
+    sqlx::query("SELECT transfer_ownership($1)")
+        .bind(request.user_id)
+        .execute(&mut *tx)
+        .await?;
+    // Önceki sahip artık yönetici: gönderdiği açık yönetici davetlerini veremez.
+    sqlx::query(
+        "UPDATE invitations SET revoked_at = now()
+          WHERE organization_id = $1 AND invited_by = $2 AND role = 'admin'
+            AND accepted_at IS NULL AND declined_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(org_id)
+    .bind(ctx.user.user_id)
+    .execute(&mut *tx)
+    .await?;
+    audit::record(
+        &mut tx,
+        audit::Event {
+            organization_id: Some(org_id),
+            actor_user_id: Some(ctx.user.user_id),
+            action: "organization.ownership_transferred",
+            target_type: Some("user"),
+            target_id: Some(&request.user_id.to_string()),
+            outcome: audit::Outcome::Success,
+            details: json!({ "from": ctx.user.user_id, "to": request.user_id }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "owner": request.user_id })))
 }

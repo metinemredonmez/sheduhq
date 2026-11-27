@@ -5,6 +5,7 @@ pub mod extract;
 mod handlers;
 pub mod password;
 pub mod rate_limit;
+pub mod reauth;
 pub mod tokens;
 
 use axum::{

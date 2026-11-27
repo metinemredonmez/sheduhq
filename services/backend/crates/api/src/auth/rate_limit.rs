@@ -139,3 +139,10 @@ pub const INVITE_SMS_PER_PHONE: Budget = Budget {
     window_secs: 24 * 60 * 60,
     limit: 3,
 };
+
+/// Hassas işlem öncesi parola doğrulaması, kullanıcı başına.
+pub const REAUTH_PER_USER: Budget = Budget {
+    scope: "reauth:user",
+    window_secs: 15 * 60,
+    limit: 5,
+};

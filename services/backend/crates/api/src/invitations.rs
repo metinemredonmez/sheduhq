@@ -54,6 +54,7 @@ pub fn routes() -> Router<AppState> {
 pub enum InvitedRole {
     Admin,
     Member,
+    Operator,
 }
 
 impl InvitedRole {
@@ -61,6 +62,7 @@ impl InvitedRole {
         match self {
             Self::Admin => Role::Admin,
             Self::Member => Role::Member,
+            Self::Operator => Role::Operator,
         }
     }
 }
@@ -162,6 +164,9 @@ pub async fn create(
         .await?;
         tx.commit().await?;
         return Err(ApiError::Forbidden("not_permitted"));
+    }
+    if !authz::role_fits(&authz::organization_kind(&mut tx).await?, role) {
+        return Err(ApiError::Unprocessable("role_not_allowed"));
     }
 
     let already_member: Option<(i32,)> = sqlx::query_as(
@@ -412,7 +417,7 @@ pub async fn accept(
             AND i.accepted_at IS NULL AND i.declined_at IS NULL AND i.revoked_at IS NULL
             AND EXISTS (SELECT 1 FROM memberships m
                          WHERE m.user_id = i.invited_by AND m.organization_id = i.organization_id
-                           AND (m.role = 'owner' OR (m.role = 'admin' AND i.role = 'member')))
+                           AND (m.role = 'owner' OR (m.role = 'admin' AND i.role IN ('member', 'operator'))))
           RETURNING i.organization_id, i.role",
     )
     .bind(invitation_id)

@@ -49,6 +49,17 @@ impl Role {
         matches!(self, Self::Owner | Self::Admin)
     }
 
+    /// Bütün panelleri, bölümleri ve olayları görür mü? Yöneticiler ve operatör (izleme
+    /// personeli). Operatör kurma, kapatma ve bypass için yine yetki kaydına ihtiyaç duyar.
+    pub fn sees_all_panels(self) -> bool {
+        matches!(self, Self::Owner | Self::Admin | Self::Operator)
+    }
+
+    /// Bu rol yalnızca işletme ve izleme merkezi organizasyonlarında kullanılabilir mi?
+    pub fn requires_business(self) -> bool {
+        matches!(self, Self::Operator)
+    }
+
     fn rank(self) -> u8 {
         match self {
             Self::Owner => 3,
@@ -155,8 +166,12 @@ pub async fn permissions(
     .bind(partition_id)
     .fetch_all(&mut *conn)
     .await?;
+    let sees_all = ctx.role.sees_all_panels();
     if grants.is_empty() {
-        return Ok(Permissions::default());
+        return Ok(Permissions {
+            view: sees_all,
+            ..Permissions::default()
+        });
     }
 
     let moment = local_moment(conn).await?;
@@ -194,6 +209,7 @@ pub async fn permissions(
         result.disarm |= open && can_disarm;
         result.bypass |= open && can_bypass;
     }
+    result.view |= sees_all;
     Ok(result)
 }
 
@@ -203,7 +219,7 @@ pub async fn visible_partitions(
     ctx: &OrgContext,
     panel_id: Uuid,
 ) -> ApiResult<Option<Vec<Uuid>>> {
-    if ctx.role.is_manager() {
+    if ctx.role.sees_all_panels() {
         return Ok(None);
     }
     let rows: Vec<(Option<Uuid>,)> = sqlx::query_as(
@@ -272,4 +288,18 @@ pub async fn session_active(conn: &mut PgConnection, user: AuthUser) -> Result<b
     .fetch_optional(conn)
     .await?;
     Ok(active.is_some())
+}
+
+/// İşlemin organizasyonunun türü (`home`, `business`, `monitoring_center`).
+pub async fn organization_kind(conn: &mut PgConnection) -> ApiResult<String> {
+    let (kind,): (String,) =
+        sqlx::query_as("SELECT kind FROM organizations WHERE id = app_current_org()")
+            .fetch_one(conn)
+            .await?;
+    Ok(kind)
+}
+
+/// Rol bu türdeki organizasyonda kullanılabilir mi? Operatör yalnızca işletme ve izleme merkezi.
+pub fn role_fits(kind: &str, role: Role) -> bool {
+    !role.requires_business() || matches!(kind, "business" | "monitoring_center")
 }

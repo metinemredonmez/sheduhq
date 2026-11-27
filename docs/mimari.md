@@ -139,15 +139,23 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
 ## Üyeler, davetler ve panel yetkileri
 
 Uç noktalar (`/v1/organizations/{org_id}` altında): `GET /members`, `PATCH`/`DELETE
-/members/{user_id}`, `GET`/`POST /invitations`, `DELETE /invitations/{id}`, `GET`/`POST
+/members/{user_id}`, `POST /ownership-transfer`, `GET`/`POST /invitations`, `DELETE /invitations/{id}`, `GET`/`POST
 /members/{user_id}/grants`, `PUT`/`DELETE /grants/{grant_id}`. Davet edilen taraf: `GET /v1/invitations`,
 `POST /v1/invitations/{id}/accept`, `POST /v1/invitations/{id}/decline`.
 
-- **Roller:** `owner` (tek, organizasyonu açan kişi), `admin`, `member`. Herkes yalnızca kendinden
-  alt roldeki birini yönetir ve yalnızca kendinden alt bir rol atar: sahip yöneticiyi ve üyeyi,
-  yönetici yalnızca üyeyi. Kimse kendi rolünü değiştiremez. Sahip çıkarılamaz, rolü değiştirilemez,
-  ayrılamaz; veritabanı da her organizasyonda tek sahip olmasını ve sahip üyeliğinin doğrudan
-  silinmemesini zorlar.
+- **Roller:** `owner` (tek, organizasyonu açan kişi), `admin`, `member`, `operator`. Herkes
+  yalnızca kendinden alt roldeki birini yönetir ve yalnızca kendinden alt bir rol atar: sahip
+  yöneticiyi, üyeyi ve operatörü; yönetici yalnızca üyeyi ve operatörü. Kimse kendi rolünü
+  değiştiremez. Sahip çıkarılamaz, rolü değiştirilemez, ayrılamaz; veritabanı da her
+  organizasyonda tek sahip olmasını ve uygulamanın sahip üyeliğine doğrudan dokunamamasını zorlar.
+- **Sahiplik devri:** sahip, güncel parolasıyla yeniden doğrulayarak sahipliği bir yöneticiye
+  devreder; önceki sahip yönetici olur. Devir veritabanındaki tek bir fonksiyonla, tek adımda
+  yapılır. Önceki sahibin açık yönetici davetleri iptal edilir.
+- **Operatör:** izleme personeli; yalnızca işletme ve izleme merkezi organizasyonlarında olur
+  (veritabanı da zorlar). Organizasyondaki bütün panelleri, bölümleri, zonları ve olayları görür,
+  alarm bildirimlerini alır; kimseyi yönetemez, çıkışları göremez, kurma/kapatma/bypass için yetki
+  kaydı gerekir. Bir izleme merkezinin müşteri organizasyonlarını izlemesi (organizasyonlar arası
+  erişim) henüz yok; izleme merkezi modeli netleşince tasarlanacak.
 - **Davet:** telefon numarasına bağlıdır; bağlantı veya kod taşımaz. Kişi o numarayla (SMS koduyla
   doğrulanmış) oturum açınca daveti uygulamada görür. 7 gün geçerlidir, tek kez kabul, ret veya
   iptal edilir. Davet SMS'i sabit bir metindir; organizasyon veya kişi adı içermez, böylece

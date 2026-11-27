@@ -87,7 +87,7 @@ async fn visible_panels(
     conn: &mut sqlx::PgConnection,
     ctx: &OrgContext,
 ) -> ApiResult<Vec<PanelSummary>> {
-    let panels = if ctx.role.is_manager() {
+    let panels = if ctx.role.sees_all_panels() {
         sqlx::query_as::<_, PanelSummary>(
             "SELECT id, name, brand, model, connectivity, ready_to_arm, last_seen_at, simulated
                FROM panels ORDER BY name",
@@ -171,7 +171,7 @@ pub async fn panel_detail(
     .await?;
     let zones = zones
         .into_iter()
-        .filter(|z| ctx.role.is_manager() || z.partitions.iter().any(|p| visible.contains(p)))
+        .filter(|z| ctx.role.sees_all_panels() || z.partitions.iter().any(|p| visible.contains(p)))
         .collect();
 
     let outputs = if ctx.role.is_manager() {

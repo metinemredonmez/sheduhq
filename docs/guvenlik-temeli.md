@@ -68,6 +68,13 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bağlanamaz; yetki kapsamı değiştirme isteğiyle taşınamaz; reddedilen denemeler denetim kaydına
   girer. Üç koruma (kabul anındaki yeniden doğrulama, rol karşılaştırması, üyelik-yetki bağı)
   tek tek bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
+- **Sahiplik devri ve operatör (AZ-05, AUT-02):** aynı dosyada 2 entegrasyon testi ve
+  `services/backend/tests/sql/004_ownership_operator.sql`: sahiplik yalnızca sahip tarafından,
+  yalnızca yöneticiye ve parola doğrulamasından sonra devredilir; yanlış parolada devir olmaz ve
+  deneme kaydedilir; her an tek sahip vardır; uygulama rolü devir fonksiyonu dışında sahip
+  üyeliğine dokunamaz. Operatör ev organizasyonunda olamaz; bütün panelleri görür ama yetki kaydı
+  olmadan kuramaz, kimseyi yönetemez, alarm bildirimini alır. Parola doğrulaması ve operatör tür
+  kontrolü bozulduğunda testlerin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -75,10 +82,10 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   - SES-03: mutlak oturum ömrü (refresh ailesi için üst süre) yok.
   - KEY-03: JWT anahtarı tek; planlı rotasyon için `kid` ile anahtar kümesi eklenecek.
   - NET-03: ters vekil arkasında gerçek IP için güvenilir vekil listesi yok.
-  - AZ-05: sahiplik devri yok. Sahip hesabı silinirse (KVKK silme akışı) organizasyon sahipsiz
-    kalabilir; silme akışı yazılırken önce organizasyonun devri veya kapatılması istenecek.
-  - AZ-05: `operator` rolü (izleme merkezi personeli) tanımlı ama davet ve rol atamasında
-    kullanılamaz; izleme merkezi modeli netleşince eklenecek.
+  - AZ-05: sahip hesabı silinirse (KVKK silme akışı) organizasyon sahipsiz kalabilir; silme akışı
+    yazılırken önce sahipliğin devri veya organizasyonun kapatılması istenecek.
+  - AZ-01: izleme merkezinin müşteri organizasyonlarına erişimi (organizasyonlar arası operatör)
+    yok; izleme merkezi modeli netleşince ayrı politika olarak tasarlanacak.
 
 ## Değişmez kurallar
 

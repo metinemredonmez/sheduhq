@@ -805,3 +805,253 @@ async fn grants_are_validated_scoped_and_take_effect(_: PgPoolOptions, connect: 
         assert_eq!(audit_count(&app, action, "success").await, 1, "{action}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Sahiplik devri
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ownership_is_transferred_only_to_an_admin_after_reauth(
+    _: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let app = app(connect).await;
+    let (owner, owner_id, org) = app.user(PHONE).await;
+    let (admin, admin_id) = join(&app, &owner, &org, ADMIN_PHONE, "admin").await;
+    let (_, member_id) = join(&app, &owner, &org, INVITEE, "member").await;
+    let transfer = format!("/v1/organizations/{org}/ownership-transfer");
+    let body = |to: &str, password: &str| json!({ "user_id": to, "password": password });
+
+    // Sahip olmayan devredemez; devralan yönetici olmalı; kendine devredilmez.
+    let (status, _) = app
+        .post_auth(&transfer, body(&member_id, PASSWORD), &admin)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, response) = app
+        .post_auth(&transfer, body(&member_id, PASSWORD), &owner)
+        .await;
+    assert_eq!(
+        (status, s(&response, "error")),
+        (StatusCode::CONFLICT, "target_must_be_admin".into())
+    );
+    let (status, _) = app
+        .post_auth(&transfer, body(&owner_id, PASSWORD), &owner)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Yanlış parola: devir olmaz, deneme kaydedilir.
+    let (status, response) = app
+        .post_auth(&transfer, body(&admin_id, NEW_PASSWORD), &owner)
+        .await;
+    assert_eq!(
+        (status, s(&response, "error")),
+        (StatusCode::FORBIDDEN, "reauth_failed".into())
+    );
+    assert_eq!(
+        role_in_db(&app, &org, &owner_id).await.as_deref(),
+        Some("owner")
+    );
+    assert_eq!(
+        audit_count(&app, "organization.ownership_transfer", "denied").await,
+        2
+    );
+
+    // Önceki sahibin açık yönetici daveti devirle iptal edilir; üye daveti kalır.
+    let (status, _) = invite(&app, &owner, &org, SECOND, "admin").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = invite(&app, &owner, &org, THIRD, "member").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, response) = app
+        .post_auth(&transfer, body(&admin_id, PASSWORD), &owner)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        role_in_db(&app, &org, &admin_id).await.as_deref(),
+        Some("owner")
+    );
+    assert_eq!(
+        role_in_db(&app, &org, &owner_id).await.as_deref(),
+        Some("admin")
+    );
+    let (owners,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM memberships WHERE organization_id = $1::uuid AND role = 'owner'",
+    )
+    .bind(&org)
+    .fetch_one(&app.admin)
+    .await
+    .expect("sorgu");
+    assert_eq!(owners, 1);
+    let (_, open) = app
+        .get(&format!("/v1/organizations/{org}/invitations"), &admin)
+        .await;
+    let roles: Vec<&str> = open["invitations"]
+        .as_array()
+        .expect("liste")
+        .iter()
+        .filter_map(|i| i["role"].as_str())
+        .collect();
+    assert_eq!(roles, vec!["member"]);
+
+    // Önceki sahip artık yönetici: yeni sahibe dokunamaz; yeni sahip onu yönetebilir.
+    let (status, _) = app
+        .patch(
+            &format!("/v1/organizations/{org}/members/{admin_id}"),
+            json!({ "role": "member" }),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = app
+        .delete(
+            &format!("/v1/organizations/{org}/members/{admin_id}"),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = app
+        .patch(
+            &format!("/v1/organizations/{org}/members/{owner_id}"),
+            json!({ "role": "member" }),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        audit_count(&app, "organization.ownership_transferred", "success").await,
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Operatör
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn operator_sees_all_panels_but_controls_only_with_grants(
+    _: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let app = app(connect).await;
+    app.start_background().await;
+    let (owner, _, org) = app.user(PHONE).await;
+
+    // Ev organizasyonunda operatör olmaz.
+    let (status, response) = invite(&app, &owner, &org, INVITEE, "operator").await;
+    assert_eq!(
+        (status, s(&response, "error")),
+        (StatusCode::UNPROCESSABLE_ENTITY, "role_not_allowed".into())
+    );
+    let (_, member_id) = join(&app, &owner, &org, SECOND, "member").await;
+    let (status, _) = app
+        .patch(
+            &format!("/v1/organizations/{org}/members/{member_id}"),
+            json!({ "role": "operator" }),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // İşletme organizasyonu.
+    sqlx::query("UPDATE organizations SET kind = 'business' WHERE id = $1::uuid")
+        .bind(&org)
+        .execute(&app.admin)
+        .await
+        .expect("tür");
+    let (panel, home, garage) = demo(&app, &owner, &org).await;
+    let (operator, operator_id) = join(&app, &owner, &org, INVITEE, "operator").await;
+    let (status, _) = app
+        .put(
+            "/v1/devices/current/push-token",
+            json!({ "token": "operator-device-token" }),
+            &operator,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Yetki kaydı olmadan bütün panelleri, bölümleri, zonları ve olayları görür.
+    let (_, panels) = app
+        .get(&format!("/v1/organizations/{org}/panels"), &operator)
+        .await;
+    assert_eq!(panels.as_array().map(Vec::len), Some(1));
+    let (status, detail) = app
+        .get(
+            &format!("/v1/organizations/{org}/panels/{panel}"),
+            &operator,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["partitions"].as_array().map(Vec::len), Some(2));
+    assert_eq!(detail["zones"].as_array().map(Vec::len), Some(5));
+    assert!(detail.get("outputs").is_none(), "operatör çıkışları görmez");
+    let (status, _) = app
+        .get(
+            &format!("/v1/organizations/{org}/panels/{panel}/events"),
+            &operator,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Ama kuramaz, kimseyi yönetemez, yetki veremez.
+    let (status, _) = command(&app, &operator, &org, &panel, &home, "arm_away").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = app
+        .get(&format!("/v1/organizations/{org}/members"), &operator)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = invite(&app, &operator, &org, THIRD, "member").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = app
+        .post_auth(
+            &format!("/v1/organizations/{org}/members/{operator_id}/grants"),
+            full_grant(&panel, None),
+            &operator,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Yönetici garaj için yetki verince yalnızca garajı kurar.
+    let (status, _) = app
+        .post_auth(
+            &format!("/v1/organizations/{org}/members/{operator_id}/grants"),
+            full_grant(&panel, Some(&garage)),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, response) = command(&app, &operator, &org, &panel, &garage, "arm_away").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    wait_succeeded(&app, &operator, &org, &s(&response, "id")).await;
+    let (status, _) = command(&app, &operator, &org, &panel, &home, "arm_away").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Alarm bildirimi operatöre gider; yetkisi olmayan üyeye gitmez.
+    let (status, alarm) = app
+        .post_auth(
+            &format!("/v1/organizations/{org}/panels/{panel}/simulate-alarm"),
+            json!({ "zone_number": 3 }),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{alarm}");
+    let event_id = alarm["event_id"].as_i64().expect("olay");
+    let mut tokens = Vec::new();
+    for _ in 0..150 {
+        tokens = app
+            .push
+            .messages()
+            .into_iter()
+            .filter(|m| m.event_id == event_id)
+            .map(|m| (m.token, m.user_id.to_string()))
+            .collect();
+        if !tokens.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(
+        tokens,
+        vec![("operator-device-token".to_owned(), operator_id.clone())]
+    );
+    assert_ne!(operator_id, member_id);
+}
