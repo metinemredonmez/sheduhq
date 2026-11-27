@@ -140,8 +140,9 @@ impl TestApp {
 
     /// Arka planda gönderilen son SMS kodunu bekler. Kod taşımayan mesajlar (ör. arka planda geç
     /// ulaşan davet SMS'i) atlanır.
+    /// Yüklü makinede (CI) arka plan görevi gecikebilir; en fazla 5 saniye beklenir.
     pub async fn last_code(&self, phone: &str, previous: usize) -> String {
-        for _ in 0..100 {
+        for _ in 0..500 {
             let messages = self.sms.messages_to(phone);
             let code = messages
                 .iter()

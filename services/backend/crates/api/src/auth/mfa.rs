@@ -119,7 +119,7 @@ pub struct Status {
 // Yardımcılar
 // ---------------------------------------------------------------------------------------------
 
-fn notify(state: &AppState, phone: Option<String>, text: &'static str) {
+pub(crate) fn notify(state: &AppState, phone: Option<String>, text: &'static str) {
     let Some(phone) = phone else { return };
     let sms = state.sms.clone();
     tokio::spawn(async move {
@@ -129,7 +129,7 @@ fn notify(state: &AppState, phone: Option<String>, text: &'static str) {
     });
 }
 
-async fn phone_of(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<Option<String>> {
+pub(crate) async fn phone_of(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<Option<String>> {
     let row: Option<(Option<String>,)> = sqlx::query_as("SELECT phone FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(conn)
@@ -160,7 +160,13 @@ async fn record(
     Ok(())
 }
 
-async fn require_password(state: &AppState, user_id: Uuid, password: String) -> ApiResult<()> {
+/// Parolayla yeniden doğrulama; başarısız deneme `action` adıyla denetim kaydına yazılır.
+pub(crate) async fn require_password(
+    state: &AppState,
+    user_id: Uuid,
+    password: String,
+    action: &'static str,
+) -> ApiResult<()> {
     if reauth::verify_password(state, user_id, password).await? {
         return Ok(());
     }
@@ -168,7 +174,7 @@ async fn require_password(state: &AppState, user_id: Uuid, password: String) -> 
     record(
         &mut conn,
         user_id,
-        "mfa.reauth",
+        action,
         audit::Outcome::Failure,
         json!({}),
     )
@@ -345,6 +351,23 @@ async fn totp_enabled(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<bool>
             .fetch_optional(conn)
             .await?;
     Ok(row.is_some())
+}
+
+/// Hassas hesap işlemleri (dışa aktarma, numara değişimi, silme) için adım yükseltme: kullanıcının
+/// faktörü açıksa bu oturumda ikinci adım tamamlanmış olmalı (AUT-04).
+pub(crate) async fn step_up(conn: &mut PgConnection, user: AuthUser) -> ApiResult<()> {
+    let (enabled, verified): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM user_totp WHERE user_id = $1 AND confirmed_at IS NOT NULL),
+                EXISTS (SELECT 1 FROM session_factors WHERE family_id = $2 AND user_id = $1)",
+    )
+    .bind(user.user_id)
+    .bind(user.session_id)
+    .fetch_one(conn)
+    .await?;
+    if enabled && !verified {
+        return Err(ApiError::Forbidden("mfa_required"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -536,7 +559,7 @@ pub async fn setup(
     user: AuthUser,
     Json(request): Json<PasswordRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_password(&state, user.user_id, request.password).await?;
+    require_password(&state, user.user_id, request.password, "mfa.reauth").await?;
     let mut tx = state.db.begin().await?;
     let existing: Option<(bool,)> = sqlx::query_as(
         "SELECT confirmed_at IS NOT NULL FROM user_totp WHERE user_id = $1 FOR UPDATE",
@@ -644,7 +667,7 @@ pub async fn disable(
     user: AuthUser,
     Json(request): Json<FactorRequest>,
 ) -> ApiResult<StatusCode> {
-    require_password(&state, user.user_id, request.password).await?;
+    require_password(&state, user.user_id, request.password, "mfa.reauth").await?;
     {
         let mut conn = state.db.acquire().await?;
         rate_limit::hit(
@@ -713,7 +736,7 @@ pub async fn regenerate_recovery_codes(
     if request.recovery_code.is_some() || request.code.is_none() {
         return Err(ApiError::BadRequest("totp_code_required"));
     }
-    require_password(&state, user.user_id, request.password).await?;
+    require_password(&state, user.user_id, request.password, "mfa.reauth").await?;
     {
         let mut conn = state.db.acquire().await?;
         rate_limit::hit(

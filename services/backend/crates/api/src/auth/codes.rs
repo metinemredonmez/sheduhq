@@ -15,6 +15,7 @@ pub const MAX_ATTEMPTS: i16 = 5;
 pub enum Purpose {
     Register,
     PasswordReset,
+    PhoneChange,
 }
 
 impl Purpose {
@@ -22,6 +23,7 @@ impl Purpose {
         match self {
             Self::Register => "register",
             Self::PasswordReset => "password_reset",
+            Self::PhoneChange => "phone_change",
         }
     }
 }

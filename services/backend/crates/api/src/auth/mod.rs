@@ -5,6 +5,7 @@ pub mod extract;
 mod handlers;
 pub mod mfa;
 pub mod password;
+pub mod profile;
 pub mod rate_limit;
 pub mod reauth;
 pub mod tokens;
@@ -34,7 +35,9 @@ pub fn routes() -> Router<AppState> {
             "/auth/password-reset/complete",
             post(handlers::reset_complete),
         )
-        .route("/me", get(handlers::me))
+        .route("/me", get(handlers::me).patch(profile::update))
+        .route("/me/phone/start", post(profile::phone_start))
+        .route("/me/phone/complete", post(profile::phone_complete))
         .route("/auth/mfa", get(mfa::status))
         .route("/auth/mfa/totp/setup", post(mfa::setup))
         .route("/auth/mfa/totp/confirm", post(mfa::confirm))

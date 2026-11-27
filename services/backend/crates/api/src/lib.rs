@@ -15,6 +15,7 @@ pub mod history;
 pub mod invitations;
 pub mod members;
 pub mod panels;
+pub mod privacy;
 pub mod push;
 pub mod simulator;
 pub mod sms;
@@ -143,7 +144,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(events::routes())
                 .merge(members::routes())
                 .merge(invitations::routes())
-                .merge(grants::routes()),
+                .merge(grants::routes())
+                .merge(privacy::routes()),
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))

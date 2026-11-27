@@ -185,7 +185,7 @@ async fn limit(
 
 /// Yeni kod üretir, aynı telefon ve amaç için önceki kodları geçersiz kılar ve SMS'i arka planda
 /// gönderir (yanıt süresi kodun gönderilip gönderilmediğini belli etmez).
-async fn issue_code(
+pub(super) async fn issue_code(
     state: &AppState,
     conn: &mut PgConnection,
     purpose: Purpose,
@@ -231,7 +231,7 @@ async fn issue_code(
 /// Kodu doğrular ve tüketir. Ayrı ve hemen kalıcı hale gelen bir işlemde çalışır: yanlış
 /// denemeler sonraki adımlar başarısız olsa bile sayılır. Kod tek kullanımlıktır, en fazla
 /// 5 deneme hakkı vardır (AUT-03). Başarılıysa koda bağlı kullanıcı kimliğini döner.
-async fn consume_code(
+pub(super) async fn consume_code(
     state: &AppState,
     purpose: Purpose,
     phone: &str,

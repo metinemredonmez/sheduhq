@@ -159,3 +159,17 @@ pub const MFA_PER_IP: Budget = Budget {
     window_secs: 15 * 60,
     limit: 50,
 };
+
+/// Kişisel veri dışa aktarma, kullanıcı başına günde (RES-01, DAT-02).
+pub const PRIVACY_EXPORT_PER_USER: Budget = Budget {
+    scope: "privacy:export",
+    window_secs: 24 * 60 * 60,
+    limit: 3,
+};
+
+/// Telefon numarası değiştirme başlatma, kullanıcı başına günde.
+pub const PHONE_CHANGE_PER_USER: Budget = Budget {
+    scope: "phone-change:user",
+    window_secs: 24 * 60 * 60,
+    limit: 3,
+};

@@ -15,7 +15,9 @@ Geliştirme sırası: **backend → AI servisi → admin → web → mobil.** Ge
 - Panel gateway, olay kaydı, push servisi, SMS sağlayıcısı, denetim kaydı.
 - Uyarı merkezi, özellik bayrakları, hata izleme (kişisel veri maskelenerek).
 - Dış adres kalkanı (kamera akışı, webhook): SSRF'e karşı.
-- KVKK: rıza defteri, veri dışa aktarma, 30 gün geri alınabilir hesap silme.
+- KVKK: rıza defteri, veri dışa aktarma, 30 gün geri alınabilir hesap silme. (Backend: dışa aktarma,
+  düzeltme ve hesap silme hazır; silme şimdilik anında ve geri alınamaz. Rıza defteri ve 30 günlük
+  bekleme süresi kaldı.)
 - Mağaza inceleme hesabı için sanal demo panel.
 
 **Yönetim**

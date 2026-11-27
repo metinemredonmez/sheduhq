@@ -192,6 +192,33 @@ Uç noktalar (`/v1/organizations/{org_id}` altında): `GET /members`, `PATCH`/`D
 - **Etki hemen:** rol, üyelik ve yetki her istekte, her WebSocket mesajında ve her push
   gönderiminde veritabanından okunur. Üyelik silinince yetki kayıtları da silinir.
 
+## Kişisel veriler (KVKK)
+
+Uç noktalar (`/v1`): `PATCH me` (görünen ad), `POST me/phone/start`, `POST me/phone/complete`,
+`POST me/data-export`, `POST me/delete`. KVKK md. 11'deki bilgi alma, düzeltme ve silme
+haklarının teknik karşılığıdır; aydınlatma metni ve hukuki kararlar açık sorulardadır.
+
+- **Ortak koşul:** dışa aktarma, numara değişimi ve silme parolayla yeniden doğrulama ister; MFA
+  açıksa oturumda ikinci adım tamamlanmış olmalıdır. Ele geçirilmiş bir access token ile bütün
+  kişisel veri alınamaz, numara değiştirilemez, hesap silinemez.
+- **Dışa aktarma:** JSON (`shedu-personal-data/v1`): profil, üyelikler, cihazlar (push token'ı
+  olmadan), oturumlar, MFA durumu (sır olmadan), kendi panel yetkileri, kendi komutları ve
+  kendisinin yaptığı veya ona yönelik güvenlik olayları (ayrıldığı organizasyonlar dahil, en çok
+  10.000 satır). Başka kişilerin kimliği, numarası ve olay ayrıntısı girmez. Dosya sunucuda
+  tutulmaz, yanıt önbelleğe alınmaz; kullanıcı başına günde 3 kez.
+- **Düzeltme:** görünen ad doğrudan değişir. Numara değişimi yeni numaraya giden SMS koduyla
+  tamamlanır; kod değişimi başlatan kullanıcıya bağlıdır. Yeni numara başka hesaptaysa kod
+  gönderilmez, yanıt aynıdır. Değişiklik eski numaraya bildirilir. Günde 3 başlatma.
+- **Silme (anonimleştirme ve yok etme):** veritabanındaki `erase_account()` tek işlemde yapar.
+  Kişinin tek başına sahibi olduğu organizasyonlar bütün verisiyle (paneller, olaylar, komutlar,
+  davetler) silinir. Diğer organizasyonlardaki üyelikler ve yetkiler silinir. Numarasına gelmiş
+  davetler, cihazlar, oturumlar, MFA kayıtları silinir. Başka organizasyonlardaki güvenlik
+  kayıtları (komut, bildirim teslimi, denetim kaydı) korunur; kullanıcı satırı ad, numara,
+  e-posta ve parola olmadan "Silinmiş kullanıcı" olarak kalır, böylece bu kayıtlar kişiye
+  bağlanamaz. Başka üyesi olan organizasyonun sahibi önce sahipliği devretmelidir (yanıt hangi
+  organizasyonlar olduğunu söyler). Silme kullanıcıya SMS ile bildirilir. Aynı numarayla yeniden
+  kayıt olunabilir; bu yeni bir hesaptır.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.
