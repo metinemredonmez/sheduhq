@@ -238,6 +238,39 @@ haklarının teknik karşılığıdır; aydınlatma metni ve hukuki kararlar aç
   yanıt kabul edilmez, metin değişince istemci yeniden sorar (`up_to_date`). Dışa aktarmada
   bütün geçmiş yer alır.
 
+## Platform yöneticisi aracı (`shedu-admin`)
+
+Pilotta müşteri organizasyonu açma, panel atama ve olay anında kullanıcıyı kapatma işleri sunucuda
+çalışan `shedu-admin` komut satırı aracıyla yapılır; API'de karşılığı yoktur. Admin paneli
+(Next.js) gelince aynı kurallarla onun arkasına taşınacaktır.
+
+```
+shedu-admin org list
+shedu-admin org show <ORG_ID>
+shedu-admin org create --name "Örnek AŞ" --kind business --owner-phone +90… --owner-name "…" --reason "…"
+shedu-admin panel add --org <ORG_ID> --name Merkez --brand acme --serial SN-1 --layout panel.json --reason "…"
+shedu-admin user disable --phone +90… --reason "…"
+shedu-admin user enable --phone +90… --reason "…"
+```
+
+- **Ayrı rol:** araç `shedu_admin` veritabanı rolüyle bağlanır (gerçek giriş rolü bu role üye
+  yapılır, parolası API'ninkinden ayrıdır: `CREATE ROLE … LOGIN; GRANT shedu_admin TO …`). Bu
+  rol uygulama rolünün yetkilerini miras alır ve RLS'ye aynen tabidir; ek olarak yalnızca bütün
+  organizasyonların özetini veren fonksiyonu çalıştırabilir. API'nin rolü bu listeyi alamaz.
+- **Gerekçe ve iz:** her değişiklik `--reason` (10–300 karakter) ister; işlemi yapan kişi
+  (`--operator` ya da sunucudaki kullanıcı adı) ve gerekçe denetim kaydına yazılır. Telefon
+  numarası denetim kaydına yazılmaz, ekranda maskelenir.
+- **Sahip:** yeni organizasyonun sahibi kayıtlı değilse parolasız bir hesap açılır; kişi
+  parolasını uygulamadaki parola sıfırlama (SMS kodu) ile kendisi belirler. Araç parola
+  belirlemez ve göstermez.
+- **Panel:** bölüm ve zon düzeni JSON dosyasından okunur (bilinmeyen alan reddedilir); panel
+  çevrimdışı ve "kurmaya hazır değil" başlar, gateway bağlanana kadar komut kabul edilmez. Demo
+  panellerin markası gerçek panele verilemez; aynı marka ve seri numarası ikinci kez eklenemez.
+- **Kullanıcıyı kapatma:** bütün oturumlar ve push token'ları hemen iptal edilir; yeniden
+  açılınca kişi normal giriş yapar.
+- **Üretim:** `DATABASE_URL` TLS (`sslmode=verify-full` veya `require`) istemiyorsa araç
+  başlamaz. Sunucuya erişim (SSH, anahtar, yetki) dağıtım tarafında kısıtlanır (OPS-02).
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

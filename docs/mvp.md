@@ -20,7 +20,8 @@ Geliştirme sırası: **backend → AI servisi → admin → web → mobil.** Ge
 - Mağaza inceleme hesabı için sanal demo panel.
 
 **Yönetim**
-- Pilot için: müşteriye panel atama ve kullanıcı açma işleri korumalı bir yönetici CLI'ı ile.
+- Pilot için: müşteriye panel atama ve kullanıcı açma işleri korumalı bir yönetici CLI'ı ile
+  (hazır: `shedu-admin`).
 - Ardından admin paneli (Next.js): BFF ile HttpOnly çerez, MFA, gerekçeli işlem, denetim kaydı ekranı.
 
 **Mobil (iOS + Android)**

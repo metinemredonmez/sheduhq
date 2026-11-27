@@ -36,6 +36,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
+# Yönetici komut satırı aracı (shedu-admin).
+clap = { version = "4.6", features = ["derive", "env"] }
 
 [workspace.lints.rust]
 # Güvenli olmayan Rust kodu yasak; gerekirse gerekçesiyle tek tek açılır.

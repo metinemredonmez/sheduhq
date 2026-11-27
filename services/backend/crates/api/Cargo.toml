@@ -27,6 +27,7 @@ getrandom.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+clap.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

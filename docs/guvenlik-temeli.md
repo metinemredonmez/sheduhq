@@ -19,6 +19,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
 | Token | TOK-01, TOK-02 | JWT'de algoritma listesi sabit; `exp`, `aud`, `iss` zorunlu; anahtar güvenilir kaynaktan | Doğrulanacak |
 | Yetki | AZ-01, AZ-02, AZ-04 | Her komutta izin + kapsam + nesne + durum birlikte; veri katmanında ikinci bariyer | Doğrulanacak |
 | Yetki | AZ-05 | Rol hiyerarşisi: yalnızca alt rol yönetilir; tek ve korunan sahip; kendine yetki yok | Doğrulanacak |
+| Yönetim | AZ-05, OPS-02, LOG-01 | Platform yöneticisi ayrı araç ve ayrı veritabanı rolüyle; her değişiklik gerekçeli ve kayıtlı | Doğrulanacak |
 | API | API-02 | Alan düzeyinde yazma izni; istemci izinsiz alan gönderemez | Doğrulanacak |
 | API | API-04 | WebSocket'te kimlik, origin ve mesaj başına yetki | Doğrulanacak |
 | İş mantığı | BUS-01, BUS-02 | Komut durum makinesi (`domain` crate'i), idempotency, atomik geçiş | Doğrulanacak |
@@ -117,6 +118,17 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bildirimi gider. Veritabanında alarm kategorisi yazılamaz, kişi başkası adına veya üyesi
   olmadığı organizasyona tercih yazamaz, üyelik silinince tercih silinir. Dağıtıcı filtresi, alarm
   koruması ve kişi başına yazma politikası bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
+- **Platform yöneticisi (AZ-05, OPS-02, LOG-01, SES-04, EXC-01):** `services/backend/crates/api/tests/admin.rs`
+  (3 entegrasyon testi), `tests/sql/009_platform_admin.sql`, `admin.rs` ve `shedu-admin` birim
+  testleri ve aracın yerel veritabanında uçtan uca çalıştırılması: gerekçesiz veya kısa gerekçeli
+  değişiklik reddedilir; açılan sahip parolasız başlar ve ancak SMS kodlu parola sıfırlamayla
+  girer; işletme sahibi MFA'dan sonra paneli görür; yeni panel çevrimdışıdır ve komut reddedilir;
+  ayrılmış marka (büyük/küçük harf farkıyla da) ve tekrar eden seri reddedilir, başarısız ekleme
+  iz bırakmaz; uygulama rolü organizasyon listesini alamaz, yönetici rolü RLS'ye tabidir ve
+  denetim kaydını silemez; kapatılan kullanıcının açık oturumu hemen kapanır, push token'ı silinir;
+  denetim kaydında işlemi yapan ve gerekçe vardır, numara yoktur; üretimde TLS'siz bağlantıyla
+  araç başlamaz. Rol ayrımı, push token silme ve ayrılmış marka kontrolü bozulduğunda ilgili
+  testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -133,6 +145,10 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
     yok (bilinmeyen sürüm güvenli tarafta reddedilir).
   - AUT-04: kullanıcı hem doğrulayıcıyı hem kurtarma kodlarını kaybederse destek eliyle kurtarma
     akışı yok; yazılırken ayrı yetki, denetim kaydı ve kullanıcı bildirimiyle yapılacak.
+  - OPS-02: `shedu-admin`'in çalışacağı sunucuya erişim (SSH anahtarı, ayrı servis kullanıcısı,
+    yönetim ağı) ve yönetici giriş rolünün parolası dağıtım kurulurken tanımlanacak. İşlemi
+    yapan kişinin adı sunucudaki kullanıcı adından gelir; kişi başına ayrı sunucu hesabı
+    gerekir.
   - DAT-05: yedekler henüz yok; yedekten geri dönüşte silinmiş hesapların yeniden canlanmaması
     için silme kayıtlarının (denetim kaydındaki `privacy.account_erased`) yeniden uygulanması
     yedekleme kurulurken tanımlanacak.
