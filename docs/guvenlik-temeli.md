@@ -50,6 +50,11 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   tek yoldaki komut; reddedilen komutun kaydı; başka bölümün zonu bypass edilemez; WebSocket'te
   token zorunlu, yabancı origin reddi, başka organizasyonun olayı gelmez, çıkıştan sonra bağlantı
   kapanır.
+- **Olay ve push (AZ-01, BUS-02, SES-04, LOG-01):** `services/backend/crates/api/tests/events.rs`
+  (8 entegrasyon testi): geçmişte kiracı ve bölüm izolasyonu; alarm bildirimi yalnızca yetkili
+  cihazlara ve kritik öncelikle; çıkış yapılmış cihaza bildirim gitmez; token el değiştirince eski
+  hesaptan kalkar; iki dağıtıcı aynı olayı tek kez gönderir; kaçırılan olay taramayla yakalanır;
+  teslim kaydı tutulur.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.

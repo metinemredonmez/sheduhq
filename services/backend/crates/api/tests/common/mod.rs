@@ -11,7 +11,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use shedu_api::{AppState, db, sms::RecordingSms};
+use shedu_api::{AppState, db, push::RecordingPush, sms::RecordingSms};
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -26,6 +26,7 @@ pub struct TestApp {
     pub router: Router,
     pub state: AppState,
     pub sms: RecordingSms,
+    pub push: RecordingPush,
     /// Uygulama rolüyle (RLS uygulanır).
     pub pool: PgPool,
     /// Süper kullanıcıyla; yalnızca test kurulumu ve doğrulamaları için.
@@ -57,18 +58,37 @@ pub async fn app_with(connect: PgConnectOptions, simulator_delay: Duration) -> T
     )
     .expect("durum");
     state.simulator_delay = simulator_delay;
+    let push = RecordingPush::default();
+    state.push = Arc::new(push.clone());
     let router = shedu_api::router(state.clone())
         .layer(MockConnectInfo(SocketAddr::from(([203, 0, 113, 7], 4000))));
     TestApp {
         router,
         state,
         sms,
+        push,
         pool,
         admin,
     }
 }
 
 impl TestApp {
+    /// Olay dinleyicisini ve push dağıtıcısını başlatır.
+    pub async fn start_background(&self) {
+        self.state.start_event_listener();
+        self.state.start_push_dispatcher();
+        // Dinleyicinin LISTEN komutunu vermesi için kısa bir süre.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    pub async fn delete(&self, path: &str, bearer: &str) -> (StatusCode, Value) {
+        self.call(Method::DELETE, path, None, Some(bearer)).await
+    }
+
+    pub async fn put(&self, path: &str, body: Value, bearer: &str) -> (StatusCode, Value) {
+        self.call(Method::PUT, path, Some(body), Some(bearer)).await
+    }
+
     pub async fn call(
         &self,
         method: Method,

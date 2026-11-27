@@ -343,6 +343,8 @@ fn token_response(
     })
 }
 
+/// Oturum ailesini iptal eder ve o cihazın push token'ını siler: çıkış yapılmış cihaza alarm
+/// bildirimi gitmez.
 async fn revoke_family(
     conn: &mut PgConnection,
     family_id: Uuid,
@@ -351,6 +353,14 @@ async fn revoke_family(
     let result = sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = now()
           WHERE family_id = $1 AND user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(family_id)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE user_devices SET push_token = NULL
+          WHERE user_id = $2 AND id IN (SELECT device_id FROM refresh_tokens WHERE family_id = $1)",
     )
     .bind(family_id)
     .bind(user_id)
@@ -803,6 +813,10 @@ pub async fn reset_complete(
     let mut tx = state.db.begin().await?;
     sqlx::query("UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2 AND status = 'active'")
         .bind(&password_hash)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE user_devices SET push_token = NULL WHERE user_id = $1")
         .bind(user_id)
         .execute(&mut *tx)
         .await?;

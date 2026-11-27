@@ -113,3 +113,10 @@ pub const COMMAND_PER_USER: Budget = Budget {
     window_secs: 60,
     limit: 30,
 };
+
+/// Panik butonu kullanıcı başına (kötüye kullanıma karşı; meşru kullanım için geniş).
+pub const PANIC_PER_USER: Budget = Budget {
+    scope: "panic:user",
+    window_secs: 10 * 60,
+    limit: 10,
+};

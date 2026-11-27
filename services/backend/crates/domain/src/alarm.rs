@@ -19,6 +19,10 @@ pub enum AlarmKind {
     Medical,
     /// Cihaza fiziksel müdahale (sabotaj).
     Tamper,
+    /// Gaz kaçağı.
+    Gas,
+    /// Su baskını.
+    Flood,
 }
 
 /// Panelden gelen bir bildirim.
@@ -78,6 +82,8 @@ mod tests {
             AlarmKind::Fire,
             AlarmKind::Medical,
             AlarmKind::Tamper,
+            AlarmKind::Gas,
+            AlarmKind::Flood,
         ] {
             let notification = PanelNotification::Alarm {
                 kind,

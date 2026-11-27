@@ -114,6 +114,28 @@ zonlar, yöneticiye çıkışlar), `demo-panel` (sanal panel oluştur), `panels/
 - **PIN:** panel kullanıcı kodu henüz alınmıyor; gateway ile birlikte, saklanmadan doğrudan panele
   iletilecek şekilde eklenecek.
 
+## Olaylar ve push bildirimleri
+
+Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `from`, `to`),
+`POST …/panels/{panel_id}/panic` (`police`, `medical`, `fire`), `POST …/panels/{panel_id}/simulate-alarm`
+(yalnızca sanal panel, yönetici), `PUT`/`DELETE /v1/devices/current/push-token`.
+
+- **Geçmiş:** yeniden eskiye, imleçli sayfalama; üye yalnızca yetkili bölümlerinin olaylarını ve
+  panel düzeyindeki olayları (bağlantı, güç, panik) görür.
+- **Dağıtım:** panel olayı yazılınca dağıtıcı olayı `FOR UPDATE SKIP LOCKED` ile alır, alıcıları
+  yetkiye göre bulur, gönderir, `push_deliveries`'e teslim kaydı yazar ve olayı bildirildi
+  işaretler. Birden fazla API kopyası aynı olayı iki kez göndermez; süreç çökerse 15 saniyelik
+  tarama bekleyen olayları yeniden dener. Alarm bildirimi kaybolmaz.
+- **Alıcılar:** yöneticiler ve o bölümü görmeye yetkili üyeler; yalnızca etkin oturumu olan ve
+  token'ı kayıtlı cihazlar. Çıkışta, oturum kapatmada ve parola sıfırlamada token silinir. Aynı
+  token başka hesaba kaydedilirse eski hesaptan kaldırılır.
+- **Öncelik:** alarm `critical` (iOS kritik uyarı, Android alarm kanalı), bağlantı kopması ve güç
+  sorunu `warning`, kurma/kapatma `info`.
+- **Sağlayıcı:** FCM/APNs henüz bağlanmadı; geliştirmede konsola yazılır, üretimde sağlayıcı yoksa
+  API başlamaz.
+- **Sanal alarm:** hırsızlık zonu yalnızca kurulu bölümde, yangın/gaz/su/panik/tıbbi/sabotaj zonu
+  her zaman alarm verir; bypass edilmiş zon alarm vermez.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

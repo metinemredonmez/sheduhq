@@ -6,9 +6,12 @@ pub mod authz;
 pub mod commands;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod error;
 pub mod events;
+pub mod history;
 pub mod panels;
+pub mod push;
 pub mod simulator;
 pub mod sms;
 
@@ -27,7 +30,7 @@ use sqlx::PgPool;
 
 use tokio::sync::broadcast;
 
-use crate::{auth::tokens::TokenKeys, events::OrgEvent, sms::SmsSender};
+use crate::{auth::tokens::TokenKeys, events::OrgEvent, push::PushSender, sms::SmsSender};
 
 /// JSON gövdeleri için üst sınır; büyük gövdelerle kaynak tüketilmesini önler (RES-01).
 const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -48,6 +51,8 @@ pub struct AppState {
     /// WebSocket için izinli tarayıcı origin'leri. Boşsa Origin başlığı taşıyan her bağlantı
     /// reddedilir (tarayıcı istemcileri BFF üzerinden bağlanır).
     pub allowed_origins: Arc<[String]>,
+    /// Push sağlayıcısı. Varsayılan: devre dışı (her gönderim başarısız sayılır).
+    pub push: Arc<dyn PushSender>,
 }
 
 #[derive(Debug)]
@@ -74,12 +79,18 @@ impl AppState {
             events: events::channel(),
             simulator_delay: Duration::from_millis(800),
             allowed_origins: Arc::from(Vec::new()),
+            push: Arc::new(push::DisabledPush),
         })
     }
 
     /// Veritabanı olay dinleyicisini başlatır (WebSocket akışı için).
     pub fn start_event_listener(&self) -> tokio::task::JoinHandle<()> {
         events::start_listener(self)
+    }
+
+    /// Push dağıtıcısını ve kaçırılan olay taramasını başlatır.
+    pub fn start_push_dispatcher(&self) -> tokio::task::JoinHandle<()> {
+        push::start_dispatcher(self)
     }
 }
 
@@ -117,6 +128,8 @@ pub fn router(state: AppState) -> Router {
             auth::routes()
                 .merge(panels::routes())
                 .merge(commands::routes())
+                .merge(history::routes())
+                .merge(devices::routes())
                 .merge(events::routes()),
         )
         .with_state(state)

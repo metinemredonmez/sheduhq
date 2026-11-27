@@ -5,6 +5,7 @@ use shedu_api::{
     auth::rate_limit,
     config::{Config, Environment},
     db,
+    push::{DevConsolePush, PushSender},
     sms::{DevConsoleSms, SmsSender},
 };
 use sqlx::postgres::PgConnectOptions;
@@ -20,11 +21,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_env()?;
 
-    // Üretim için SMS sağlayıcısı henüz yok: güvensiz bir yedekle başlamak yerine dur (KEY-01).
-    let sms: Arc<dyn SmsSender> = match config.environment {
-        Environment::Development => Arc::new(DevConsoleSms),
+    // Üretim için SMS ve push sağlayıcıları henüz yok: alarm bildirimi gitmeyen bir sistemle
+    // başlamak yerine dur (KEY-01, EXC-01).
+    let (sms, push): (Arc<dyn SmsSender>, Arc<dyn PushSender>) = match config.environment {
+        Environment::Development => (Arc::new(DevConsoleSms), Arc::new(DevConsolePush)),
         Environment::Production => {
-            return Err("üretim için SMS sağlayıcısı yapılandırılmadı; API başlatılmadı".into());
+            return Err(
+                "üretim için SMS ve push sağlayıcıları yapılandırılmadı; API başlatılmadı".into(),
+            );
         }
     };
 
@@ -33,7 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(pool.clone(), &config.jwt_secret, &config.hmac_secret, sms)
         .map_err(|_| "uygulama durumu kurulamadı")?;
     state.allowed_origins = config.allowed_origins.clone().into();
+    state.push = push;
     state.start_event_listener();
+    state.start_push_dispatcher();
 
     // Eski deneme sayacı pencerelerini saatte bir temizle.
     tokio::spawn(async move {
