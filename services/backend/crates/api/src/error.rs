@@ -27,6 +27,8 @@ pub enum ApiError {
     TooManyRequests {
         retry_after_secs: u64,
     },
+    /// Bağımlı bir servis (ör. AI servisi) şu an kullanılamıyor.
+    Unavailable(&'static str),
     /// Beklenmeyen hata. Ayrıntı yalnızca sunucu log'una gider.
     Internal,
 }
@@ -58,6 +60,7 @@ impl IntoResponse for ApiError {
                 }
                 return response;
             }
+            Self::Unavailable(code) => (StatusCode::SERVICE_UNAVAILABLE, code),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         (status, Json(Body { error: code })).into_response()

@@ -46,6 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|_| "uygulama durumu kurulamadı")?;
     state.allowed_origins = config.allowed_origins.clone().into();
     state.push = push;
+    if let Some(ai) = &config.ai {
+        let client = shedu_api::ai::AiClient::new(&ai.url, &ai.token)
+            .map_err(|_| "AI servisi istemcisi kurulamadı")?
+            .with_global_budget(i64::from(ai.daily_budget_usd) * 1_000_000);
+        state.ai = Some(Arc::new(client));
+    }
     state.start_event_listener();
     state.start_push_dispatcher();
     state.start_erasure_job();

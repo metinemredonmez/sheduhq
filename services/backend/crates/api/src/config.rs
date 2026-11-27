@@ -34,6 +34,16 @@ pub struct Config {
     pub data_key_version: i16,
     /// WebSocket için izinli tarayıcı origin'leri (virgülle ayrılmış, ör. `https://app.example`).
     pub allowed_origins: Vec<String>,
+    /// İç AI servisinin adresi ve servis token'ı (ikisi birlikte; yoksa AI özellikleri kapalı).
+    pub ai: Option<AiSettings>,
+}
+
+#[derive(Clone)]
+pub struct AiSettings {
+    pub url: String,
+    pub token: String,
+    /// Bütün sistemin son 24 saatteki AI harcama sınırı (ABD doları).
+    pub daily_budget_usd: u32,
 }
 
 impl fmt::Debug for Config {
@@ -43,6 +53,7 @@ impl fmt::Debug for Config {
             .field("environment", &self.environment)
             .field("addr", &self.addr)
             .field("database_role", &self.database_role)
+            .field("ai_configured", &self.ai.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -131,6 +142,41 @@ impl Config {
             .map(str::to_owned)
             .collect();
 
+        let ai = match (
+            get("SHEDU_AI_URL").filter(|v| !v.is_empty()),
+            get("SHEDU_AI_TOKEN").filter(|v| !v.is_empty()),
+        ) {
+            (None, None) => None,
+            (Some(_), None) => return Err(ConfigError::Missing("SHEDU_AI_TOKEN")),
+            (None, Some(_)) => return Err(ConfigError::Missing("SHEDU_AI_URL")),
+            (Some(url), Some(token)) => {
+                crate::ai::validate_url(&url).map_err(|_| ConfigError::Invalid("SHEDU_AI_URL"))?;
+                if token.len() < MIN_SECRET_LEN {
+                    return Err(ConfigError::SecretTooShort("SHEDU_AI_TOKEN"));
+                }
+                let token_bytes = token.as_bytes();
+                if [&jwt_secret, &hmac_secret, &data_key]
+                    .iter()
+                    .any(|s| s.as_slice() == token_bytes)
+                {
+                    return Err(ConfigError::SecretsMustDiffer);
+                }
+                let daily_budget_usd = match get("SHEDU_AI_DAILY_BUDGET_USD") {
+                    None => crate::ai::DEFAULT_GLOBAL_DAILY_USD,
+                    Some(value) => value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|v| (1..=100_000).contains(v))
+                        .ok_or(ConfigError::Invalid("SHEDU_AI_DAILY_BUDGET_USD"))?,
+                };
+                Some(AiSettings {
+                    url,
+                    token,
+                    daily_budget_usd,
+                })
+            }
+        };
+
         Ok(Self {
             environment,
             addr,
@@ -141,6 +187,7 @@ impl Config {
             data_key,
             data_key_version,
             allowed_origins,
+            ai,
         })
     }
 }
@@ -257,6 +304,60 @@ mod tests {
             ("SHEDU_HMAC_SECRET", HMAC),
         ]));
         assert_eq!(missing.err(), Some(ConfigError::Missing("SHEDU_DATA_KEY")));
+    }
+
+    #[test]
+    fn ai_service_settings_are_validated() {
+        let base = [
+            ("SHEDU_ENV", "development"),
+            ("DATABASE_URL", "postgres://localhost/shedu"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = base.to_vec();
+            pairs.extend_from_slice(extra);
+            Config::from_lookup(lookup(&pairs))
+        };
+        const TOKEN: &str = "ai-token-0123456789abcdefghijklmnopq";
+        assert!(with(&[]).expect("AI'sız").ai.is_none());
+        let ok = with(&[
+            ("SHEDU_AI_URL", "http://127.0.0.1:8000"),
+            ("SHEDU_AI_TOKEN", TOKEN),
+        ])
+        .expect("AI'lı");
+        assert_eq!(ok.ai.as_ref().map(|ai| ai.daily_budget_usd), Some(20));
+        assert!(!format!("{ok:?}").contains(TOKEN));
+        assert_eq!(
+            with(&[
+                ("SHEDU_AI_URL", "http://127.0.0.1:8000"),
+                ("SHEDU_AI_TOKEN", TOKEN),
+                ("SHEDU_AI_DAILY_BUDGET_USD", "0"),
+            ])
+            .err(),
+            Some(ConfigError::Invalid("SHEDU_AI_DAILY_BUDGET_USD"))
+        );
+        assert_eq!(
+            with(&[("SHEDU_AI_URL", "http://127.0.0.1:8000")]).err(),
+            Some(ConfigError::Missing("SHEDU_AI_TOKEN"))
+        );
+        assert_eq!(
+            with(&[
+                ("SHEDU_AI_URL", "http://ai:8000"),
+                ("SHEDU_AI_TOKEN", TOKEN)
+            ])
+            .err(),
+            Some(ConfigError::Invalid("SHEDU_AI_URL"))
+        );
+        assert_eq!(
+            with(&[("SHEDU_AI_URL", "https://ai"), ("SHEDU_AI_TOKEN", "kisa")]).err(),
+            Some(ConfigError::SecretTooShort("SHEDU_AI_TOKEN"))
+        );
+        assert_eq!(
+            with(&[("SHEDU_AI_URL", "https://ai"), ("SHEDU_AI_TOKEN", JWT)]).err(),
+            Some(ConfigError::SecretsMustDiffer)
+        );
     }
 
     #[test]

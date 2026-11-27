@@ -28,7 +28,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
 | Log | LOG-01, LOG-02 | Yapılandırılmış güvenlik olayı; log'da PIN, token, telefon yok | Doğrulanacak |
 | Veri | DAT-01, DAT-02, AZ-03 | Kişisel veri dışa aktarma yalnızca kişinin kendi verisi; yeniden doğrulama, günlük sınır, dosya sunucuda tutulmaz | Doğrulanacak |
 | Veri | DAT-05 | Hesap silme: 30 gün geri alınabilir talep, sonra anonimleştirme ve yok etme tek işlemde; güvenlik kayıtları kimliksiz kalır; rıza defteri yalnızca eklenir | Doğrulanacak |
-| AI | AI-01, AI-02, AI-03 | Araçlar yalnızca okuma; kiracı izolasyonu; maliyet bütçesi | Doğrulanacak |
+| AI | AI-01, AI-02, AI-03 | Modelin aracı yok; yalnızca görünür ve kimliksiz veri; kesin bilgi koddan; sonuçtan bağımsız maliyet defteri ve bütçe; bayrakla kapalı | Doğrulanacak |
 | Üretim | OPS-01 | Güvenli üretim profili; debug ve sunucu seçici yok; varsayılan dinleme adresi `127.0.0.1` | Doğrulanacak |
 | Build | OPS-04 | CODEOWNERS, korumalı `main`, Dependabot, en az yetkili CI | Doğrulanacak |
 | Hata | ARC-05, EXC-01 | Arıza halinde güvenli davranış: belirsizse komut reddedilir | Doğrulanacak |
@@ -162,6 +162,20 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   90 günlük mutlak oturum ömrü; silme talebinde gönderilmiş davetlerin iptali, etkin olmayan
   kişinin davetinin kabul edilmemesi ve kalıcı silmenin takılmaması; hesap başına 24 saatte 20
   başarısız doğrulama sınırı (SMS ve ikinci adım).
+- **AI olay özeti (AI-01, AI-02, AI-03, LOG-02, ARC-04):**
+  `services/backend/crates/api/tests/ai.rs` (4 entegrasyon testi, gerçek PostgreSQL ve yerel
+  sahte AI servisi), `services/backend/tests/sql/013_ai_usage.sql` ve `services/ai/tests`
+  (41 test, sahte model istemcisi): bayrak kapalıyken 403, servis yokken 503, üye olmayana 404;
+  AI servisine kimlik, telefon ve görünmeyen bölümün olayı gitmez; sayılar ve dikkat işareti
+  AI'nın yanlış değerlerinden değil SQL'den gelir; 500 olay sınırında sayılar yine kesin; ret,
+  hata ve düşen servis sabit kodlara döner ve harcaması deftere yazılır; bağlanılamayınca
+  harcama yazılmaz; saatlik sınır ve maliyet sınırı (kullanıcı ve sistem) dolunca model
+  çağrılmaz; defter yalnızca eklenir, başkası adına yazılamaz, satırları okunamaz, tablo sahibi
+  bile değiştiremez, yabancı anahtarı yoktur. AI servisinde: veri bloğunu kapatmaya çalışan zon
+  adı kaçışlanır, tanımsız alan ve kimlik reddedilir, yedek model denemeleri faturaya katılır,
+  fiyatsız modelle başlanmaz. Bütçe kontrolü, ret harcaması ve bölüm filtresi bozulduğunda ilgili
+  testin kaldığı yerelde doğrulandı. Rust'ın ürettiği istek Python servisinin modeliyle uçtan uca
+  bir kez doğrulandı. Gerçek modelle çağrı yapılmadı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -200,6 +214,15 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   - Rıza amaçları ve metin sürümleri taslaktır (`taslak-1`); aydınlatma metni ve rıza metinleri
     onaylanınca migration'la güncellenecek. Ticari ileti onayı için İYS (İleti Yönetim Sistemi)
     entegrasyonu yok.
+  - AI-03: aynı anda süren çağrılar sınırı aşabilir (her biri kontrolden geçtiği an sınırın
+    altındaydı); en fazla saatlik sıklık sınırı kadar. Sonucu bilinmeyen çağrının tahmini AI
+    servisinin `max_tokens` ve en pahalı fiyat değerine dayanır; bunlar iki yerde tutulur
+    (`ai.rs`, `pricing.py`). Fiyat tablosu elle güncellenir.
+  - AI-02: istemciler (web, mobil) henüz yok; özet metninin düz metin olarak basılması ve "yapay
+    zekâ ile üretildi" etiketi istemci yazılırken test edilecek.
+  - KVKK: `ai_event_summary` bayrağı, yurt dışına aktarım ve rıza kararı (açık sorular 5, 11,
+    12) verilene kadar açılmayacak. Model sağlayıcısıyla veri saklama koşulları da bu kararla
+    birlikte ele alınacak.
   - DAT-01: silinen kullanıcının eski numarasını içeren SMS sağlayıcısı kayıtları ve push
     sağlayıcısındaki cihaz kayıtları Shedu'nun dışındadır; sağlayıcılar bağlanırken
     sözleşmeyle ele alınacak.

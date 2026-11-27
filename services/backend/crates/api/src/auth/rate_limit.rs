@@ -181,6 +181,18 @@ pub const CONSENT_PER_USER: Budget = Budget {
     limit: 30,
 };
 
+/// AI olay özeti: kullanıcı başına saatte ve organizasyon başına günde (maliyet sınırı, AI-03).
+pub const AI_SUMMARY_PER_USER: Budget = Budget {
+    scope: "ai-summary:user",
+    window_secs: 60 * 60,
+    limit: 10,
+};
+pub const AI_SUMMARY_PER_ORG: Budget = Budget {
+    scope: "ai-summary:org",
+    window_secs: 24 * 60 * 60,
+    limit: 50,
+};
+
 /// Başarısız doğrulama denemeleri, hesap başına 24 saatte: SMS kodlarında telefon, ikinci adımda
 /// kullanıcı. Kod başına 5 deneme sınırına ek olarak yeni kod isteyerek veya IP değiştirerek
 /// tahminin sürdürülmesini engeller (AUT-02; NIST SP 800-63B en fazla 100 ardışık hata ister).

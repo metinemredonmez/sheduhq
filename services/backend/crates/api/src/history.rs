@@ -92,20 +92,7 @@ pub async fn list_events(
     {
         return Err(ApiError::NotFound);
     }
-    let partition_numbers: Option<Vec<i16>> =
-        match authz::visible_partitions(&mut tx, &ctx, panel_id).await? {
-            None => None,
-            Some(ids) => {
-                let rows: Vec<(i16,)> = sqlx::query_as(
-                    "SELECT number FROM partitions WHERE id = ANY($1) AND organization_id = $2",
-                )
-                .bind(&ids)
-                .bind(org_id)
-                .fetch_all(&mut *tx)
-                .await?;
-                Some(rows.into_iter().map(|(n,)| n).collect())
-            }
-        };
+    let partition_numbers = authz::visible_partition_numbers(&mut tx, &ctx, panel_id).await?;
 
     let mut events: Vec<EventView> = sqlx::query_as(
         "SELECT id, kind, alarm_kind, arm_mode, priority, partition_number, zone_number, source, occurred_at

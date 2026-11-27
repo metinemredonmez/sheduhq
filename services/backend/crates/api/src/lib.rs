@@ -1,6 +1,7 @@
 //! Shedu HTTP API.
 
 pub mod admin;
+pub mod ai;
 pub mod app_version;
 pub mod audit;
 pub mod auth;
@@ -67,6 +68,8 @@ pub struct AppState {
     pub push: Arc<dyn PushSender>,
     /// Uygulama sürüm politikası önbelleği (varsayılan 60 saniye).
     pub versions: Arc<app_version::VersionCache>,
+    /// İç AI servisi. Yapılandırılmadıysa AI özellikleri 503 döner; başka hiçbir şey etkilenmez.
+    pub ai: Option<Arc<ai::AiClient>>,
 }
 
 #[derive(Debug)]
@@ -99,6 +102,7 @@ impl AppState {
             allowed_origins: Arc::from(Vec::new()),
             push: Arc::new(push::DisabledPush),
             versions: Arc::new(app_version::VersionCache::new(Duration::from_secs(60))),
+            ai: None,
         })
     }
 
@@ -162,6 +166,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(notifications::routes())
                 .merge(features::routes())
                 .merge(inbox::routes())
+                .merge(ai::routes())
                 // Desteklenmeyen sürümdeki istemci reddedilir; sürüm kontrol ucu bunun dışındadır.
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),

@@ -21,7 +21,7 @@
 | `services/backend/crates/api` | Rust, Axum | REST + WebSocket, kimlik, yetki, komut kabulü |
 | `services/backend/crates/gateway` | Rust | Panellerle bağlantı, protokol çözme, komut iletimi |
 | `services/backend/crates/domain` | Rust | Panel durum makinesi, komut kuralları, ortak tipler |
-| `services/ai` | Python, FastAPI | Olay özeti, alarm önceliklendirme önerisi, destek asistanı |
+| `services/ai` | Python, FastAPI | Olay özeti (hazır); alarm önceliklendirme önerisi ve destek asistanı (planlandı) |
 
 ## Temel kurallar
 
@@ -339,6 +339,59 @@ shedu-admin flag override camera_live --org <ORG_ID> --state on|off|clear --reas
   `https://apps.apple.com/` veya `https://play.google.com/` ile başlayabilir (API ve veritabanı
   ayrı ayrı denetler); kullanıcıya sahte bir "güncelle" bağlantısı gösterilemez. API'nin rolü
   politikayı değiştiremez.
+
+## AI olay özeti
+
+İlk AI özelliği: bir panelin son saatlerdeki olaylarının kısa Türkçe özeti. Alarm yolunun parçası
+değildir. AI servisi yoksa veya yanıt vermezse yalnızca özet gelmez (503 `ai_unavailable`).
+
+Uç nokta: `POST /v1/organizations/{org_id}/panels/{panel_id}/ai-summary` `{"hours": 24}`
+(1–168, varsayılan 24) → `summary`, `highlights`, `ai_generated`, `needs_attention`, `stats`,
+`period_start`, `period_end`, `truncated`.
+
+```
+Uygulama ──> API: yetki (paneli görme), bayrak, sıklık ve maliyet bütçesi
+                  görünür olaylar (en yeni 500), kesin sayılar (SQL) ──commit──┐
+             API ──iç ağ, Bearer servis token'ı──> AI servisi ──> Claude (yapılandırılmış çıktı)
+             API <── özet metni + harcama ──┘
+             API: harcamayı deftere yaz (ayrı işlem), denetim kaydı, yanıt
+```
+
+- **Varsayılan kapalı:** `ai_event_summary` bayrağı tanımlanmadıkça özellik 403
+  `feature_disabled` döner. Olaylar yurt dışındaki model sağlayıcısına gittiği için bayrak, KVKK
+  aktarım ve rıza kararı verilene kadar açılmaz (açık sorular 5, 11, 12).
+- **Veri azaltma (AI-02):** AI servisine panel adı, organizasyonun saat dilimi, dönem ve olaylar
+  (tür, alarm türü, kip, bölüm ve zon adı, kaynak, zaman) gider. Organizasyon veya kullanıcı
+  kimliği, telefon, PIN, token gitmez. Bölüm yetkisi uygulanır: üye görmediği bölümün olayını
+  özette de göremez.
+- **Kesin bilgi koddan gelir:** sayılar ve "dikkat gerekiyor mu?" (alarm, güç sorunu veya hâlâ
+  süren bağlantı kopması) API'de SQL ile hesaplanır, AI yanıtından alınmaz. Liste 500 olayla
+  kısaltılsa bile sayılar bütün dönemi kapsar. Metin `ai_generated: true` ile işaretlenir;
+  istemci bunu kullanıcıya gösterir ve metni HTML veya Markdown olarak değil düz metin olarak
+  basar.
+- **Model (AI-01):** varsayılan `claude-opus-5-5`, düşük çaba, `max_tokens` 4096, JSON şemalı
+  çıktı (`summary`, `highlights`). Modelin aracı yoktur, eylem yapamaz. Panel, bölüm ve zon
+  adları kullanıcı verisidir: prompt'ta veri bloğunda JSON olarak durur (`<` ve `>` kaçışlı),
+  sistem prompt'u içlerindeki talimatların uygulanmamasını söyler. Güvenlik reddinde sunucu
+  tarafı yedek model denenir (`fallbacks: "default"`); hepsi reddederse 422 `ai_refused`.
+- **Maliyet (AI-03):** iki katman. Sıklık: kullanıcı başına saatte 10, organizasyon başına günde
+  50 özet. Harcama: her çağrıdan önce `ai_usage` defterinden son 24 saat okunur. Kullanıcı 1 $,
+  organizasyon 5 $, bütün sistem 20 $ (`SHEDU_AI_DAILY_BUDGET_USD`) sınırına ulaştıysa model
+  çağrılmaz (429). Her çağrının harcaması sonucu ne olursa olsun (başarı, ret, hata) çağrı döner
+  dönmez deftere yazılır; yedek model denemeleri de sayılır (`usage.iterations`). Sonucu
+  bilinmeyen çağrı (zaman aşımı, düşen servis) istek boyutundan temkinli bir tahminle yazılır.
+  Defter yalnızca eklenir, yabancı anahtarı yoktur: hesap silinse de harcama kalır. Uygulama
+  rolü satırları okuyamaz; yalnızca toplam döndüren `ai_spend_last_day()` fonksiyonunu
+  çağırabilir. Sınırı yalnızca o an süren çağrılar aşabilir. AI servisi fiyatı bilinmeyen bir
+  modelle başlamaz.
+- **AI servisine bağlantı (ARC-04, NET-01):** `SHEDU_AI_URL` ve `SHEDU_AI_TOKEN` (en az 32
+  karakter, diğer sırlardan farklı) birlikte verilir; yoksa özellik 503 döner. Loopback dışında
+  yalnızca HTTPS kabul edilir. Yönlendirme izlenmez, vekil sunucu kullanılmaz, yanıt 64 KB ile
+  sınırlıdır, istek 75 saniyede zaman aşımına uğrar. AI servisi token'ı sabit zamanlı karşılaştırır;
+  token'sız yapılandırılırsa hiçbir isteğe yanıt vermez. Şema ve dokümantasyon yayınlanmaz.
+- **Kayıt (LOG-02):** denetim kaydına (`ai.summary_generated`, `ai.summary_failed`) olay sayısı,
+  model, token ve maliyet yazılır; özet metni ve olay içeriği yazılmaz. AI servisi de içerik
+  loglamaz.
 
 ## Komut akışı (kurma / kapatma)
 

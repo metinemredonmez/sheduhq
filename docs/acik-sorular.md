@@ -8,7 +8,7 @@ Mimariyi ve takvimi doğrudan etkileyen, henüz yanıtı olmayan sorular.
 | 2 | Kendi alarm izleme merkezimiz olacak mı, yoksa mevcut bir izleme merkezi yazılımıyla mı entegre olacağız? | Operatör konsolunun kapsamı ve fazı |
 | 3 | Satış modeli: doğrudan son kullanıcıya mı, izleme firmalarına beyaz etiketli platform olarak mı? | Çok kiracılı yapı, marka özelleştirme |
 | 4 | Kamera sağlayıcıları canlı yayını HLS veya WebRTC olarak sunuyor mu? | Mobilde video oynatma, yayın aktarıcısı ihtiyacı |
-| 5 | Veriler nerede barındırılacak? Yurt dışındaki bir LLM sağlayıcısına veri aktarımı için KVKK dayanağı ne? | Altyapı, AI özelliklerinin kapsamı |
+| 5 | Veriler nerede barındırılacak? Yurt dışındaki bir LLM sağlayıcısına veri aktarımı için KVKK dayanağı ne? | Altyapı, AI özelliklerinin kapsamı. AI olay özeti hazır; `ai_event_summary` bayrağı bu karara kadar kapalı |
 | 6 | "Shedu" marka tescili (sınıf 9, 42, 45) ve alan adları | Ürün adı, paket kimlikleri (bundle id) |
 | 7 | iOS kritik bildirim (critical alerts) izni için Apple başvurusu | Sessiz moddayken alarm bildirimi |
 | 8 | KVKK'da veri sorumlusu kim: son kullanıcıya hizmet veren izleme firması mı, Shedu mu (veri işleyen)? | Aydınlatma metni, VERBİS kaydı, sözleşmeler, başvuruların kime yapılacağı |

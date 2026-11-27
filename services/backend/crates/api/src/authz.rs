@@ -235,6 +235,25 @@ pub async fn permissions(
     Ok(result)
 }
 
+/// Kullanıcının görebileceği bölümlerin numaraları (olaylar bölüm numarasıyla yazılır).
+/// `None`: panelin bütün bölümleri.
+pub async fn visible_partition_numbers(
+    conn: &mut PgConnection,
+    ctx: &OrgContext,
+    panel_id: Uuid,
+) -> ApiResult<Option<Vec<i16>>> {
+    let Some(ids) = visible_partitions(conn, ctx, panel_id).await? else {
+        return Ok(None);
+    };
+    let rows: Vec<(i16,)> =
+        sqlx::query_as("SELECT number FROM partitions WHERE id = ANY($1) AND organization_id = $2")
+            .bind(&ids)
+            .bind(ctx.organization_id)
+            .fetch_all(&mut *conn)
+            .await?;
+    Ok(Some(rows.into_iter().map(|(n,)| n).collect()))
+}
+
 /// Kullanıcının görebileceği bölümler. `None`: panelin bütün bölümleri.
 pub async fn visible_partitions(
     conn: &mut PgConnection,
