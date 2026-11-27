@@ -36,7 +36,13 @@
    kapatamaz, polis çağıramaz (AI-01, AI-02).
 4. **Kiracı (organizasyon) kimliği istemciden alınmaz.** Token'dan çıkarılır ve veri katmanında ikinci
    bir bariyerle (ör. PostgreSQL Row-Level Security) zorlanır (AZ-01, AZ-02).
-5. **Sözleşme önce gelir.** API, OpenAPI şemasını kendisi üretir; mobil ve web istemcileri bu şemadan
+5. **Tarayıcıda token tutulmaz.** Admin ve web, Next.js sunucu tarafında çalışan bir BFF üzerinden
+   API'ye bağlanır; oturum HttpOnly, Secure, SameSite çerezde durur, durum değiştiren isteklerde
+   CSRF koruması vardır (SES-01, WEB-05). Mobil uygulama token'ı cihazın güvenli deposunda tutar.
+6. **Kullanıcının verdiği adreslere giden istekler kalkandan geçer.** Kamera akışı ve webhook
+   adresleri izin listesi, özel ağ ve metadata adreslerinin engellenmesi, DNS yeniden bağlama ve
+   yönlendirme kontrolünden geçer (EXT-01, EXT-02).
+7. **Sözleşme önce gelir.** API, OpenAPI şemasını kendisi üretir; mobil ve web istemcileri bu şemadan
    üretilir.
 
 ## Veritabanı

@@ -42,6 +42,7 @@ API varsayılan olarak yalnızca `127.0.0.1:8080` adresini dinler; sağlık kont
 
 - [Mimari](docs/mimari.md)
 - [MVP kapsamı](docs/mvp.md)
+- [Özellik havuzu](docs/ozellik-havuzu.md)
 - [Güvenlik temeli](docs/guvenlik-temeli.md)
 - [Karar kayıtları](docs/kararlar/)
 - [Açık sorular](docs/acik-sorular.md)
