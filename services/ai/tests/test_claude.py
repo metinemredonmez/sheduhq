@@ -131,10 +131,12 @@ def status_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.
         # Yanıt gelmedi: istek gitmiş ve model çalışmış olabilir.
         (anthropic.APITimeoutError(request=REQUEST), True),
         (anthropic.APIConnectionError(request=REQUEST), True),
-        # Sağlayıcının hata yanıtı faturalanmaz.
+        # Sağlayıcının reddettiği istek ve aşırı yük: model çalışmadı.
         (status_error(anthropic.RateLimitError, 429), False),
-        (status_error(anthropic.InternalServerError, 500), False),
         (status_error(anthropic.OverloadedError, 529), False),
+        # Sunucu hatası: model çalışmış olabilir, faturalama doğrulanamaz (temkinli).
+        (status_error(anthropic.InternalServerError, 500), True),
+        (status_error(anthropic.InternalServerError, 503), True),
         (status_error(anthropic.BadRequestError, 400), False),
         (status_error(anthropic.AuthenticationError, 401), False),
     ],

@@ -59,6 +59,10 @@ pub const MAX_EVENTS: usize = 500;
 const SUMMARY_MAX_CHARS: usize = 800;
 const HIGHLIGHT_MAX_CHARS: usize = 200;
 const MAX_HIGHLIGHTS: usize = 5;
+/// Olay olmayan dönemin sabit metinleri (AI servisinin `summary.NO_EVENTS` ve
+/// `summary.STILL_DISCONNECTED` metinleriyle aynı).
+const NO_EVENTS: &str = "Bu dönemde panelde kayıtlı olay yok.";
+const STILL_DISCONNECTED: &str = "Panelin bilinen son bağlantı durumu: kopuk.";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MIN_TOKEN_LEN: usize = 32;
 /// AI servisinin kendi model zaman aşımı ve bir yeniden denemesi bu sürenin içinde kalır.
@@ -236,7 +240,7 @@ impl AiClient {
         if status == StatusCode::OK {
             return match serde_json::from_slice::<ServiceResponse>(&body) {
                 Ok(answer) => Reply {
-                    spend: answer.spend.clone(),
+                    spend: answer.spend.clone().into_spend(reserved),
                     result: Ok(answer),
                 },
                 Err(_) => {
@@ -251,7 +255,7 @@ impl AiClient {
         let spend = match &error {
             Some(ServiceError {
                 usage: Some(usage), ..
-            }) => usage.clone(),
+            }) => usage.clone().into_spend(reserved),
             Some(ServiceError {
                 usage: None,
                 may_be_billed: false,
@@ -284,18 +288,47 @@ struct Reply {
 }
 
 /// Bir çağrının harcaması. AI servisi bildirir; bilinmiyorsa tahmin edilir.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Spend {
     model: Option<String>,
-    #[serde(default)]
     input_tokens: i64,
-    #[serde(default)]
     output_tokens: i64,
-    #[serde(default)]
     cost_microusd: i64,
     /// Servis bildirmedi; en kötü durum tahmini.
-    #[serde(skip)]
     estimated: bool,
+}
+
+/// AI servisinin bildirdiği kullanım. Kullanım alanlarından biri eksik veya negatifse kullanım
+/// bilinmiyor sayılır ve en kötü durum tahmini yazılır: eksik alan sıfır sayılmaz, eksik maliyet
+/// bütçeden kaçmaz (Y10).
+#[derive(Deserialize, Clone, Debug)]
+struct RawSpend {
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cost_microusd: Option<i64>,
+}
+
+impl RawSpend {
+    fn into_spend(self, reserved: &Spend) -> Spend {
+        match (self.input_tokens, self.output_tokens, self.cost_microusd) {
+            (Some(input), Some(output), Some(cost)) if input >= 0 && output >= 0 && cost >= 0 => {
+                Spend {
+                    model: self.model,
+                    input_tokens: input,
+                    output_tokens: output,
+                    cost_microusd: cost,
+                    estimated: false,
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "AI servisinin bildirdiği kullanım eksik veya geçersiz; tahmin yazılıyor"
+                );
+                reserved.clone()
+            }
+        }
+    }
 }
 
 impl Spend {
@@ -366,13 +399,13 @@ struct ServiceResponse {
     highlights: Vec<String>,
     generated: bool,
     #[serde(flatten)]
-    spend: Spend,
+    spend: RawSpend,
 }
 
 #[derive(Deserialize)]
 struct ServiceError {
     detail: serde_json::Value,
-    usage: Option<Spend>,
+    usage: Option<RawSpend>,
     /// `false`: sağlayıcıya faturalanan istek kesinlikle gitmedi. Alan yoksa temkinli: `true`.
     #[serde(default = "billed_by_default")]
     may_be_billed: bool,
@@ -448,7 +481,9 @@ pub async fn event_summary(
         return Err(ApiError::Unavailable("ai_unavailable"));
     };
     // Bütçe, üyelik ve bayrak doğrulandıktan sonra sayılır: üye olmayan biri bir organizasyonun
-    // bütçesini tüketemez. Sınır aşılırsa işlem geri alınır, sayaç artmaz.
+    // bütçesini tüketemez. Sıklık sınırı aşılırsa işlem geri alınır (sayaç zaten dolu). Bütçe
+    // reddinde ise işlem commit'lenir: yetkili isteğin sıklık kaydı kalır, sürekli bütçe retleri
+    // ağır sorguyu sıklık kapısında durdurur (Y09).
     rate_limit::hit(
         &mut tx,
         &state.hmac_secret,
@@ -473,6 +508,7 @@ pub async fn event_summary(
         || org_spent >= ORG_DAILY_MICROUSD
         || global_spent >= ai.global_daily_microusd
     {
+        tx.commit().await?;
         return Err(budget_exhausted());
     }
 
@@ -528,7 +564,15 @@ pub async fn event_summary(
                       LEFT JOIN zones z
                              ON z.panel_id = $1 AND z.number = l.zone_number
                             AND z.organization_id = $2
-                ), '[]'::jsonb) AS events
+                ), '[]'::jsonb) AS events,
+                -- Güncel bağlantı durumu dönemle sınırlı değildir: dönem başlamadan kopmuş ve hâlâ
+                -- kopuk panel de dikkat ister. Aynı deyimde okunur: sayılarla aynı anlık görüntü
+                -- (Y11). Bağlantı olayları panel düzeyindedir (bölümsüz).
+                (SELECT c.kind FROM panel_events c
+                  WHERE c.panel_id = $1 AND c.organization_id = $2 AND c.occurred_at <= $4
+                    AND c.kind IN ('connected', 'disconnected') AND c.partition_number IS NULL
+                  ORDER BY c.occurred_at DESC, c.id DESC
+                  LIMIT 1) AS connection
            FROM visible",
     )
     .bind(panel_id)
@@ -552,24 +596,32 @@ pub async fn event_summary(
     let truncated = events.len() > MAX_EVENTS;
     events.truncate(MAX_EVENTS);
 
-    // Güncel bağlantı durumu dönemle sınırlı değildir: dönem başlamadan kopmuş ve hâlâ kopuk
-    // panel de dikkat ister. Bağlantı olayları panel düzeyindedir (bölümsüz).
-    let connection: Option<(String,)> = sqlx::query_as(
-        "SELECT kind FROM panel_events
-          WHERE panel_id = $1 AND organization_id = $2 AND occurred_at <= $3
-            AND kind IN ('connected', 'disconnected') AND partition_number IS NULL
-          ORDER BY occurred_at DESC, id DESC
-          LIMIT 1",
-    )
-    .bind(panel_id)
-    .bind(org_id)
-    .bind(period_end)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let connection = connection.map(|(kind,)| kind);
+    let connection = window.connection;
     let needs_attention = stats.alarms > 0
         || stats.power_problems > 0
         || connection.as_deref() == Some("disconnected");
+
+    // Dönemde olay yoksa model gerekmez: sabit metin kodla üretilir, bütçeden ayrılmaz ve AI servisi
+    // çağrılmaz (Y09). Metinler AI servisinin boş dönem yanıtıyla aynı.
+    if stats.total == 0 {
+        tx.commit().await?;
+        let summary = if connection.as_deref() == Some("disconnected") {
+            format!("{NO_EVENTS} {STILL_DISCONNECTED}")
+        } else {
+            NO_EVENTS.to_owned()
+        };
+        return Ok(Json(SummaryView {
+            summary,
+            highlights: Vec::new(),
+            ai_generated: false,
+            model: None,
+            needs_attention,
+            stats,
+            period_start,
+            period_end,
+            truncated: false,
+        }));
+    }
 
     let event_count = events.len();
     let payload = serde_json::to_vec(&ServiceRequest {
@@ -596,12 +648,13 @@ pub async fn event_summary(
             .fetch_one(&mut *tx)
             .await?;
     let Some(reservation_id) = reservation.0 else {
+        tx.commit().await?;
         return Err(budget_exhausted());
     };
-    tx.commit().await?;
 
-    // Çağrı, harcama kaydı ve denetim kaydı ayrı görevde: istemci bağlantıyı koparsa da (işleyici
-    // iptal edilse de) sonuna kadar yürür ve rezervasyon kapanır.
+    // Rezervasyonun commit'i, çağrı, harcama kaydı ve denetim kaydı aynı ayrı görevde: istemci
+    // bağlantıyı koparsa da (işleyici iptal edilse de) sonuna kadar yürür ve rezervasyon kapanır.
+    // İşleyici görev başlamadan iptal edilirse işlem geri alınır ve rezervasyon hiç yazılmaz (Y10).
     let call = Call {
         user_id: user.user_id,
         org_id,
@@ -619,7 +672,11 @@ pub async fn event_summary(
         period_end,
         truncated,
     };
-    let task = tokio::spawn(complete_summary(state.clone(), ai, payload, call, view));
+    let state = state.clone();
+    let task = tokio::spawn(async move {
+        tx.commit().await?;
+        complete_summary(state, ai, payload, call, view).await
+    });
     task.await.map_err(|_| ApiError::Internal)?.map(Json)
 }
 
@@ -639,6 +696,7 @@ struct PeriodRow {
     disconnected: i64,
     power_problems: i64,
     events: sqlx::types::Json<serde_json::Value>,
+    connection: Option<String>,
 }
 
 /// Rezervasyonu yapılmış çağrının bilgileri.
@@ -770,22 +828,27 @@ async fn settle(
 ) -> ApiResult<()> {
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, Some(call.user_id), Some(call.org_id)).await?;
-    sqlx::query(
-        "INSERT INTO ai_usage (organization_id, user_id, feature, model, input_tokens, output_tokens,
-                               cost_microusd, outcome, reservation_id)
-         VALUES ($1, $2, 'event_summary', $3, $4, $5, $6, $7, $8)",
-    )
-    .bind(call.org_id)
-    .bind(call.user_id)
-    .bind(spend.model.as_deref().filter(|m| !m.is_empty()).map(|m| clip(m, 100)))
-    .bind(spend.input_tokens.max(0))
-    .bind(spend.output_tokens.max(0))
-    .bind(spend.cost_microusd.max(0))
-    .bind(outcome)
-    .bind(call.reservation_id)
-    .execute(&mut *tx)
-    .await
-    .inspect_err(|_| tracing::error!("AI harcaması deftere yazılamadı; rezervasyon açık kaldı"))?;
+    // Uygulama deftere doğrudan yazamaz: kapanış yalnızca kişinin kendi açık rezervasyonuna,
+    // rezervasyonun özelliğiyle bağlanır (`ai_settle`, Y10). Değerler burada negatif olamaz
+    // (bilinmeyen veya geçersiz kullanım tahmine dönüşür, bkz. `RawSpend`).
+    sqlx::query("SELECT ai_settle($1, $2, $3, $4, $5, $6)")
+        .bind(call.reservation_id)
+        .bind(
+            spend
+                .model
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|m| clip(m, 100)),
+        )
+        .bind(spend.input_tokens)
+        .bind(spend.output_tokens)
+        .bind(spend.cost_microusd)
+        .bind(outcome)
+        .execute(&mut *tx)
+        .await
+        .inspect_err(|_| {
+            tracing::error!("AI harcaması deftere yazılamadı; rezervasyon açık kaldı")
+        })?;
     tx.commit().await?;
     Ok(())
 }

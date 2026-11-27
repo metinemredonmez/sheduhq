@@ -50,28 +50,35 @@ SELECT test_expect_error('SELECT * FROM ai_spend_last_day()', '42501');
 SELECT set_config('app.org_id', 'aaaaaaaa-0000-0000-0000-000000000001', true),
        set_config('app.user_id', '11111111-0000-0000-0000-000000000001', true);
 
-INSERT INTO ai_usage (organization_id, user_id, feature, model, input_tokens, output_tokens,
-                      cost_microusd, outcome)
-VALUES ('aaaaaaaa-0000-0000-0000-000000000001', '11111111-0000-0000-0000-000000000001',
-        'event_summary', 'claude-opus-5-5', 100, 20, 800, 'success');
-
--- Başka organizasyon veya başka kullanıcı adına yazılamaz.
-SELECT test_expect_error(
-    $q$INSERT INTO ai_usage (organization_id, user_id, feature, input_tokens, output_tokens, cost_microusd, outcome)
-       VALUES ('bbbbbbbb-0000-0000-0000-000000000002', '11111111-0000-0000-0000-000000000001',
-               'event_summary', 0, 0, 0, 'failed')$q$,
-    '42501');
-SELECT test_expect_error(
-    $q$INSERT INTO ai_usage (organization_id, user_id, feature, input_tokens, output_tokens, cost_microusd, outcome)
-       VALUES ('aaaaaaaa-0000-0000-0000-000000000001', '22222222-0000-0000-0000-000000000002',
-               'event_summary', 0, 0, 0, 'failed')$q$,
-    '42501');
--- Negatif maliyetle harcama silinemez.
+-- Uygulama deftere doğrudan yazamaz (kendi adına da, başkası adına da): yazma yalnızca
+-- rezervasyon ve kapanış yordamlarıyla, bağlamdaki kişi ve organizasyon adına yapılır.
 SELECT test_expect_error(
     $q$INSERT INTO ai_usage (organization_id, user_id, feature, input_tokens, output_tokens, cost_microusd, outcome)
        VALUES ('aaaaaaaa-0000-0000-0000-000000000001', '11111111-0000-0000-0000-000000000001',
-               'event_summary', 0, 0, -1000, 'failed')$q$,
-    '23514');
+               'event_summary', 0, 0, 0, 'failed')$q$,
+    '42501');
+SELECT test_expect_error(
+    $q$INSERT INTO ai_usage (organization_id, user_id, feature, input_tokens, output_tokens, cost_microusd, outcome)
+       VALUES ('bbbbbbbb-0000-0000-0000-000000000002', '22222222-0000-0000-0000-000000000002',
+               'event_summary', 0, 0, 0, 'failed')$q$,
+    '42501');
+
+DO $$
+DECLARE
+    reservation bigint;
+BEGIN
+    reservation := ai_reserve('event_summary', 900, 100000, 100000, 100000);
+    ASSERT reservation IS NOT NULL, 'rezervasyon sığar';
+    -- Negatif maliyetle harcama silinemez.
+    BEGIN
+        PERFORM ai_settle(reservation, 'claude-opus-5-5', 0, 0, -1000, 'failed');
+        RAISE EXCEPTION 'negatif maliyet kabul edildi';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    PERFORM ai_settle(reservation, 'claude-opus-5-5', 100, 20, 800, 'success');
+END
+$$;
 
 -- Uygulama satırları okuyamaz, değiştiremez, silemez.
 SELECT test_expect_error('SELECT count(*) FROM ai_usage', '42501');

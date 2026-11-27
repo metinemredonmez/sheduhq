@@ -36,6 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = db::connect(options, config.database_role.clone()).await?;
     // RLS'yi aşan bir rolle (süper kullanıcı, tablo sahibi) başlamak yerine dur (AZ-02, EXC-01).
     db::verify_least_privilege(&pool, db::Service::Api).await?;
+    // Üretimde bağlantıyı açan giriş rolü de denetlenir (Y08).
+    if matches!(config.environment, Environment::Production) {
+        db::verify_login_role(&pool, db::Service::Api).await?;
+    }
     let mut state = AppState::new(
         pool.clone(),
         &config.jwt_secret,

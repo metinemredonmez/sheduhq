@@ -229,6 +229,12 @@ async fn run(cli: Cli) -> Result<(), String> {
     db::verify_least_privilege(&pool, db::Service::Admin)
         .await
         .map_err(|e| e.to_string())?;
+    // Üretimde giriş rolü de denetlenir (Y08).
+    if std::env::var("SHEDU_ENV").as_deref() != Ok("development") {
+        db::verify_login_role(&pool, db::Service::Admin)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let error = |e: admin::AdminError| e.to_string();
 
     match &cli.command {

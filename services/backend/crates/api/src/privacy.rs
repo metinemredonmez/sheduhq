@@ -181,21 +181,35 @@ async fn reauthenticate(
 /// `authz::mfa_required` ile aynı). Dışa aktarma bu organizasyonlardaki yetki ve komut
 /// kayıtlarını da içerdiği için aynı kural burada da geçerlidir: faktörü henüz kurulmamış
 /// personel önce faktörü kurar.
-async fn ensure_staff_factor(state: &AppState, user: AuthUser) -> ApiResult<()> {
-    let mut tx = state.db.begin().await?;
-    set_context(&mut tx, Some(user.user_id), None).await?;
-    let (staff, verified): (bool, bool) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM memberships m JOIN organizations o ON o.id = m.organization_id
-                         WHERE m.user_id = $1 AND o.kind IN ('business', 'monitoring_center')
-                           AND m.role IN ('owner', 'admin', 'operator')),
-                EXISTS (SELECT 1 FROM session_factors WHERE family_id = $2 AND user_id = $1)",
+///
+/// Denetim verinin okunduğu işlemde yapılır ve üyelikler işlem sonuna kadar paylaşımlı kilitlenir:
+/// arada personel rolüne yükseltilen üyenin çıktısı da bu kurala tabidir (Y06). Çağıran işlem kişi
+/// bağlamıyla açılmış olmalı.
+async fn ensure_staff_factor(conn: &mut PgConnection, user: AuthUser) -> ApiResult<()> {
+    let roles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT o.kind, m.role FROM memberships m JOIN organizations o ON o.id = m.organization_id
+          WHERE m.user_id = $1
+          ORDER BY m.organization_id
+            FOR SHARE OF m",
+    )
+    .bind(user.user_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let staff = roles.iter().any(|(kind, role)| {
+        matches!(kind.as_str(), "business" | "monitoring_center")
+            && matches!(role.as_str(), "owner" | "admin" | "operator")
+    });
+    if !staff {
+        return Ok(());
+    }
+    let (verified,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM session_factors WHERE family_id = $2 AND user_id = $1)",
     )
     .bind(user.user_id)
     .bind(user.session_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-    tx.commit().await?;
-    if staff && !verified {
+    if !verified {
         return Err(ApiError::Forbidden("mfa_required"));
     }
     Ok(())
@@ -206,7 +220,14 @@ pub async fn export(
     user: AuthUser,
     Json(request): Json<PasswordRequest>,
 ) -> ApiResult<Response> {
-    ensure_staff_factor(&state, user).await?;
+    // Parola denemesinden önce erken red (personelin faktörü yoksa parola sorulmaz); kesin denetim
+    // aşağıda, verinin okunduğu işlemde.
+    {
+        let mut tx = state.db.begin().await?;
+        set_context(&mut tx, Some(user.user_id), None).await?;
+        ensure_staff_factor(&mut tx, user).await?;
+        tx.commit().await?;
+    }
     reauthenticate(&state, user, request.password, "privacy.export").await?;
     {
         let mut conn = state.db.acquire().await?;
@@ -221,6 +242,7 @@ pub async fn export(
 
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, Some(user.user_id), None).await?;
+    ensure_staff_factor(&mut tx, user).await?;
     let profile: UserData = sqlx::query_as(
         "SELECT id, display_name, phone, email, status, created_at FROM users WHERE id = $1",
     )
@@ -372,7 +394,7 @@ pub async fn delete_account(
     // satırını paylaşımlı kilitler: ya talepten önce biter (aşağıdaki denetim yeni üyeyi veya
     // sahipliği görür) ya da talepten sonra sıralanır ve kapanmış hesabı görüp reddedilir (AZ-03).
     let active: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM users WHERE id = $1 AND status = 'active' FOR UPDATE")
+        sqlx::query_as("SELECT 1 FROM users WHERE id = $1 AND status = 'active' FOR NO KEY UPDATE")
             .bind(user.user_id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -453,14 +475,15 @@ pub async fn delete_account(
 /// Bekleyen silme talebini iptal eder (tam doğrulamalı girişte, oturum açılmadan önce çağrılır).
 /// İptal edildiyse `true`. Talep yalnızca 30 günlük süre içinde geri alınabilir: süresi dolmuş
 /// (silme işinin henüz işlemediği) hesapla giriş reddedilir. Silme işi hesap satırını kilitler;
-/// iptal onunla sıralanır (DAT-05).
+/// iptal onunla sıralanır (DAT-05). Süre karar anına (`clock_timestamp()`) göre denetlenir, işlem
+/// başına göre değil: kilidi beklerken süre dolduysa talep geri alınmaz (Y06).
 pub(crate) async fn cancel_scheduled_erasure(
     conn: &mut PgConnection,
     user_id: Uuid,
 ) -> ApiResult<bool> {
     let cancelled = sqlx::query(
         "UPDATE users SET status = 'active', deletion_due_at = NULL, updated_at = now()
-          WHERE id = $1 AND status = 'pending_deletion' AND deletion_due_at > now()",
+          WHERE id = $1 AND status = 'pending_deletion' AND deletion_due_at > clock_timestamp()",
     )
     .bind(user_id)
     .execute(&mut *conn)

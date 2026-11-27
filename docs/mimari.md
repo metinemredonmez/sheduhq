@@ -94,10 +94,16 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
   seferde yapmalıdır (single-flight). Oturumun mutlak ömrü 90 gündür: yenileme ile uzamaz, dolunca
   access token da geçersiz olur ve yeniden giriş gerekir. Yenileme ve iptal aile satırını
   kilitleyerek sıralanır: iptalle yarışan yenileme iptal edilmiş ailede yeni token bırakamaz.
-- **Kimlik bilgisi sürümü:** parola sıfırlama ve ikinci faktörün açılıp kapanması
-  `credential_version`'ı artırır ve bekleyen ikinci adım biletlerini geçersiz kılar. Parola veya
-  ikinci adım doğrulandıktan sonra oturum açılırken sürüm satır kilidiyle yeniden okunur; arada
-  değiştiyse oturum açılmaz.
+- **Kimlik bilgisi sürümü:** parola sıfırlama, ikinci faktörün açılıp kapanması ve hesabın
+  yönetim aracıyla kapatılması `credential_version`'ı artırır ve bekleyen ikinci adım biletlerini
+  geçersiz kılar. Parola doğrulandıktan sonra oturum açılırken sürüm satır kilidiyle yeniden
+  okunur; arada değiştiyse oturum açılmaz. İkinci adımda sürüm faktörden **önce** denetlenir:
+  geçersizleşmiş biletle gelen istek TOTP adımını veya kurtarma kodunu harcamaz.
+- **Kilit sırası:** hesap işlemleri satırları hep aynı sırayla kilitler: hesabın hata kilidi
+  (advisory) → doğrulama kodu → kullanıcı satırı → ikinci adım bileti → oturum ailesi. Kullanıcı
+  satırı `FOR NO KEY UPDATE` ile kilitlenir; oturum yenilemenin yabancı anahtar denetimini
+  bekletmez. Komutta önce bölüm, sonra komut kilitlenir (sanal panel de aynı sırayla). Açık işlem
+  içinde parola (Argon2) doğrulanmaz.
 - **Deneme sınırları:** hesap, IP ve bütün sistem için ayrı sayaçlar; PostgreSQL'de, bütün API
   kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır. Kod
   başına 5 denemeye ek olarak hesap başına 24 saatte en fazla 20 başarısız doğrulama (SMS
@@ -155,8 +161,16 @@ zonlar, yöneticiye çıkışlar), `demo-panel` (sanal panel oluştur), `panels/
 - **Komut türleri:** `arm_away`, `arm_stay`, `arm_night`, `disarm`, `bypass_zones`, `unbypass_zones`.
 - **Kurallar:** `shedu-domain` durum makinesi uygulanır (çevrimdışı panel, aynı durum, önce kapat,
   kurmaya hazır değil, başka bölümün zonu). Reddedilen komut da `rejected` olarak kaydedilir.
-- **Tekrar anahtarı:** aynı anahtar aynı istekle gelirse ilk komut döner (200), farklı istekle
-  gelirse 422. Bir bölümde aynı anda tek komut yolda olabilir (409 `command_in_progress`).
+- **Tekrar anahtarı:** aynı anahtar aynı istekle gelirse yeni komut yazılmaz. İlk istek iş
+  kuralıyla reddedildiyse (409 ve ret kodu) tekrarı da aynı 409 ve aynı kodu döner; kabul
+  edildiyse tekrarı komutun güncel durumunu 200 ile döner. Farklı istekle gelirse 422. İstemci ağ
+  kesintisinden sonra aynı anahtarla yeniden gönderip sonucu ilk yanıtla aynı yorumlar. Bir
+  bölümde aynı anda tek komut yolda olabilir (409 `command_in_progress`). Kilitlenme veya
+  serileştirme çakışmasında (SQLSTATE 40P01/40001) işlem geri alınır ve 409 `concurrent_update`
+  döner; istemci aynı anahtarla yeniden dener.
+- **Karar anı:** paylaşılan zonda bypass, zonun bağlı olduğu bütün bölümlerin yetki kayıtları
+  kilitlendikten sonra alınan tek bir anla değerlendirilir; her bölüm ayrı saat örneğiyle
+  değerlendirilmez.
 - **Sanal panel:** gerçek cihaza bağlı değildir; komutu kısa bir gecikmeyle tamamlar, bölüm
   durumunu ve panel olayını yazar. Mağaza incelemesi ve deneme için; organizasyon başına bir tane.
   Gerçek panellerde bu işi gateway yapacak.
@@ -176,14 +190,21 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
 - **Geçmiş:** yeniden eskiye, imleçli sayfalama; üye yalnızca yetkili bölümlerinin olaylarını ve
   panel düzeyindeki olayları (bağlantı, güç, panik) görür.
 - **Dağıtım (kalıcı kuyruk):** panel olayı yazılınca dağıtıcı olayı `FOR UPDATE SKIP LOCKED` ile
-  alır, alıcıları yetkiye göre bulur, her cihaz için `push_deliveries`'e `pending` bir teslim işi
-  yazar ve olayı dağıtıldı işaretler. Birden fazla API kopyası aynı olayı iki kez dağıtmaz.
-  Her iş kısa bir işlemde 30 saniyelik süreyle alınır (`sending`), sağlayıcıya veritabanı işlemi
-  dışında gönderilir ve sonuç ayrı işlemde yazılır. Geçici hata artan aralıklarla (5 sn – 5 dk)
-  en fazla 6 kez denenir; deneme hakkı veya bir saatlik süre dolarsa iş `failed` olur ve hata
-  olarak loglanır. Geçersiz token denenmez, cihazdan silinir. Süreç gönderim sırasında kesilirse
-  süre dolunca iş yeniden alınır; 5 saniyelik tarama kaçırılan olayları ve zamanı gelen işleri
-  yakalar. Teslim en az bir kezdir: sağlayıcının kabulü ile sonucun yazılması arasındaki kesintide
+  alır, alıcıları `push_recipient_eligible()` kuralıyla bulur, her cihaz için `push_deliveries`'e
+  `pending` bir teslim işi yazar ve olayı dağıtıldı işaretler. Birden fazla API kopyası aynı olayı
+  iki kez dağıtmaz. Her iş kısa bir işlemde 30 saniyelik süreyle alınır (`sending`); alıcı aynı
+  kuralla **gönderimden hemen önce yeniden denetlenir** ve artık uygun değilse iş `cancelled`
+  olur. Sağlayıcıya veritabanı işlemi dışında ve 20 saniyelik süre sınırıyla gönderilir, sonuç
+  ayrı işlemde yazılır. Geçici hata artan aralıklarla (5 sn – 5 dk) en fazla 6 kez denenir.
+  Deneme hakkı biten iş yeniden alınmaz; olayı bir saatten eski olan iş (yaş işin değil olayın
+  alınma zamanından ölçülür) gönderilmez. İkisini de her taramanın başında
+  `reap_push_deliveries()` `failed` yapar ve hata olarak loglanır: uzun kesintiden sonra da hiçbir
+  iş `pending` veya `sending` durumunda kalmaz. Geç dağıtılan eski olay için iş yazılmaz, olay
+  yalnızca dağıtıldı işaretlenir. Geçersiz token denenmez; işin sonucunu bu deneme yazdıysa
+  cihazdan silinir. Süreç gönderim sırasında kesilirse süre dolunca iş yeniden alınır; 5
+  saniyelik tarama kaçırılan olayları (yaş sınırı olmadan) ve zamanı gelen işleri yakalar. Tarama
+  her olayı ve işi ayrı ele alır: birinin hatası loglanır, diğerleri (başka organizasyonlarınki
+  dahil) işlenmeye devam eder. Teslim en az bir kezdir: sağlayıcının kabulü ile sonucun yazılması arasındaki kesintide
   bildirim ikinci kez gidebilir; sağlayıcı bağdaştırıcısı olay başına sabit `collapse_key`'i
   (APNs `apns-collapse-id`, FCM `collapse_key`) kullanarak cihazda tekilleştirir.
 - **Paylaşılan zon:** bir zon birden fazla bölümdeyse alarm, alarma geçen her bölüm için ayrı
@@ -191,8 +212,11 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   her bölümde bypass yetkisi ister; panel ayrıntısı görünmeyen bölümlerin kimliğini göstermez.
   Zon bilgisi taşıyan olay bir bölüme ait olmalıdır, bağlantı olayları panel düzeyindedir
   (veritabanı kısıtı).
-- **Alıcılar:** yöneticiler ve o bölümü görmeye yetkili üyeler; yalnızca etkin oturumu olan ve
-  token'ı kayıtlı cihazlar. Çıkışta, oturum kapatmada ve parola sıfırlamada token silinir. Aynı
+- **Alıcılar:** yöneticiler ve o bölümü görmeye yetkili üyeler; yalnızca etkin oturumu olan
+  (personelde ikinci adımı tamamlanmış), bildirim kategorisini kapatmamış ve token'ı kayıtlı
+  cihazlar. Kural veritabanında tek yerdedir (`push_recipient_eligible()`) ve dağıtımda da
+  gönderimde de aynen uygulanır: kuyrukta beklerken üyeliği, yetkisi veya oturumu düşen kişiye
+  bildirim gitmez. Çıkışta, oturum kapatmada ve parola sıfırlamada token silinir. Aynı
   token başka hesaba kaydedilirse eski hesaptan kaldırılır.
 - **Öncelik:** alarm `critical` (iOS kritik uyarı, Android alarm kanalı), bağlantı kopması ve güç
   sorunu `warning`, kurma/kapatma `info`.
@@ -410,7 +434,10 @@ Uygulama ──> API: yetki (paneli görme), bayrak, sıklık sınırı
   süren bağlantı kopması) API'de SQL ile hesaplanır, AI yanıtından alınmaz. Sayılar ve liste tek
   sorguda (aynı anlık görüntüde) okunur; liste 500 olayla kısaltılsa bile sayılar bütün dönemi
   kapsar ve modele de bu sayılar verilir, model sayıları listeden saymaz. Bağlantı durumu dönemle
-  sınırlı değildir: dönem başlamadan kopmuş ve hâlâ kopuk panel de dikkat ister. Metin `ai_generated: true` ile işaretlenir;
+  sınırlı değildir: dönem başlamadan kopmuş ve hâlâ kopuk panel de dikkat ister; o da aynı
+  sorguda (aynı anlık görüntüde) okunur. Dönemde olay yoksa model çağrılmaz ve bütçeden
+  ayrılmaz: sabit metin ("Bu dönemde panelde kayıtlı olay yok.", panel hâlâ kopuksa bağlantı
+  notuyla) API'de üretilir, `ai_generated: false` döner. Metin `ai_generated: true` ile işaretlenir;
   istemci bunu kullanıcıya gösterir ve metni HTML veya Markdown olarak değil düz metin olarak
   basar.
 - **Model (AI-01):** varsayılan `claude-opus-5-5`, düşük çaba, `max_tokens` 4096, JSON şemalı
@@ -422,16 +449,23 @@ Uygulama ──> API: yetki (paneli görme), bayrak, sıklık sınırı
   50 özet. Harcama: her çağrıdan önce en kötü durum tahmini (istek boyutundan giriş, `max_tokens`
   çıktı, en pahalı fiyat, asıl ve yedek model için iki çalışma) `ai_reserve()` ile kullanıcı 3 $,
   organizasyon 10 $ ve bütün sistem 20 $ (`SHEDU_AI_DAILY_BUDGET_USD`) son 24 saat bütçesinden
-  **ayrılır**; sığmıyorsa model çağrılmaz (429). Rezervasyonlar tek kilitle sıralanır: eşzamanlı
+  **ayrılır**; sığmıyorsa model çağrılmaz (429). Bütçe reddinde de isteğin sıklık kaydı kalır:
+  sürekli bütçe retleri ağır sorguyu sıklık kapısında durdurur. Sınırlar API'den gelse de
+  yordamın sert üst sınırlarını (kullanıcı 3 $, organizasyon 10 $, sistem 100.000 $) aşamaz. Rezervasyonlar tek kilitle sıralanır: eşzamanlı
   çağrılar aynı boş bütçeyi iki kez kullanamaz. Çağrı bitince gerçek harcama rezervasyonu kapatan
   ayrı satır olarak yazılır (başarı, ret, hata); yedek model denemeleri de sayılır
   (`usage.iterations`). AI servisi her hata yanıtında `may_be_billed` bildirir: faturalanmayan
-  hata sıfırla, sonucu bilinmeyen çağrı (zaman aşımı, düşen servis, okunamayan yanıt) tahminle
-  kapanır. Süreç kesilirse veya kayıt yazılamazsa rezervasyon açık kalır ve tahminiyle sayılmaya
-  devam eder; çağrı ve kayıt ayrı görevde yürür, istemci bağlantıyı koparsa da tamamlanır. AI
+  hata (sağlayıcının reddettiği istek, 429, 529) sıfırla; sonucu bilinmeyen çağrı (zaman aşımı,
+  bağlantı kopması, sağlayıcının diğer 5xx hataları, düşen servis, okunamayan yanıt) tahminle
+  kapanır. Başarılı yanıtta kullanım alanlarından biri eksik veya negatifse harcama sıfır sayılmaz,
+  tahminle (`unknown`) kapanır. Süreç kesilirse veya kayıt yazılamazsa rezervasyon açık kalır ve
+  tahminiyle sayılmaya devam eder. Rezervasyonun commit'i, çağrı ve kayıt aynı ayrı görevde
+  yürür: istemci bağlantıyı koparsa da tamamlanır; görev başlamadan kesilen isteğin rezervasyonu
+  hiç yazılmaz. AI
   servisi SDK'nın kendi yeniden denemesini kapatır. Defter yalnızca eklenir, başka tabloya
-  yabancı anahtarı yoktur: hesap silinse de harcama kalır. Uygulama rolü satırları okuyamaz;
-  yalnızca toplam döndüren `ai_spend_last_day()` ve `ai_reserve()` yordamlarını çağırabilir. AI
+  yabancı anahtarı yoktur: hesap silinse de harcama kalır. Uygulama rolü satırları okuyamaz ve
+  deftere doğrudan yazamaz; yalnızca toplam döndüren `ai_spend_last_day()`, `ai_reserve()` ve
+  kişinin kendi açık rezervasyonunu kapatan `ai_settle()` yordamlarını çağırabilir. AI
   servisi fiyatı bilinmeyen bir modelle başlamaz.
 - **AI servisine bağlantı (ARC-04, NET-01):** `SHEDU_AI_URL` ve `SHEDU_AI_TOKEN` (en az 32
   karakter, diğer sırlardan farklı) birlikte verilir; yoksa özellik 503 döner. Loopback dışında

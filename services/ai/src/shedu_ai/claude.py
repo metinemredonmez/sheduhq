@@ -8,8 +8,10 @@
 - Zaman aşımı 30 saniye, SDK'nın kendi yeniden denemesi kapalı; hata durumunda `Unavailable`.
   Alarm yolu AI'ya bağlı değildir: özet gelmezse yalnızca özet gösterilmez.
 - Yanıt gelmeyen hatada faturalama belirsizliği `may_be_billed` ile bildirilir (AI-03): zaman
-  aşımı ve bağlantı hatasında istek sağlayıcıya ulaşmış ve model çalışmış olabilir (true);
-  sağlayıcının hata yanıtı (429, 4xx, 5xx, 529) faturalanmaz (false).
+  aşımı ve bağlantı hatasında istek sağlayıcıya ulaşmış ve model çalışmış olabilir (true).
+  Sağlayıcının reddettiği istek (429, 4xx) ve aşırı yük (529) model çalışmadan döner (false).
+  Sunucu hatasında (diğer 5xx) model çalışmış olabilir; faturalanıp faturalanmadığı
+  doğrulanamadığından temkinli davranılır (true): Rust API rezervasyonu tahminiyle kapatır.
 """
 
 from __future__ import annotations
@@ -101,7 +103,8 @@ class ClaudeWriter:
             raise Unavailable("hız sınırı", may_be_billed=False) from error
         except anthropic.APIStatusError as error:
             log.warning("model hatası: durum %s", error.status_code)
-            raise Unavailable("model hatası", may_be_billed=False) from error
+            server_side = error.status_code >= 500 and error.status_code != 529
+            raise Unavailable("model hatası", may_be_billed=server_side) from error
 
         # Yanıt geldiyse harcama oldu: hangi sonuç olursa olsun kullanım bildirilir.
         usage = billed_usage(response)

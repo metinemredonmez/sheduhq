@@ -166,6 +166,18 @@ pub async fn phone_complete(
     }
 
     let old_phone = mfa::phone_of(&mut tx, user.user_id).await?;
+    // Eski numaraya gönderilmiş, henüz kullanılmamış kodlar geçersiz olur: eski numaranın yeni
+    // sahibi veya numarayı ele geçiren biri hesabın parolasını sıfırlayamaz (AUT-03). Kodlar
+    // kullanıcı satırından önce kilitlenir: parola sıfırlamayla aynı sıra (kod → kullanıcı), iki
+    // işlem birbirini ters sırada beklemez (Y05).
+    sqlx::query(
+        "UPDATE verification_codes SET consumed_at = now()
+          WHERE consumed_at IS NULL AND (user_id = $1 OR phone = $2) AND purpose = 'password_reset'",
+    )
+    .bind(user.user_id)
+    .bind(old_phone.as_deref())
+    .execute(&mut *tx)
+    .await?;
     let updated = sqlx::query(
         "UPDATE users SET phone = $2, updated_at = now() WHERE id = $1 AND status = 'active'",
     )
@@ -181,16 +193,6 @@ pub async fn phone_complete(
             other?;
         }
     }
-    // Eski numaraya gönderilmiş, henüz kullanılmamış kodlar geçersiz olur: eski numaranın yeni
-    // sahibi veya numarayı ele geçiren biri hesabın parolasını sıfırlayamaz (AUT-03).
-    sqlx::query(
-        "UPDATE verification_codes SET consumed_at = now()
-          WHERE consumed_at IS NULL AND (user_id = $1 OR phone = $2) AND purpose = 'password_reset'",
-    )
-    .bind(user.user_id)
-    .bind(old_phone.as_deref())
-    .execute(&mut *tx)
-    .await?;
     audit::record(
         &mut tx,
         audit::Event {

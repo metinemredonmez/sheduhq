@@ -304,6 +304,10 @@ pub async fn transfer_ownership(
     Path(org_id): Path<Uuid>,
     Json(request): Json<TransferRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Parola işlem açılmadan doğrulanır: Argon2 sürerken bağlantı ve satır kilitleri tutulmaz, işlem
+    // açıkken havuzdan ikinci bağlantı istenmez (Y05). Sonuç aşağıda, yetki denetimlerinden sonra
+    // uygulanır (yanıt sırası değişmez).
+    let password_ok = reauth::verify_password(&state, user.user_id, request.password).await?;
     let (mut tx, ctx) = authz::begin(&state, user, org_id).await?;
     let denied = |reason: &'static str| audit::Event {
         organization_id: Some(org_id),
@@ -347,7 +351,7 @@ pub async fn transfer_ownership(
         return Err(ApiError::Conflict("target_not_active"));
     }
 
-    if !reauth::verify_password(&state, ctx.user.user_id, request.password).await? {
+    if !password_ok {
         audit::record(&mut tx, denied("reauth_failed")).await?;
         tx.commit().await?;
         return Err(ApiError::Forbidden("reauth_failed"));

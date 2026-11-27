@@ -345,7 +345,11 @@ async fn mark_session(
 }
 
 /// Kimlik bilgisi sürümünü artırır ve bekleyen ikinci adım biletlerini geçersiz kılar (SES-04).
-async fn bump_credentials(conn: &mut PgConnection, user_id: Uuid) -> ApiResult<()> {
+/// Sıra: önce kullanıcı satırı, sonra biletler (bütün hesap işlemlerindeki kilit sırası).
+pub(crate) async fn bump_credentials(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE users SET credential_version = credential_version + 1, updated_at = now()
           WHERE id = $1",
@@ -487,23 +491,19 @@ pub async fn verify(
     }
 
     let mut tx = state.db.begin().await?;
-    let challenge: Option<(Uuid, Uuid, String, Option<String>, i32)> = sqlx::query_as(
-        "SELECT c.id, c.user_id, c.platform, c.device_name, c.credential_version
-           FROM mfa_challenges c
-           JOIN users u ON u.id = c.user_id AND u.status IN ('active', 'pending_deletion')
-          WHERE c.token_hash = $1 AND c.consumed_at IS NULL AND c.expires_at > now()
-            AND c.attempts < $2
-          FOR UPDATE OF c",
-    )
-    .bind(&hash)
-    .bind(CHALLENGE_MAX_ATTEMPTS)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((challenge_id, user_id, platform, device_name, credential_version)) = challenge else {
+    // Kilit sırası bütün hesap işlemlerinde aynı: hesabın hata kilidi (advisory) → kullanıcı
+    // satırı → bilet → faktör (Y05). Bilet önce kilitsiz bulunur (yalnızca hangi hesaba ait
+    // olduğu); geçerliliği kilitlendikten sonra denetlenir.
+    let owner: Option<(Uuid,)> =
+        sqlx::query_as("SELECT user_id FROM mfa_challenges WHERE token_hash = $1")
+            .bind(&hash)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((user_id,)) = owner else {
         tx.commit().await?;
         return Err(ApiError::Unauthorized);
     };
-    // Sınırlar biletin işleminde: işlem ve bilet kilidi açıkken havuzdan ikinci bağlantı istenmez.
+    // Sınırlar biletin işleminde: işlem açıkken havuzdan ikinci bağlantı istenmez.
     rate_limit::hit(
         &mut tx,
         &state.hmac_secret,
@@ -512,6 +512,45 @@ pub async fn verify(
     )
     .await?;
     ensure_mfa_attempts(&mut tx, &state, user_id).await?;
+    // Kullanıcı satırı işlem sonuna kadar kilitli: parola sıfırlama, faktör değişikliği veya hesabın
+    // kapatılması bu doğrulamayla sıralanır ve kimlik bilgisi sürümü arada değişemez.
+    let current: Option<(i32,)> = sqlx::query_as(
+        "SELECT credential_version FROM users
+          WHERE id = $1 AND status IN ('active', 'pending_deletion')
+          FOR NO KEY UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let challenge: Option<(Uuid, String, Option<String>, i32)> = sqlx::query_as(
+        "SELECT id, platform, device_name, credential_version
+           FROM mfa_challenges
+          WHERE token_hash = $1 AND user_id = $2 AND consumed_at IS NULL AND expires_at > now()
+            AND attempts < $3
+          FOR UPDATE",
+    )
+    .bind(&hash)
+    .bind(user_id)
+    .bind(CHALLENGE_MAX_ATTEMPTS)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (Some((current,)), Some((challenge_id, platform, device_name, credential_version))) =
+        (current, challenge)
+    else {
+        tx.commit().await?;
+        return Err(ApiError::Unauthorized);
+    };
+    // Bilet açıldıktan sonra parola sıfırlandı, faktör değişti veya hesap kapatılıp açıldıysa
+    // bilet geçersizdir. Faktör denetlenmeden reddedilir: kurtarma kodu veya TOTP adımı boşa
+    // harcanmaz (Y04).
+    if current != credential_version {
+        sqlx::query("UPDATE mfa_challenges SET consumed_at = now() WHERE id = $1")
+            .bind(challenge_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Err(ApiError::Unauthorized);
+    }
 
     let method = check_factor(
         &state,
@@ -549,13 +588,6 @@ pub async fn verify(
         .bind(challenge_id)
         .execute(&mut *tx)
         .await?;
-    // Bilet açıldıktan sonra parola sıfırlandıysa veya hesap kapatıldıysa oturum açılmaz.
-    if let Err(error) =
-        handlers::ensure_credentials_unchanged(&mut tx, user_id, credential_version).await
-    {
-        tx.commit().await?;
-        return Err(error);
-    }
     let device = DeviceInfo {
         platform,
         name: device_name,
@@ -779,6 +811,8 @@ pub async fn disable(
         tx.commit().await?;
         return Err(ApiError::BadRequest("invalid_code"));
     }
+    // Önce kullanıcı satırı (sürüm), sonra biletler: parola sıfırlamayla aynı kilit sırası (Y05).
+    bump_credentials(&mut tx, user.user_id).await?;
     for statement in [
         "DELETE FROM user_totp WHERE user_id = $1",
         "DELETE FROM recovery_codes WHERE user_id = $1",
@@ -790,7 +824,6 @@ pub async fn disable(
             .execute(&mut *tx)
             .await?;
     }
-    bump_credentials(&mut tx, user.user_id).await?;
     let phone = phone_of(&mut tx, user.user_id).await?;
     record(
         &mut tx,

@@ -126,10 +126,7 @@ BEGIN
     ASSERT r.user_microusd = 600, format('açık rezervasyon sayılır: %s', r.user_microusd);
 
     -- Kapanış: gerçek harcama rezervasyonun yerine geçer.
-    INSERT INTO ai_usage (organization_id, user_id, feature, model, input_tokens, output_tokens,
-                          cost_microusd, outcome, reservation_id)
-    VALUES ('aaaaaaaa-0000-0000-0000-000000000001', '11111111-0000-0000-0000-000000000001',
-            'event_summary', 'claude-opus-5-5', 100, 20, 80, 'success', first);
+    PERFORM ai_settle(first, 'claude-opus-5-5', 100, 20, 80, 'success');
     SELECT * INTO r FROM ai_spend_last_day();
     ASSERT r.user_microusd = 80, format('kapanınca gerçek harcama: %s', r.user_microusd);
     ASSERT r.org_microusd = 80 AND r.global_microusd = 80, 'organizasyon ve sistem de';

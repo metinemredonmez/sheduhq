@@ -460,11 +460,11 @@ async fn dispatch_is_exactly_once_and_sweep_recovers_missed_events(
     .execute(&app.admin)
     .await
     .expect("güncelleme");
-    let swept = push::sweep_pending(&app.state).await.expect("tarama");
+    let swept = push::sweep_pending(&app.state).await;
     assert_eq!(swept, 1);
     assert_eq!(app.push.messages().len(), 2);
     assert_eq!(
-        push::sweep_pending(&app.state).await.expect("tarama"),
+        push::sweep_pending(&app.state).await,
         0,
         "ikinci tarama boş"
     );

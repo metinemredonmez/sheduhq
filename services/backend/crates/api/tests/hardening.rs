@@ -74,6 +74,61 @@ async fn startup_refuses_a_role_that_bypasses_rls(_: PgPoolOptions, connect: PgC
     assert!(error.to_string().contains("uygulama rolü"), "{error}");
 }
 
+/// Üretimde giriş rolü de denetlenir (Y08): etkin rol uygulama rolü olsa bile bağlantıyı süper
+/// kullanıcı açtıysa açılış reddedilir; yalnızca uygulama rolüne geçebilen giriş rolü kabul edilir,
+/// yönetim rolüne de geçebilen giriş rolü API'de reddedilir.
+#[sqlx::test(migrations = "../../migrations")]
+async fn production_checks_the_login_role_too(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect.clone()).await;
+    db::verify_least_privilege(&app.pool, db::Service::Api)
+        .await
+        .expect("etkin rol uygulama rolü");
+    let error = db::verify_login_role(&app.pool, db::Service::Api)
+        .await
+        .expect_err("süper kullanıcı girişi reddedilmeli");
+    assert!(error.to_string().contains("RLS"), "{error}");
+
+    // Roller küme genelinde: her çalıştırmada ayrı ad ve rastgele parola, sonunda silinir.
+    let name = format!("shedu_test_login_{}", Uuid::new_v4().simple());
+    let password = Uuid::new_v4().simple().to_string();
+    let create = format!("CREATE ROLE {name} LOGIN PASSWORD '{password}' IN ROLE shedu_app");
+    sqlx::query(sqlx::AssertSqlSafe(create))
+        .execute(&app.admin)
+        .await
+        .expect("giriş rolü");
+    let login = db::pool_options(Some("shedu_app".to_owned()))
+        .max_connections(1)
+        .connect_with(connect.clone().username(&name).password(&password))
+        .await
+        .expect("giriş rolüyle bağlantı");
+    db::verify_least_privilege(&login, db::Service::Api)
+        .await
+        .expect("etkin rol");
+    db::verify_login_role(&login, db::Service::Api)
+        .await
+        .expect("yalnızca uygulama rolüne geçebilen giriş kabul edilmeli");
+    login.close().await;
+
+    sqlx::query(sqlx::AssertSqlSafe(format!("GRANT shedu_admin TO {name}")))
+        .execute(&app.admin)
+        .await
+        .expect("yönetim rolü");
+    let login = db::pool_options(Some("shedu_app".to_owned()))
+        .max_connections(1)
+        .connect_with(connect.username(&name).password(&password))
+        .await
+        .expect("giriş rolüyle bağlantı");
+    let error = db::verify_login_role(&login, db::Service::Api)
+        .await
+        .expect_err("yönetim rolüne geçebilen giriş API'de reddedilmeli");
+    assert!(error.to_string().contains("yönetim rolüne"), "{error}");
+    login.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {name}")))
+        .execute(&app.admin)
+        .await
+        .expect("rol silme");
+}
+
 /// Bulgu 1 (ikinci bariyer): RLS devre dışı olsa bile kiracı filtreleri sorgularda açıkça var.
 #[sqlx::test(migrations = "../../migrations")]
 async fn tenant_filters_hold_without_rls(_: PgPoolOptions, connect: PgConnectOptions) {

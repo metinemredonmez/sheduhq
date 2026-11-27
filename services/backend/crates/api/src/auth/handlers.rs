@@ -353,7 +353,7 @@ pub(super) async fn ensure_credentials_unchanged(
     let current: Option<(i32,)> = sqlx::query_as(
         "SELECT credential_version FROM users
           WHERE id = $1 AND status IN ('active', 'pending_deletion')
-          FOR SHARE",
+          FOR NO KEY UPDATE",
     )
     .bind(user_id)
     .fetch_optional(conn)
@@ -954,11 +954,13 @@ pub async fn reset_complete(
         consume_code(&state, Purpose::PasswordReset, &phone, &request.code).await?;
     let user_id = user_id.ok_or(ApiError::BadRequest("invalid_code"))?;
     // Kod düzenlendiği numaraya bağlıdır: hesabın numarası o arada değiştiyse kod parolayı
-    // değiştiremez (AUT-03). Hesap satırı kilitlenir; numara değişimi bununla sıralanır.
+    // değiştiremez (AUT-03). Hesap satırı kilitlenir; numara değişimi bununla sıralanır. Kilit
+    // `FOR NO KEY UPDATE`: oturum yenilemenin yabancı anahtar denetimini (KEY SHARE) bekletmez,
+    // yenileme de bu işlemin iptal edeceği aileyi tutarken kullanıcı satırını beklemez (Y05).
     let profile: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT display_name, email FROM users
           WHERE id = $1 AND phone = $2 AND status IN ('active', 'pending_deletion')
-          FOR UPDATE",
+          FOR NO KEY UPDATE",
     )
     .bind(user_id)
     .bind(&phone)

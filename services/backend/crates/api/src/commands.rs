@@ -136,6 +136,21 @@ pub fn rejection_code(rejection: &CommandRejection) -> &'static str {
     }
 }
 
+/// Kayıtlı ret nedeninin yanıt kodu (ilk yanıttaki kodla aynı). Bilinmeyen değer genel koda düşer.
+fn stored_rejection_code(reason: Option<&str>) -> &'static str {
+    const CODES: [&str; 6] = [
+        "panel_offline",
+        "already_in_state",
+        "disarm_required_first",
+        "not_ready_to_arm",
+        "no_zones_requested",
+        "zones_not_in_partition",
+    ];
+    reason
+        .and_then(|reason| CODES.into_iter().find(|code| *code == reason))
+        .unwrap_or("command_rejected")
+}
+
 fn valid_idempotency_key(key: &str) -> bool {
     (16..=128).contains(&key.len())
         && key
@@ -236,11 +251,18 @@ pub async fn create_command(
             && previous.kind == request.kind.as_str()
             && previous.zones == zones_db;
         tx.commit().await?;
-        return if same {
-            Ok((StatusCode::OK, Json(previous)))
-        } else {
-            Err(ApiError::Unprocessable("idempotency_key_reused"))
-        };
+        if !same {
+            return Err(ApiError::Unprocessable("idempotency_key_reused"));
+        }
+        // Tekrar, ilk yanıtla aynı sonucu verir: ilk istek iş kuralıyla reddedildiyse (409 ve kod)
+        // tekrarı da aynı kodla 409 döner. Ağ kesintisinden sonra yeniden gönderen istemci sonucu
+        // ilk yanıtla aynı yorumlar. Kabul edilmiş komutun tekrarı komutun güncel durumunu döner.
+        if previous.status == "rejected" {
+            return Err(ApiError::Conflict(stored_rejection_code(
+                previous.rejection_reason.as_deref(),
+            )));
+        }
+        return Ok((StatusCode::OK, Json(previous)));
     }
 
     // Panel ve bölüm; bölüm satırı işlem sonuna kadar kilitlenir.
@@ -257,28 +279,40 @@ pub async fn create_command(
     .await?;
     let (connectivity, ready_to_arm, simulated, state_text) = target.ok_or(ApiError::NotFound)?;
 
-    let permissions =
-        authz::permissions(&mut tx, &ctx, panel_id, Some(request.partition_id)).await?;
-    let mut allowed = match request.kind {
-        CommandKind::ArmAway | CommandKind::ArmStay | CommandKind::ArmNight => permissions.arm,
-        CommandKind::Disarm => permissions.disarm,
-        CommandKind::BypassZones | CommandKind::UnbypassZones => permissions.bypass,
-    };
     // Bypass zonun kendisini değiştirir: zon başka bölümlerde de kullanılıyorsa o bölümleri de
     // etkiler. Bu yüzden zonun ait olduğu her bölümde bypass yetkisi gerekir (AZ-04).
-    if allowed && is_bypass {
-        let shared: Vec<(Uuid,)> = sqlx::query_as(
+    let shared: Vec<Uuid> = if is_bypass {
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
             "SELECT DISTINCT zp.partition_id
                FROM zones z JOIN zone_partitions zp ON zp.zone_id = z.id
-              WHERE z.panel_id = $1 AND z.number = ANY($2) AND zp.partition_id <> $3",
+              WHERE z.panel_id = $1 AND z.number = ANY($2) AND zp.partition_id <> $3
+              ORDER BY zp.partition_id",
         )
         .bind(panel_id)
         .bind(zones_db.as_deref().unwrap_or_default())
         .bind(request.partition_id)
         .fetch_all(&mut *tx)
         .await?;
-        for (partition_id,) in shared {
-            if !authz::permissions(&mut tx, &ctx, panel_id, Some(partition_id))
+        rows.into_iter().map(|(id,)| id).collect()
+    } else {
+        Vec::new()
+    };
+    // Bütün ilgili yetki kayıtları önce kilitlenir, sonra tek bir karar anı alınır: bütün bölümler
+    // aynı anda değerlendirilir (Y07).
+    let mut involved = vec![request.partition_id];
+    involved.extend(&shared);
+    authz::lock_grants(&mut tx, &ctx, panel_id, &involved).await?;
+    let moment = authz::decision_moment(&mut tx).await?;
+    let permissions =
+        authz::permissions_at(&mut tx, &ctx, panel_id, Some(request.partition_id), moment).await?;
+    let mut allowed = match request.kind {
+        CommandKind::ArmAway | CommandKind::ArmStay | CommandKind::ArmNight => permissions.arm,
+        CommandKind::Disarm => permissions.disarm,
+        CommandKind::BypassZones | CommandKind::UnbypassZones => permissions.bypass,
+    };
+    if allowed {
+        for partition_id in shared {
+            if !authz::permissions_at(&mut tx, &ctx, panel_id, Some(partition_id), moment)
                 .await?
                 .bypass
             {
@@ -417,5 +451,31 @@ pub async fn get_command(
     match view {
         Some(view) if ctx.role.is_manager() || view.user_id == ctx.user.user_id => Ok(Json(view)),
         _ => Err(ApiError::NotFound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tekrarlanan reddin kodu ilk yanıttaki kodla aynı olmalı.
+    #[test]
+    fn stored_rejection_codes_match_the_first_response() {
+        for rejection in [
+            CommandRejection::PanelOffline,
+            CommandRejection::AlreadyInState,
+            CommandRejection::DisarmRequiredFirst,
+            CommandRejection::NotReadyToArm,
+            CommandRejection::NoZonesRequested,
+            CommandRejection::ZonesNotInPartition(BTreeSet::new()),
+        ] {
+            let code = rejection_code(&rejection);
+            assert_eq!(stored_rejection_code(Some(code)), code);
+        }
+        assert_eq!(
+            stored_rejection_code(Some("bilinmeyen")),
+            "command_rejected"
+        );
+        assert_eq!(stored_rejection_code(None), "command_rejected");
     }
 }

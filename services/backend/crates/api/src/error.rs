@@ -74,6 +74,12 @@ impl From<sqlx::Error> for ApiError {
         let code = error
             .as_database_error()
             .and_then(|db| db.code().map(|c| c.into_owned()));
+        // Kilitlenme (40P01) veya serileştirme çakışması (40001): veritabanı işlemi geri aldı, hiçbir
+        // şey yazılmadı. Genel hata yerine istemcinin yeniden deneyebileceği çakışma döner.
+        if matches!(code.as_deref(), Some("40P01" | "40001")) {
+            tracing::warn!(code = ?code, "eşzamanlı güncelleme çakışması; işlem geri alındı");
+            return Self::Conflict("concurrent_update");
+        }
         tracing::error!(kind = error_kind(&error), code = ?code, "veritabanı hatası");
         Self::Internal
     }

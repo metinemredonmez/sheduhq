@@ -71,6 +71,17 @@ async fn complete(
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, None, Some(organization_id)).await?;
 
+    // Kilit sırası komut oluşturmayla aynı: önce bölüm, sonra komut (Y05). Ters sıra, aynı bölüme
+    // komut veren istekle karşılıklı beklemeye girebilir.
+    sqlx::query(
+        "SELECT pt.id FROM commands c JOIN partitions pt ON pt.id = c.partition_id
+          WHERE c.id = $1
+            FOR UPDATE OF pt",
+    )
+    .bind(command_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
     let done: Option<CompletedCommand> = sqlx::query_as(
         "UPDATE commands c SET status = 'succeeded', completed_at = now()
            FROM panels p, partitions pt

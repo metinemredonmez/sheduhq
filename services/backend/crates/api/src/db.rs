@@ -117,3 +117,36 @@ pub async fn verify_least_privilege(pool: &PgPool, service: Service) -> Result<(
         _ => Ok(()),
     }
 }
+
+/// Üretimde bağlantıyı açan giriş rolü (`session_user`) de denetlenir (Y08). Etkin rol düşük olsa
+/// bile giriş rolü ayrıcalıklıysa aynı bağlantıda çalışan kod (`RESET ROLE`, `SET ROLE`) RLS'yi
+/// aşan role dönebilir. Giriş rolü süper kullanıcı veya BYPASSRLS olmamalı, tablo sahibi bir role
+/// geçememeli; API'nin giriş rolü yönetim rolüne de geçememeli. Geliştirmede (yerel süper kullanıcı
+/// ve `SHEDU_DB_ROLE`) uygulanmaz.
+pub async fn verify_login_role(pool: &PgPool, service: Service) -> Result<(), PrivilegeError> {
+    let row: Result<(String, bool, bool, i64, bool), sqlx::Error> = sqlx::query_as(
+        "SELECT session_user::text, r.rolsuper, r.rolbypassrls,
+                (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public' AND c.relkind = 'r'
+                    AND pg_has_role(session_user, c.relowner, 'MEMBER')),
+                pg_has_role(session_user, 'shedu_admin', 'MEMBER')
+           FROM pg_roles r WHERE r.rolname = session_user",
+    )
+    .fetch_one(pool)
+    .await;
+    let (role, superuser, bypass, owner, admin) =
+        row.map_err(|e| PrivilegeError(format!("giriş rolü denetlenemedi: {e}")))?;
+    if superuser || bypass || owner > 0 {
+        return Err(PrivilegeError(format!(
+            "veritabanı giriş rolü '{role}' RLS'yi aşabilir (süper kullanıcı, BYPASSRLS veya tablo \
+             sahibine geçebilen rol); yalnızca uygulama rolüne geçebilen ayrı bir giriş rolü kullanın"
+        )));
+    }
+    if service == Service::Api && admin {
+        return Err(PrivilegeError(format!(
+            "API'nin veritabanı giriş rolü '{role}' yönetim rolüne geçebiliyor; API ve yönetim aracı \
+             için ayrı giriş rolleri kullanın"
+        )));
+    }
+    Ok(())
+}

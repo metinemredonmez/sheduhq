@@ -178,7 +178,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bağlanarak yeni sözleşme uçtan uca doğrulandı (27 Kasım 2026). Gerçek modelle çağrı yapılmadı.
 - **İkinci denetim (27 Kasım 2026, commit `aec05ed` üzerinde, Codex):** 20 bulgu kodda doğrulandı;
   hepsi düzeltildi veya aşağıda kalan risk olarak yazıldı. Regresyon testleri:
-  `services/backend/crates/api/tests/audit_fixes.rs` (11 test), `ai.rs`, `hardening.rs`,
+  `services/backend/crates/api/tests/audit_fixes.rs` (ilk 11 test), `ai.rs`, `hardening.rs`,
   `config.rs` birim testleri, `tests/sql/014_audit_fixes.sql`, `services/ai/tests`. Hesap başına
   hata sınırının kilidi kaldırılınca paralel deneme testinin kaldığı yerelde doğrulandı.
 
@@ -203,7 +203,30 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   | S17 | RES-01, ARC-04 | AI servisinde gövde okunmadan kimlik doğrulama, 1 MiB sınır, doğrulama hatasında içerik yansıtılmaz | Geçti (yerel) |
   | S18 | AI-01, AI-02 | Kesin sayılar ve güncel bağlantı durumu API'den modele gider; liste ve sayılar tek sorguda | Geçti (yerel) |
   | S19 | AZ-05, BUS-01 | Üyelik ve yetki satırları işlem boyunca paylaşımlı kilitli; karar anı `clock_timestamp()`, saniye yuvarlaması güvenli yöne | Geçti (yerel) |
-  | S20 | OPS-04 | CI aksiyonları commit SHA'sına, PostgreSQL imajları özete, Rust ve uv kesin sürüme sabitlendi | CI'da doğrulanacak |
+  | S20 | OPS-04 | CI aksiyonları commit SHA'sına, PostgreSQL imajları özete, Rust ve uv kesin sürüme sabitlendi | Geçti (CI, `ab6fa85`) |
+- **Doğrulama denetimi (27 Kasım 2026, commit `ab6fa85` üzerinde, Codex):** ilk 20 bulgunun 10'u
+  kapanmış, 10'u kısmen kapanmış bulundu; kalan kısımlar ve 11 yeni bulgu (Y01–Y11) kodda
+  doğrulandı ve düzeltildi. Aynı sürümün genel incelemesindeki komut tekrarı bulgusu da eklendi.
+  Regresyon testleri: `audit_fixes.rs` (doğrulama bölümü), `ai.rs`, `hardening.rs`,
+  `commands.rs` birim testi, `tests/sql/015_verification_fixes.sql`, `services/ai/tests`.
+  Gönderim anındaki alıcı denetimi kaldırılınca kuyruk testinin kaldığı yerelde doğrulandı.
+  Migration 0017'nin eski veri düzeltmeleri (karma oturum ailesi, bölümsüz zon olayı, bölümlü
+  bağlantı olayı, bölümü belirlenemeyen olayda durma) yerelde 0016 sonrası eski veriyle denendi.
+
+  | No | Kontrol | Düzeltme | Durum |
+  |---|---|---|---|
+  | Y01 | AZ-04, SES-04 | Alıcı kuralı tek yerde (`push_recipient_eligible`); gönderimden hemen önce yeniden uygulanır, uygun olmayan iş iptal edilir | Geçti (yerel) |
+  | Y02 | AZ-04, BUS-02 | Eski olaylar düzeltilip kısıtlar doğrulandı (bölümü belirlenemeyen olayda göç durur); tarama her kaydı ayrı ele alır | Geçti (yerel) |
+  | Y03 | BUS-02 | Deneme hakkı biten iş alınmaz; yaş olaydan ölçülür; her taramada bitmesi gereken işler kapanır; geç dağıtılan eski olay için iş yazılmaz; gönderim 20 sn ile sınırlı; token yalnızca işin sahibi olan deneme silebilir | Geçti (yerel) |
+  | Y04 | SES-04, AUT-01 | Karma eski aileler kapandı; yönetim aracı hesabı kapatınca sürüm artar ve biletler tükenir; sürüm faktörden önce denetlenir | Geçti (yerel) |
+  | Y05 | BUS-02, AZ-05 | Ortak kilit sırası (bkz. mimari), kullanıcı satırı `FOR NO KEY UPDATE`, sanal panel bölüm → komut, numara değişimi kod → kullanıcı, sahiplik devrinde parola işlem dışında; 40P01/40001 → 409 `concurrent_update` | Geçti (yerel); eşzamanlı kilitlenme yükle sınanmadı |
+  | Y06 | AUT-01, DAT-05 | Dışa aktarmada personel denetimi verinin okunduğu işlemde, üyelikler paylaşımlı kilitli; silme iptali `clock_timestamp()` | Geçti (yerel) |
+  | Y07 | AZ-04 | Paylaşılan zonda bütün bölümler yetki kayıtları kilitlendikten sonra tek karar anıyla değerlendirilir | Geçti (yerel); sınırdaki eşzamanlı durum sınanmadı |
+  | Y08 | AZ-02, AZ-05 | Üretimde giriş rolü (`session_user`) de denetlenir: süper kullanıcı, BYPASSRLS, tablo sahibine geçebilen rol, API'de yönetim rolüne geçebilen rol reddedilir | Geçti (yerel) |
+  | Y09 | AI-03 | Boş dönem modelsiz ve rezervasyonsuz; bütçe reddinde sıklık kaydı kalır | Geçti (yerel) |
+  | Y10 | AI-03 | Uygulama deftere doğrudan yazamaz (`ai_settle`); sert üst sınırlar; eksik/negatif kullanım tahminle kapanır; commit ve çağrı aynı görevde; sağlayıcının 5xx'i (529 hariç) faturalanmış olabilir sayılır | Geçti (yerel) |
+  | Y11 | AI-02 | Son bağlantı durumu sayılarla aynı sorguda | Geçti (yerel) |
+  | K01 | BUS-01 | Reddedilen komutun tekrarı ilk yanıtla aynı 409 ve kodu döner | Geçti (yerel) |
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -254,8 +277,20 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
     zorunlu değildir. Yönetim yazıları gerekçe isteyen ayrıcalıklı yordamlara taşınacak.
   - BUS-02 (ikinci denetim): push teslimi en az bir kezdir; sağlayıcı kabulü ile sonucun yazılması
     arasındaki kesintide bildirim ikinci kez gidebilir. Sağlayıcı bağdaştırıcısı `collapse_key`'i
-    kullanmalı ve gönderim zaman aşımı iş süresinden (30 sn) kısa olmalıdır; bağdaştırıcılar henüz
+    kullanmalı; çekirdek gönderimi 20 saniyeyle sınırlar (iş süresi 30 sn). Bağdaştırıcılar henüz
     yazılmadı.
+  - AZ-04, SES-04 (doğrulama denetimi, Y01): alıcı gönderimden hemen önce denetlenir; denetim ile
+    sağlayıcı çağrısı arasındaki kısa pencerede (saniyeler) düşen yetki o bildirimi durdurmaz.
+  - AZ-04 (doğrulama denetimi, Y02): veritabanı, olayın bölümünün gerçekten o zona bağlı olduğunu
+    zorlamıyor; olayı yazan üreticiler (sanal panel, ileride gateway) bunu sağlar. Gateway
+    yazılırken aynı kural testle eklenecek.
+  - AI-03 (doğrulama denetimi, Y10): harcama AI servisinin bildirdiği kullanıma dayanır (iç servis
+    güvenilir sayılır; eksik veya geçersiz alan tahmine dönüşür). Görev paniği veya süreç kesintisi
+    halinde rezervasyon kapanmaz ve 24 saat tahminiyle sayılır (temkinli taraf).
+  - RES-01, BUS-02 (doğrulama denetimi, Y05): kilit sırası kodda tek düzene getirildi, ama
+    eşzamanlı yük altında kilit bekleme, MultiXact büyümesi ve havuz doygunluğu ölçülmedi;
+    WebSocket ve bildirim merkezi okumaları da paylaşımlı kilit alır. Pilot öncesi yük testiyle
+    ölçülecek.
   - AZ-05 (ikinci denetim, S19): üyelik ve yetki satırlarının paylaşımlı kilidi okuma isteklerinde
     de alınır (satır başlığına yazar); yük artınca yalnızca yazan isteklere daraltılabilir.
   - Belge ve kod (ikinci denetim): bildirim merkezinde toplu "okundu" sınırı, sonradan görünür

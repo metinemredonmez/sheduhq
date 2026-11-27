@@ -1,5 +1,6 @@
-//! İkinci denetimin (27 Kasım 2026, Codex) bulgularına karşı regresyon testleri. Her test önce
-//! meşru işlemin çalıştığını, sonra açığın kapandığını gösterir.
+//! İkinci denetimin (27 Kasım 2026, Codex; S01–S20) ve doğrulama denetiminin (Y01–Y11) bulgularına
+//! karşı regresyon testleri. Her test önce meşru işlemin çalıştığını, sonra açığın kapandığını
+//! gösterir.
 #![cfg(feature = "db-tests")]
 
 mod common;
@@ -9,7 +10,12 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use common::*;
 use serde_json::{Value, json};
-use shedu_api::{privacy, push, simulator};
+use shedu_api::{
+    admin::{self, Operator},
+    db,
+    error::ApiError,
+    privacy, push, simulator,
+};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;
 
@@ -178,7 +184,7 @@ async fn push_retries_failures_and_recovers_lost_work(_: PgPoolOptions, connect:
         .execute(&app.admin)
         .await
         .expect("güncelleme");
-    push::sweep_pending(&app.state).await.expect("tarama");
+    push::sweep_pending(&app.state).await;
     assert_eq!(delivery(&app, first).await, ("sent".to_owned(), 2));
     let sent = app.push.messages();
     assert_eq!(sent.len(), 1);
@@ -200,7 +206,7 @@ async fn push_retries_failures_and_recovers_lost_work(_: PgPoolOptions, connect:
     .execute(&app.admin)
     .await
     .expect("güncelleme");
-    push::sweep_pending(&app.state).await.expect("tarama");
+    push::sweep_pending(&app.state).await;
     assert_eq!(delivery(&app, second).await.0, "sent");
 
     // Deneme hakkı biter: kalıcı hata, artık denenmez.
@@ -216,9 +222,9 @@ async fn push_retries_failures_and_recovers_lost_work(_: PgPoolOptions, connect:
     .execute(&app.admin)
     .await
     .expect("güncelleme");
-    push::sweep_pending(&app.state).await.expect("tarama");
+    push::sweep_pending(&app.state).await;
     assert_eq!(delivery(&app, third).await, ("failed".to_owned(), 6));
-    push::sweep_pending(&app.state).await.expect("tarama");
+    push::sweep_pending(&app.state).await;
     assert_eq!(delivery(&app, third).await, ("failed".to_owned(), 6));
     app.push.fail_next(0);
 }
@@ -670,4 +676,300 @@ async fn stale_simulated_commands_are_recovered(_: PgPoolOptions, connect: PgCon
     });
     let (status, body) = app.post_auth(&path, disarm, &owner).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Y01, Y03: kuyruktaki bildirim
+// ---------------------------------------------------------------------------------------------
+
+async fn delivery_statuses(app: &TestApp, event: i64) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT u.phone, d.status FROM push_deliveries d JOIN users u ON u.id = d.user_id
+          WHERE d.panel_event_id = $1 ORDER BY u.phone",
+    )
+    .bind(event)
+    .fetch_all(&app.admin)
+    .await
+    .expect("teslimler")
+}
+
+/// Kuyrukta bekleyen bildirim gönderilmeden önce alıcı yeniden denetlenir: arada yetkisi kalkan
+/// kişiye gitmez ve işi iptal edilir; yetkisi süren kişiye gider (Y01).
+#[sqlx::test(migrations = "../../migrations")]
+async fn queued_push_rechecks_the_recipient(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let d = demo(&app, &owner, &org).await;
+    let (member, member_id, _) = app.user(OTHER).await;
+    grant(&app, &d, &member_id, &d.home, false).await;
+    set_token(&app, &owner, "tok-owner").await;
+    set_token(&app, &member, "tok-member").await;
+    let org_id: Uuid = org.parse().expect("uuid");
+
+    // İlk denemede iki gönderim de geçici hata alır: iki iş kuyrukta bekler.
+    let event = event_id(&simulate(&app, &owner, &d, 3).await);
+    app.push.fail_next(2);
+    assert_eq!(
+        push::dispatch(&app.state, org_id, event)
+            .await
+            .expect("dağıtım"),
+        0
+    );
+    assert_eq!(
+        delivery_statuses(&app, event).await,
+        vec![
+            (PHONE.to_owned(), "pending".to_owned()),
+            (OTHER.to_owned(), "pending".to_owned())
+        ]
+    );
+
+    // Kuyrukta beklerken üyenin yetkisi kaldırılır.
+    sqlx::query("DELETE FROM access_grants WHERE user_id = $1::uuid")
+        .bind(&member_id)
+        .execute(&app.admin)
+        .await
+        .expect("yetki silme");
+    sqlx::query("UPDATE push_deliveries SET next_attempt_at = now() WHERE panel_event_id = $1")
+        .bind(event)
+        .execute(&app.admin)
+        .await
+        .expect("güncelleme");
+    push::sweep_pending(&app.state).await;
+    assert_eq!(
+        delivery_statuses(&app, event).await,
+        vec![
+            (PHONE.to_owned(), "sent".to_owned()),
+            (OTHER.to_owned(), "cancelled".to_owned())
+        ]
+    );
+    let tokens: Vec<String> = app.push.messages().into_iter().map(|m| m.token).collect();
+    assert_eq!(tokens, vec!["tok-owner".to_owned()]);
+}
+
+/// Uzun kesintiden sonra hiçbir iş yarı yolda kalmaz ve eski alarm gönderilmez: eski olayın bekleyen
+/// işi, deneme hakkı bitmiş süresi dolmuş iş kapanır; geç dağıtılan eski olay için iş yazılmaz
+/// (Y03).
+#[sqlx::test(migrations = "../../migrations")]
+async fn old_push_work_is_closed_not_sent(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let d = demo(&app, &owner, &org).await;
+    set_token(&app, &owner, "tok-owner").await;
+    let org_id: Uuid = org.parse().expect("uuid");
+    let age = |event: i64| {
+        sqlx::query(
+            "UPDATE panel_events SET received_at = now() - interval '2 hours' WHERE id = $1",
+        )
+        .bind(event)
+        .execute(&app.admin)
+    };
+
+    // Bekleyen işin olayı eskidi (iş yeni yazılmış olsa da yaş olaydan ölçülür).
+    let first = event_id(&simulate(&app, &owner, &d, 3).await);
+    app.push.fail_next(1);
+    push::dispatch(&app.state, org_id, first)
+        .await
+        .expect("dağıtım");
+    age(first).await.expect("yaşlandırma");
+    sqlx::query("UPDATE push_deliveries SET next_attempt_at = now() WHERE panel_event_id = $1")
+        .bind(first)
+        .execute(&app.admin)
+        .await
+        .expect("güncelleme");
+    push::sweep_pending(&app.state).await;
+    assert_eq!(delivery(&app, first).await, ("failed".to_owned(), 1));
+
+    // Geç dağıtılan eski olay: iş yazılmaz, olay dağıtıldı sayılır.
+    let second = event_id(&simulate(&app, &owner, &d, 4).await);
+    age(second).await.expect("yaşlandırma");
+    assert_eq!(
+        push::dispatch(&app.state, org_id, second)
+            .await
+            .expect("dağıtım"),
+        0
+    );
+    let (jobs, notified): (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM push_deliveries WHERE panel_event_id = $1),
+                (SELECT notified_at IS NOT NULL FROM panel_events WHERE id = $1)",
+    )
+    .bind(second)
+    .fetch_one(&app.admin)
+    .await
+    .expect("sayım");
+    assert_eq!((jobs, notified), (0, true));
+
+    // Deneme hakkı bitmiş, süresi dolmuş alınmış iş yeniden alınmaz; tarama onu kapatır.
+    let third = event_id(&simulate(&app, &owner, &d, 3).await);
+    app.push.fail_next(1);
+    push::dispatch(&app.state, org_id, third)
+        .await
+        .expect("dağıtım");
+    sqlx::query(
+        "UPDATE push_deliveries SET status = 'sending', attempts = 6,
+                lease_until = now() - interval '1 second'
+          WHERE panel_event_id = $1",
+    )
+    .bind(third)
+    .execute(&app.admin)
+    .await
+    .expect("güncelleme");
+    push::sweep_pending(&app.state).await;
+    assert_eq!(delivery(&app, third).await, ("failed".to_owned(), 6));
+    assert!(
+        app.push.messages().is_empty(),
+        "eski bildirim gönderilmemeli"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Y04: kimlik kanıtının nesli
+// ---------------------------------------------------------------------------------------------
+
+/// Yönetici hesabı kapatıp yeniden açarsa kapatmadan önce açılmış ikinci adım bileti oturum
+/// açamaz; yeni giriş çalışır (Y04).
+#[sqlx::test(migrations = "../../migrations")]
+async fn admin_disable_voids_pending_second_step(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect.clone()).await;
+    let (access, _, _) = app.user(PHONE).await;
+    let secret = app.enable_mfa(&access).await;
+    let (_, challenge) = app.login(PHONE, PASSWORD).await;
+    let stale = s(&challenge, "mfa_token");
+
+    let pool = db::pool_options(Some(admin::ADMIN_ROLE.into()))
+        .max_connections(1)
+        .connect_with(connect)
+        .await
+        .expect("yönetici bağlantısı");
+    let op = Operator::new("pilot-ops", "Hesap incelemesi, kayıt 7").expect("işlemci");
+    admin::set_user_active(&pool, &op, PHONE, false)
+        .await
+        .expect("kapatma");
+    admin::set_user_active(&pool, &op, PHONE, true)
+        .await
+        .expect("açma");
+
+    let (status, _) = app
+        .post(
+            "/v1/auth/mfa/verify",
+            json!({ "mfa_token": stale, "code": totp_code(&secret, 1) }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "eski bilet geçersiz olmalı"
+    );
+
+    let (_, challenge) = app.login(PHONE, PASSWORD).await;
+    let (status, body) = app
+        .post(
+            "/v1/auth/mfa/verify",
+            json!({ "mfa_token": s(&challenge, "mfa_token"), "code": totp_code(&secret, 1) }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Bilet açıldıktan sonra kimlik bilgisi sürümü değiştiyse faktör denetlenmeden reddedilir: aynı
+/// TOTP adımı yeni biletle hâlâ kullanılabilir (boşa harcanmaz) (Y04).
+#[sqlx::test(migrations = "../../migrations")]
+async fn version_mismatch_does_not_spend_the_factor(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (access, user_id, _) = app.user(PHONE).await;
+    let secret = app.enable_mfa(&access).await;
+    let (_, challenge) = app.login(PHONE, PASSWORD).await;
+    let stale = s(&challenge, "mfa_token");
+    // Yarışın sonucu: sürüm arttı ama bilet henüz tüketilmedi.
+    sqlx::query("UPDATE users SET credential_version = credential_version + 1 WHERE id = $1::uuid")
+        .bind(&user_id)
+        .execute(&app.admin)
+        .await
+        .expect("sürüm");
+    let code = totp_code(&secret, 1);
+    let (status, _) = app
+        .post(
+            "/v1/auth/mfa/verify",
+            json!({ "mfa_token": stale, "code": code }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (_, challenge) = app.login(PHONE, PASSWORD).await;
+    let (status, body) = app
+        .post(
+            "/v1/auth/mfa/verify",
+            json!({ "mfa_token": s(&challenge, "mfa_token"), "code": code }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "aynı TOTP adımı harcanmamış olmalı: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Y05: eşzamanlılık hatası
+// ---------------------------------------------------------------------------------------------
+
+/// Kilitlenme ve serileştirme çakışması genel 500 değil, yeniden denenebilir 409 olur (Y05).
+#[sqlx::test(migrations = "../../migrations")]
+async fn deadlocks_become_retryable_conflicts(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    for (code, sql) in [
+        (
+            "40P01",
+            "DO $$ BEGIN RAISE EXCEPTION 'çakışma' USING ERRCODE = '40P01'; END $$",
+        ),
+        (
+            "40001",
+            "DO $$ BEGIN RAISE EXCEPTION 'çakışma' USING ERRCODE = '40001'; END $$",
+        ),
+    ] {
+        let error = sqlx::query(sql)
+            .execute(&app.pool)
+            .await
+            .expect_err("hata bekleniyordu");
+        assert!(
+            matches!(
+                ApiError::from(error),
+                ApiError::Conflict("concurrent_update")
+            ),
+            "{code}"
+        );
+    }
+    let error = sqlx::query("DO $$ BEGIN RAISE EXCEPTION 'başka' USING ERRCODE = '22023'; END $$")
+        .execute(&app.pool)
+        .await
+        .expect_err("hata bekleniyordu");
+    assert!(matches!(ApiError::from(error), ApiError::Internal));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Komut tekrarı
+// ---------------------------------------------------------------------------------------------
+
+/// İş kuralıyla reddedilen komutun aynı anahtarla tekrarı ilk yanıtla aynı sonucu verir (409 ve
+/// aynı kod): ağ kesintisinden sonra yeniden gönderen istemci sonucu farklı yorumlamaz.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rejected_command_replays_the_same_conflict(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let d = demo(&app, &owner, &org).await;
+    let path = format!("/v1/organizations/{}/panels/{}/commands", d.org, d.panel);
+    // Bölüm zaten kapalı: kapatma komutu reddedilir.
+    let request = json!({
+        "partition_id": d.home, "kind": "disarm",
+        "idempotency_key": format!("test-{}", Uuid::new_v4().simple()),
+    });
+    let first = app.post_auth(&path, request.clone(), &owner).await;
+    let again = app.post_auth(&path, request, &owner).await;
+    assert_eq!(first.0, StatusCode::CONFLICT, "{}", first.1);
+    assert_eq!((again.0, &again.1), (first.0, &first.1));
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM commands WHERE status = 'rejected'")
+            .fetch_one(&app.admin)
+            .await
+            .expect("sayım");
+    assert_eq!(count, 1, "tekrar yeni komut yazmaz");
 }

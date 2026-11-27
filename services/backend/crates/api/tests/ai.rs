@@ -36,6 +36,8 @@ enum Mode {
     Crash,
     /// Yanıtı geciktirir (eşzamanlı rezervasyon testi).
     Slow,
+    /// Başarılı yanıt ama kullanım alanları eksik (iç servis sapması).
+    NoUsage,
 }
 
 /// (Authorization başlığı, istek gövdesi)
@@ -114,6 +116,16 @@ async fn fake_summary(
         )
             .into_response(),
         Mode::Crash => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response(),
+        Mode::NoUsage => (
+            StatusCode::OK,
+            Json(json!({
+                "summary": "Bir alarm oldu.",
+                "highlights": [],
+                "generated": true,
+                "model": "claude-opus-5-5"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -324,6 +336,18 @@ async fn summary_needs_flag_service_and_view_permission(
     );
     assert!(fake.requests().is_empty(), "reddedilen istek AI'ya gitmez");
 
+    // Dönemde olay yok: sabit metin, model çağrılmaz, bütçeden ayrılmaz (Y09).
+    let (status, body) = app.post_auth(&path, json!({ "hours": 6 }), &owner).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ai_generated"], false);
+    assert_eq!(body["summary"], "Bu dönemde panelde kayıtlı olay yok.");
+    assert!(fake.requests().is_empty(), "boş dönem AI'ya gitmez");
+    assert!(
+        ledger(&app, &org).await.is_empty(),
+        "boş dönem bütçeden ayırmaz"
+    );
+
+    insert_event(&app, &org, &panel, Some(1), None, "armed", None, 10).await;
     let (status, body) = app.post_auth(&path, json!({ "hours": 6 }), &owner).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(fake.requests().len(), 1);
@@ -507,6 +531,7 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
         .execute(&app.admin)
         .await
         .expect("olayları sil");
+    insert_event(&app, &org, &panel, Some(1), None, "armed", None, 5).await;
 
     // Model reddi ve kesinti sabit kodlara dönüşür, denetime yazılır.
     fake.set(Mode::Refuse);
@@ -573,6 +598,17 @@ async fn summary_failures_budget_and_truncation(_: PgPoolOptions, connect: PgCon
     use_ai(&mut app, "http://127.0.0.1:9");
     let (other, _, other_org) = app.user(MEMBER).await;
     let (other_panel, _) = demo(&app, &other, &other_org).await;
+    insert_event(
+        &app,
+        &other_org,
+        &other_panel,
+        Some(1),
+        None,
+        "armed",
+        None,
+        5,
+    )
+    .await;
     let (status, body) = app
         .post_auth(&summary_path(&other_org, &other_panel), json!({}), &other)
         .await;
@@ -604,6 +640,7 @@ async fn concurrent_calls_cannot_share_the_same_budget(
     let (owner, _, org) = app.user(PHONE).await;
     let (panel, _) = demo(&app, &owner, &org).await;
     let path = summary_path(&org, &panel);
+    insert_event(&app, &org, &panel, Some(1), None, "armed", None, 5).await;
     fake.set(Mode::Slow);
 
     let (first, second) = tokio::join!(
@@ -659,6 +696,17 @@ async fn spending_limits_stop_calls_before_they_are_made(
     // 24 saatten eski harcama sayılmaz; ama bütün sistemin sınırı doluysa yine çağrılmaz.
     let (other, _, other_org) = app.user(MEMBER).await;
     let (other_panel, _) = demo(&app, &other, &other_org).await;
+    insert_event(
+        &app,
+        &other_org,
+        &other_panel,
+        Some(1),
+        None,
+        "armed",
+        None,
+        5,
+    )
+    .await;
     let other_path = summary_path(&other_org, &other_panel);
     assert_eq!(
         app.post_auth(&other_path, json!({}), &other).await.0,
@@ -676,4 +724,97 @@ async fn spending_limits_stop_calls_before_they_are_made(
         StatusCode::TOO_MANY_REQUESTS
     );
     assert_eq!(fake.requests().len(), 1);
+}
+
+/// Model gerektirmeyen özet bütçeye takılmaz: bakiye tahminden düşük olsa da boş dönem sabit
+/// metinle ve hâlâ süren kopuklukla yanıtlanır, model çağrılmaz, rezervasyon yazılmaz. Bütçeye
+/// takılan istek ise sıklık sayacını korur: sürekli bütçe retleri ağır sorguyu sıklık kapısında
+/// durdurur (Y09).
+#[sqlx::test(migrations = "../../migrations")]
+async fn empty_periods_skip_the_model_and_budget_rejections_still_count(
+    _: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let mut app = app(connect).await;
+    let (url, fake) = start_fake().await;
+    // Sistem bütçesi bir tahmine yetmez (ama boş değil).
+    use_ai_with(
+        &mut app,
+        AiClient::new(&url, TOKEN)
+            .expect("istemci")
+            .with_global_budget(100_000),
+    );
+    enable_flag(&app).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let (panel, _) = demo(&app, &owner, &org).await;
+    let path = summary_path(&org, &panel);
+
+    // Dönemden önce kopmuş ve hâlâ kopuk panel; dönemde olay yok.
+    insert_event(
+        &app,
+        &org,
+        &panel,
+        None,
+        None,
+        "disconnected",
+        None,
+        60 * 30,
+    )
+    .await;
+    let (status, body) = app.post_auth(&path, json!({ "hours": 24 }), &owner).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["summary"],
+        "Bu dönemde panelde kayıtlı olay yok. Panelin bilinen son bağlantı durumu: kopuk."
+    );
+    assert_eq!(body["ai_generated"], false);
+    assert_eq!(body["needs_attention"], true);
+    assert!(fake.requests().is_empty());
+    assert!(ledger(&app, &org).await.is_empty());
+
+    // Olay var, tahmin bütçeye sığmaz: 429, model çağrılmaz; ama her istek sıklık sayacına yazılır.
+    insert_event(&app, &org, &panel, Some(1), None, "armed", None, 5).await;
+    let hits = || async {
+        let (hits,): (i64,) =
+            sqlx::query_as("SELECT coalesce(sum(hits), 0)::bigint FROM rate_limit_buckets")
+                .fetch_one(&app.admin)
+                .await
+                .expect("sayaç");
+        hits
+    };
+    let before = hits().await;
+    for _ in 0..3 {
+        let (status, _) = app.post_auth(&path, json!({}), &owner).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(
+        hits().await - before,
+        6,
+        "her ret kullanıcı ve organizasyon sayacına yazılmalı"
+    );
+    assert!(fake.requests().is_empty());
+    assert_eq!(open_reservations(&app, &org).await, 0);
+}
+
+/// Başarılı yanıtta kullanım alanı eksikse harcama sıfır sayılmaz: rezervasyon en kötü durum
+/// tahminiyle `unknown` olarak kapanır (Y10).
+#[sqlx::test(migrations = "../../migrations")]
+async fn missing_usage_is_charged_at_the_estimate(_: PgPoolOptions, connect: PgConnectOptions) {
+    let mut app = app(connect).await;
+    let (url, fake) = start_fake().await;
+    use_ai(&mut app, &url);
+    enable_flag(&app).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let (panel, _) = demo(&app, &owner, &org).await;
+    insert_event(&app, &org, &panel, Some(1), None, "armed", None, 5).await;
+    fake.set(Mode::NoUsage);
+    let (status, body) = app
+        .post_auth(&summary_path(&org, &panel), json!({}), &owner)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let spent = ledger(&app, &org).await;
+    assert_eq!(spent.len(), 1);
+    assert_eq!(spent[0].0, "unknown");
+    assert!(spent[0].1 >= 2 * 204_800, "tahmin: {}", spent[0].1);
+    assert_eq!(open_reservations(&app, &org).await, 0);
 }

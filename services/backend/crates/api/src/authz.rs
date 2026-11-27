@@ -157,11 +157,68 @@ type GrantRow = (
 
 /// Bir paneldeki yetkiler. `partition_id` verilirse yalnızca o bölüme (veya panelin bütün
 /// bölümlerine) ait yetki kayıtları sayılır; verilmezse paneldeki herhangi bir kayıt sayılır.
+/// Karar anı yetki kayıtları kilitlendikten sonra alınır.
 pub async fn permissions(
     conn: &mut PgConnection,
     ctx: &OrgContext,
     panel_id: Uuid,
     partition_id: Option<Uuid>,
+) -> ApiResult<Permissions> {
+    evaluate(conn, ctx, panel_id, partition_id, None).await
+}
+
+/// Birden çok bölümü aynı karar anında değerlendirmek için: önce `lock_grants` ile bütün ilgili
+/// yetki kayıtları kilitlenir, sonra `decision_moment` ile tek bir an alınır ve her bölüm bu anla
+/// değerlendirilir (Y07). Ayrı ayrı anlardan geçen denetimler, ortak bir açık anı olmayan
+/// pencerelerle işlemi kabul edebilirdi.
+pub async fn permissions_at(
+    conn: &mut PgConnection,
+    ctx: &OrgContext,
+    panel_id: Uuid,
+    partition_id: Option<Uuid>,
+    moment: LocalMoment,
+) -> ApiResult<Permissions> {
+    evaluate(conn, ctx, panel_id, partition_id, Some(moment)).await
+}
+
+/// Kişinin bu paneldeki, verilen bölümlere (veya panelin bütününe) ait yetki kayıtlarını işlem
+/// sonuna kadar paylaşımlı kilitler. Satırlar her yolda aynı sırayla (kimlik) kilitlenir.
+pub async fn lock_grants(
+    conn: &mut PgConnection,
+    ctx: &OrgContext,
+    panel_id: Uuid,
+    partitions: &[Uuid],
+) -> ApiResult<()> {
+    if ctx.role.is_manager() {
+        return Ok(());
+    }
+    sqlx::query(
+        "SELECT id FROM access_grants
+          WHERE user_id = $1 AND panel_id = $2 AND organization_id = $3
+            AND (partition_id IS NULL OR partition_id = ANY($4))
+          ORDER BY id
+            FOR SHARE",
+    )
+    .bind(ctx.user.user_id)
+    .bind(panel_id)
+    .bind(ctx.organization_id)
+    .bind(partitions)
+    .fetch_all(conn)
+    .await?;
+    Ok(())
+}
+
+/// Organizasyonun saat dilimindeki karar anı (bkz. `permissions_at`).
+pub async fn decision_moment(conn: &mut PgConnection) -> ApiResult<LocalMoment> {
+    local_moment(conn).await
+}
+
+async fn evaluate(
+    conn: &mut PgConnection,
+    ctx: &OrgContext,
+    panel_id: Uuid,
+    partition_id: Option<Uuid>,
+    moment: Option<LocalMoment>,
 ) -> ApiResult<Permissions> {
     // Panel bu organizasyona ait değilse hiçbir yetki yok. RLS de bunu sağlar; açık filtre,
     // veritabanı rolü yanlış ayarlansa bile kiracı sınırını korur (ikinci bariyer).
@@ -190,6 +247,7 @@ pub async fn permissions(
            FROM access_grants
           WHERE user_id = $1 AND panel_id = $2 AND organization_id = $4
             AND ($3::uuid IS NULL OR partition_id IS NULL OR partition_id = $3)
+          ORDER BY id
             FOR SHARE",
     )
     .bind(ctx.user.user_id)
@@ -206,7 +264,10 @@ pub async fn permissions(
         });
     }
 
-    let moment = local_moment(conn).await?;
+    let moment = match moment {
+        Some(moment) => moment,
+        None => local_moment(conn).await?,
+    };
     let grant_ids: Vec<Uuid> = grants.iter().map(|g| g.0).collect();
     let windows: Vec<(Uuid, i16, i16, i16)> = sqlx::query_as(
         "SELECT grant_id, day, start_minute, end_minute FROM access_windows WHERE grant_id = ANY($1)",

@@ -461,8 +461,9 @@ pub async fn add_panel(
 // ---------------------------------------------------------------------------------------------
 
 /// Kullanıcıyı kapatır (`active = false`) veya yeniden açar. Kapatma bütün oturumları ve push
-/// token'larını hemen iptal eder (SES-04); kişi giriş yapamaz, bildirim almaz. Silme bekleyen
-/// veya silinmiş hesaba uygulanmaz.
+/// token'larını hemen iptal eder, kimlik bilgisi sürümünü artırıp bekleyen ikinci adım biletlerini
+/// geçersiz kılar (SES-04): kişi giriş yapamaz, bildirim almaz, hesap yeniden açılınca kapatmadan
+/// önceki bilet kullanılamaz (Y04). Silme bekleyen veya silinmiş hesaba uygulanmaz.
 pub async fn set_user_active(
     pool: &PgPool,
     operator: &Operator,
@@ -472,7 +473,7 @@ pub async fn set_user_active(
     let phone = normalize_phone(phone).ok_or(AdminError::Invalid("telefon"))?;
     let mut tx = pool.begin().await?;
     let user: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, status FROM users WHERE phone = $1 FOR UPDATE")
+        sqlx::query_as("SELECT id, status FROM users WHERE phone = $1 FOR NO KEY UPDATE")
             .bind(&phone)
             .fetch_optional(&mut *tx)
             .await?;
@@ -496,6 +497,7 @@ pub async fn set_user_active(
         .await?;
     let mut revoked = 0;
     if !active {
+        crate::auth::mfa::bump_credentials(&mut tx, user_id).await?;
         revoked = crate::auth::handlers::revoke_user_sessions(&mut tx, user_id, None).await?;
     }
     audit::record(
