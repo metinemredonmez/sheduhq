@@ -1,0 +1,13 @@
+[package]
+name = "shedu-gateway"
+description = "Shedu panel gateway: panellerle bağlantı ve komut iletimi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

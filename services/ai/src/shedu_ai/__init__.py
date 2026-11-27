@@ -1,0 +1,1 @@
+"""Shedu AI servisi."""

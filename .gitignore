@@ -1,0 +1,51 @@
+# --- Sırlar: asla commit'lenmez (KEY-02) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*.p12
+*.mobileprovision
+*.keystore
+*.jks
+google-services.json
+GoogleService-Info.plist
+
+# --- İşletim sistemi / editör ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# --- Rust ---
+target/
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Node / Expo ---
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+npm-debug.*
+yarn-error.*
+*.tsbuildinfo
+
+# --- Native derleme çıktıları (Expo prebuild ile yeniden üretilir) ---
+apps/mobile/ios/
+apps/mobile/android/
+
+# --- Loglar ---
+*.log
+
+# --- Yerel MQTT parola dosyası ---
+infra/mosquitto/passwd
