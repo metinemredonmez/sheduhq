@@ -9,7 +9,8 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
 
 | Alan | Kontrol | Shedu'da nasıl | Durum |
 |---|---|---|---|
-| Kimlik | AUT-01 | Admin panelinde MFA zorunlu | Doğrulanacak |
+| Kimlik | AUT-01 | Personel (işletme/izleme merkezinde sahip, yönetici, operatör) için MFA zorunlu; yalnızca parolalı oturuma ayrıcalık yok | Doğrulanacak |
+| Kimlik | AUT-04, KEY-04 | Faktör ekleme/kaldırmada yeniden doğrulama; tek kullanımlık kurtarma kodu; TOTP sırrı şifreli | Doğrulanacak |
 | Kimlik | AUT-02, RES-01 | Giriş ve SMS kodu uç noktalarında çok boyutlu hız sınırı ve kota | Doğrulanacak |
 | Kimlik | AUT-03 | Sıfırlama ve davet kodları tek kullanımlık, kısa ömürlü | Doğrulanacak |
 | Parola | PWD-01, PWD-03, PWD-04 | Minimum uzunluk, sızmış parola kontrolü, argon2id | Doğrulanacak |
@@ -75,6 +76,17 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   üyeliğine dokunamaz. Operatör ev organizasyonunda olamaz; bütün panelleri görür ama yetki kaydı
   olmadan kuramaz, kimseyi yönetemez, alarm bildirimini alır. Parola doğrulaması ve operatör tür
   kontrolü bozulduğunda testlerin kaldığı yerelde doğrulandı.
+- **İki adımlı doğrulama (AUT-01, AUT-04, KEY-04, AUT-02, LOG-01):**
+  `services/backend/crates/api/tests/mfa.rs` (3 entegrasyon testi), `tests/sql/005_mfa.sql` ve
+  `crypto.rs`/`totp.rs` birim testleri (RFC 4226/6238 test vektörleri; bozulmuş şifreli metin,
+  yanlış kullanıcı, yanlış anahtar, yanlış sürüm reddi): kurulum yanlış parolayla başlamaz; sır
+  veritabanında düz durmaz; faktörü açık kullanıcı parolayla oturum alamaz; kullanılmış kod,
+  kullanılmış kurtarma kodu ve kullanılmış bilet reddedilir; 5 yanlış denemede bilet tükenir;
+  kişi başına deneme sınırı 429 verir; işletme personeli yalnızca parolalı oturumla (MFA'dan önce
+  açılmış oturum dahil) organizasyona erişemez ve alarm push'u o oturumun cihazına gitmez; kapatma
+  parola ve kod ister, kapatınca personel erişimi kalkar; açma, kapatma ve kurtarma koduyla giriş
+  bildirilir. Zorunluluk, tekrar oynatma koruması ve push kuralı tek tek bozulduğunda ilgili
+  testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -86,6 +98,13 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
     yazılırken önce sahipliğin devri veya organizasyonun kapatılması istenecek.
   - AZ-01: izleme merkezinin müşteri organizasyonlarına erişimi (organizasyonlar arası operatör)
     yok; izleme merkezi modeli netleşince ayrı politika olarak tasarlanacak.
+  - AUT-01/PKY: passkey (oltalamaya dayanıklı faktör) yok; yalnızca TOTP. Shedu'nun kendi
+    platform yöneticileri (admin paneli) henüz tanımlı değil; tanımlanınca aynı oturum kuralı
+    zorunlu olacak.
+  - KEY-04: veri anahtarı tek sürüm; anahtar değişiminde eski kayıtları yeniden şifreleyen araç
+    yok (bilinmeyen sürüm güvenli tarafta reddedilir).
+  - AUT-04: kullanıcı hem doğrulayıcıyı hem kurtarma kodlarını kaybederse destek eliyle kurtarma
+    akışı yok; yazılırken ayrı yetki, denetim kaydı ve kullanıcı bildirimiyle yapılacak.
 
 ## Değişmez kurallar
 

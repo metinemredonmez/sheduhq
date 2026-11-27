@@ -146,3 +146,16 @@ pub const REAUTH_PER_USER: Budget = Budget {
     window_secs: 15 * 60,
     limit: 5,
 };
+
+/// İkinci faktör kodu denemeleri: kullanıcı başına ve kaynak başına (bilet başına sınır ayrıca
+/// veritabanında: 5).
+pub const MFA_PER_USER: Budget = Budget {
+    scope: "mfa:user",
+    window_secs: 15 * 60,
+    limit: 10,
+};
+pub const MFA_PER_IP: Budget = Budget {
+    scope: "mfa:ip",
+    window_secs: 15 * 60,
+    limit: 50,
+};

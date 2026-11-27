@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::{
     AuthUser,
     codes::{self, Purpose},
-    password,
+    mfa, password,
     rate_limit::{self, Budget},
     tokens::{self, ACCESS_TTL_SECS, REFRESH_TTL_DAYS},
 };
@@ -44,8 +44,8 @@ pub struct StartRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceInfo {
-    platform: String,
-    name: Option<String>,
+    pub(super) platform: String,
+    pub(super) name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +88,14 @@ pub struct TokenResponse {
     expires_in: i64,
     refresh_token: String,
     session_id: Uuid,
+}
+
+/// Giriş yanıtı: ya oturum ya da ikinci adım bileti.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum LoginResponse {
+    Tokens(TokenResponse),
+    MfaRequired(mfa::Challenge),
 }
 
 #[derive(Serialize)]
@@ -142,7 +150,7 @@ fn normalize_email(raw: &str) -> Option<String> {
     valid.then_some(value)
 }
 
-fn validate_device(device: &DeviceInfo) -> ApiResult<()> {
+pub(super) fn validate_device(device: &DeviceInfo) -> ApiResult<()> {
     if !matches!(device.platform.as_str(), "ios" | "android" | "web") {
         return Err(ApiError::BadRequest("invalid_device"));
     }
@@ -156,7 +164,7 @@ fn validate_device(device: &DeviceInfo) -> ApiResult<()> {
     Ok(())
 }
 
-fn ip_of(addr: &SocketAddr) -> String {
+pub(super) fn ip_of(addr: &SocketAddr) -> String {
     // Ters vekil arkasında çalışırken güvenilir vekil yapılandırılana kadar X-Forwarded-For
     // dikkate alınmaz (NET-03).
     addr.ip().to_string()
@@ -283,7 +291,7 @@ async fn consume_code(
 
 /// Yeni oturum: yeni cihaz kaydı ve yeni bir refresh ailesi. Girişte her zaman yeni aile
 /// oluşturulur; eski oturum kimliği yeni yetkiyle birleşmez (SES-02).
-async fn create_session(
+pub(super) async fn create_session(
     conn: &mut PgConnection,
     user_id: Uuid,
     device: &DeviceInfo,
@@ -324,7 +332,7 @@ async fn insert_refresh(
     Ok(token)
 }
 
-fn token_response(
+pub(super) fn token_response(
     state: &AppState,
     user_id: Uuid,
     session_id: Uuid,
@@ -488,7 +496,7 @@ pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<LoginRequest>,
-) -> ApiResult<Json<TokenResponse>> {
+) -> ApiResult<Json<LoginResponse>> {
     validate_device(&request.device)?;
     let identifier = if request.identifier.trim_start().starts_with('+') {
         normalize_phone(&request.identifier)
@@ -547,6 +555,11 @@ pub async fn login(
         }
     };
 
+    // İkinci faktör açıksa oturum açılmaz; kısa ömürlü bir biletle ikinci adım istenir (AUT-01).
+    if let Some(challenge) = mfa::start_challenge(&mut conn, user_id, &request.device).await? {
+        return Ok(Json(LoginResponse::MfaRequired(challenge)));
+    }
+
     let mut tx = conn.begin().await?;
     let (session_id, refresh_token) = create_session(&mut tx, user_id, &request.device).await?;
     audit::record(
@@ -564,12 +577,12 @@ pub async fn login(
     .await?;
     tx.commit().await?;
 
-    Ok(Json(token_response(
+    Ok(Json(LoginResponse::Tokens(token_response(
         &state,
         user_id,
         session_id,
         refresh_token,
-    )?))
+    )?)))
 }
 
 /// Refresh token'ı tek kullanımlık olarak değiştirir. Daha önce kullanılmış bir token yeniden

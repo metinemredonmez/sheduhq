@@ -28,6 +28,10 @@ pub struct Config {
     pub jwt_secret: Vec<u8>,
     /// SMS kodları ve deneme sayacı anahtarları için HMAC anahtarı.
     pub hmac_secret: Vec<u8>,
+    /// Veritabanındaki faktör sırlarını (TOTP) şifreleyen veri anahtarı (KEY-04).
+    pub data_key: Vec<u8>,
+    /// Veri anahtarının sürümü; şifreli kayıtla birlikte saklanır.
+    pub data_key_version: i16,
     /// WebSocket için izinli tarayıcı origin'leri (virgülle ayrılmış, ör. `https://app.example`).
     pub allowed_origins: Vec<String>,
 }
@@ -58,9 +62,10 @@ impl fmt::Display for ConfigError {
             Self::Missing(name) => write!(f, "{name} tanımlı değil"),
             Self::Invalid(name) => write!(f, "{name} geçersiz"),
             Self::SecretTooShort(name) => write!(f, "{name} en az {MIN_SECRET_LEN} bayt olmalı"),
-            Self::SecretsMustDiffer => {
-                write!(f, "SHEDU_JWT_SECRET ve SHEDU_HMAC_SECRET farklı olmalı")
-            }
+            Self::SecretsMustDiffer => write!(
+                f,
+                "SHEDU_JWT_SECRET, SHEDU_HMAC_SECRET ve SHEDU_DATA_KEY birbirinden farklı olmalı"
+            ),
             Self::DatabaseTlsRequired => write!(
                 f,
                 "üretimde DATABASE_URL sslmode=verify-full (veya require) içermeli"
@@ -101,9 +106,18 @@ impl Config {
 
         let jwt_secret = secret(&get, "SHEDU_JWT_SECRET")?;
         let hmac_secret = secret(&get, "SHEDU_HMAC_SECRET")?;
-        if jwt_secret == hmac_secret {
+        let data_key = secret(&get, "SHEDU_DATA_KEY")?;
+        if jwt_secret == hmac_secret || data_key == jwt_secret || data_key == hmac_secret {
             return Err(ConfigError::SecretsMustDiffer);
         }
+        let data_key_version = match get("SHEDU_DATA_KEY_VERSION") {
+            None => 1,
+            Some(value) => value
+                .parse::<i16>()
+                .ok()
+                .filter(|v| *v > 0)
+                .ok_or(ConfigError::Invalid("SHEDU_DATA_KEY_VERSION"))?,
+        };
 
         let allowed_origins = get("SHEDU_ALLOWED_ORIGINS")
             .unwrap_or_default()
@@ -120,6 +134,8 @@ impl Config {
             database_role,
             jwt_secret,
             hmac_secret,
+            data_key,
+            data_key_version,
             allowed_origins,
         })
     }
@@ -152,6 +168,7 @@ mod tests {
 
     const JWT: &str = "jwt-secret-0123456789abcdefghijklmnop";
     const HMAC: &str = "hmac-secret-0123456789abcdefghijklmno";
+    const DATA: &str = "data-key-0123456789abcdefghijklmnopqr";
 
     #[test]
     fn development_config_is_accepted() {
@@ -160,6 +177,7 @@ mod tests {
             ("DATABASE_URL", "postgres://localhost/shedu"),
             ("SHEDU_JWT_SECRET", JWT),
             ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
         ]))
         .expect("geçerli yapılandırma");
         assert_eq!(config.environment, Environment::Development);
@@ -172,6 +190,7 @@ mod tests {
             ("DATABASE_URL", "postgres://db/shedu"),
             ("SHEDU_JWT_SECRET", JWT),
             ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
         ]));
         assert_eq!(result.err(), Some(ConfigError::DatabaseTlsRequired));
     }
@@ -183,6 +202,7 @@ mod tests {
             ("DATABASE_URL", "postgres://localhost/shedu"),
             ("SHEDU_JWT_SECRET", "kisa"),
             ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
         ]));
         assert_eq!(
             short.err(),
@@ -194,8 +214,26 @@ mod tests {
             ("DATABASE_URL", "postgres://localhost/shedu"),
             ("SHEDU_JWT_SECRET", JWT),
             ("SHEDU_HMAC_SECRET", JWT),
+            ("SHEDU_DATA_KEY", DATA),
         ]));
         assert_eq!(shared.err(), Some(ConfigError::SecretsMustDiffer));
+
+        let shared_data = Config::from_lookup(lookup(&[
+            ("SHEDU_ENV", "development"),
+            ("DATABASE_URL", "postgres://localhost/shedu"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", HMAC),
+        ]));
+        assert_eq!(shared_data.err(), Some(ConfigError::SecretsMustDiffer));
+
+        let missing = Config::from_lookup(lookup(&[
+            ("SHEDU_ENV", "development"),
+            ("DATABASE_URL", "postgres://localhost/shedu"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+        ]));
+        assert_eq!(missing.err(), Some(ConfigError::Missing("SHEDU_DATA_KEY")));
     }
 
     #[test]
@@ -205,9 +243,15 @@ mod tests {
             ("DATABASE_URL", "postgres://user:parola@localhost/shedu"),
             ("SHEDU_JWT_SECRET", JWT),
             ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
         ]))
         .expect("geçerli yapılandırma");
         let debug = format!("{config:?}");
-        assert!(!debug.contains(JWT) && !debug.contains(HMAC) && !debug.contains("parola"));
+        assert!(
+            !debug.contains(JWT)
+                && !debug.contains(HMAC)
+                && !debug.contains(DATA)
+                && !debug.contains("parola")
+        );
     }
 }

@@ -225,10 +225,17 @@ pub async fn dispatch(
         "SELECT DISTINCT d.id, d.user_id, d.push_token, d.platform
            FROM user_devices d
            JOIN memberships m ON m.user_id = d.user_id AND m.organization_id = $1
+           JOIN organizations o ON o.id = m.organization_id
            JOIN users u ON u.id = d.user_id AND u.status = 'active'
           WHERE d.push_token IS NOT NULL
             AND EXISTS (SELECT 1 FROM refresh_tokens r
-                         WHERE r.device_id = d.id AND r.revoked_at IS NULL AND r.expires_at > now())
+                         WHERE r.device_id = d.id AND r.revoked_at IS NULL AND r.expires_at > now()
+                           -- Personel cihazı yalnızca ikinci adımı tamamlanmış oturumla (AUT-01;
+                           -- kural authz::mfa_required ile aynı).
+                           AND (o.kind NOT IN ('business', 'monitoring_center')
+                                OR m.role NOT IN ('owner', 'admin', 'operator')
+                                OR EXISTS (SELECT 1 FROM session_factors f
+                                            WHERE f.family_id = r.family_id AND f.user_id = d.user_id)))
             AND (m.role IN ('owner', 'admin', 'operator') OR EXISTS (
                    SELECT 1 FROM access_grants g
                     WHERE g.user_id = d.user_id AND g.panel_id = $2 AND g.can_view_events

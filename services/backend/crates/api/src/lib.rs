@@ -5,6 +5,7 @@ pub mod auth;
 pub mod authz;
 pub mod commands;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod devices;
 pub mod error;
@@ -43,6 +44,8 @@ pub struct AppState {
     pub db: PgPool,
     pub tokens: Arc<TokenKeys>,
     pub hmac_secret: Arc<[u8]>,
+    /// TOTP sırlarını şifreleyen anahtar (KEY-04).
+    pub totp_key: Arc<crypto::DataKey>,
     pub sms: Arc<dyn SmsSender>,
     /// Bilinmeyen kullanıcıyla girişte doğrulanan sahte hash; yanıt süresi hesabın varlığını
     /// belli etmez.
@@ -66,9 +69,12 @@ impl AppState {
         db: PgPool,
         jwt_secret: &[u8],
         hmac_secret: &[u8],
+        data_key: (&[u8], i16),
         sms: Arc<dyn SmsSender>,
     ) -> Result<Self, StateError> {
         let tokens = TokenKeys::new(jwt_secret).map_err(|_| StateError)?;
+        let totp_key = crypto::DataKey::derive(data_key.0, data_key.1, "totp-secret")
+            .map_err(|_| StateError)?;
         let mut random = [0u8; 32];
         getrandom::fill(&mut random).map_err(|_| StateError)?;
         let dummy_password: String = random.iter().map(|b| format!("{b:02x}")).collect();
@@ -77,6 +83,7 @@ impl AppState {
             db,
             tokens: Arc::new(tokens),
             hmac_secret: Arc::from(hmac_secret),
+            totp_key: Arc::new(totp_key),
             sms,
             dummy_hash: Arc::from(dummy_hash),
             events: events::channel(),

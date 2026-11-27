@@ -11,7 +11,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use shedu_api::{AppState, db, push::RecordingPush, sms::RecordingSms};
+use shedu_api::{AppState, auth::totp, db, push::RecordingPush, sms::RecordingSms};
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -54,6 +54,7 @@ pub async fn app_with(connect: PgConnectOptions, simulator_delay: Duration) -> T
         pool.clone(),
         b"test-jwt-secret-0123456789abcdefghij",
         b"test-hmac-secret-0123456789abcdefgh",
+        (b"test-data-key-0123456789abcdefghijkl", 1),
         Arc::new(sms.clone()),
     )
     .expect("durum");
@@ -202,6 +203,39 @@ impl TestApp {
                 .expect("org")
                 .to_owned(),
         )
+    }
+}
+
+/// Şu anki adıma göre `offset` adım ilerideki TOTP kodu.
+pub fn totp_code(secret: &[u8], offset: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    totp::code_at(secret, totp::step_at(now) + offset)
+}
+
+impl TestApp {
+    /// İkinci faktörü açar (bu oturum doğrulanmış sayılır); TOTP sırrını döner.
+    pub async fn enable_mfa(&self, access: &str) -> Vec<u8> {
+        let (status, setup) = self
+            .post_auth(
+                "/v1/auth/mfa/totp/setup",
+                json!({ "password": PASSWORD }),
+                access,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{setup}");
+        let secret = totp::base32_decode(&s(&setup, "secret")).expect("sır");
+        let (status, body) = self
+            .post_auth(
+                "/v1/auth/mfa/totp/confirm",
+                json!({ "code": totp_code(&secret, 0) }),
+                access,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        secret
     }
 }
 

@@ -18,6 +18,7 @@ fn state() -> AppState {
         pool,
         b"test-jwt-secret-0123456789abcdefghij",
         b"test-hmac-secret-0123456789abcdefgh",
+        (b"test-data-key-0123456789abcdefghijkl", 1),
         Arc::new(RecordingSms::default()),
     )
     .expect("durum")

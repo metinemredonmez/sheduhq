@@ -958,8 +958,22 @@ async fn operator_sees_all_panels_but_controls_only_with_grants(
         .execute(&app.admin)
         .await
         .expect("tür");
+    // İşletmede sahip ve operatör personeldir: ikinci adım zorunlu (AUT-01).
+    let (status, response) = app
+        .get(&format!("/v1/organizations/{org}/panels"), &owner)
+        .await;
+    assert_eq!(
+        (status, s(&response, "error")),
+        (StatusCode::FORBIDDEN, "mfa_required".into())
+    );
+    app.enable_mfa(&owner).await;
     let (panel, home, garage) = demo(&app, &owner, &org).await;
     let (operator, operator_id) = join(&app, &owner, &org, INVITEE, "operator").await;
+    let (status, _) = app
+        .get(&format!("/v1/organizations/{org}/panels"), &operator)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    app.enable_mfa(&operator).await;
     let (status, _) = app
         .put(
             "/v1/devices/current/push-token",

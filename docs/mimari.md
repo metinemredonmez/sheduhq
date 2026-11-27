@@ -86,7 +86,28 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
   TLS'li ters vekil üzerinden erişilir; doğrudan erişime kapalıdır (NET-02). Ters vekil arkasında
   gerçek istemci IP'si için güvenilir vekil listesi henüz yapılandırılmadı (NET-03).
 - **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı TLS istemiyorsa veya
-  sırlar kısa ya da aynıysa API başlamaz.
+  sırlar (`SHEDU_JWT_SECRET`, `SHEDU_HMAC_SECRET`, `SHEDU_DATA_KEY`) kısa ya da aynıysa API
+  başlamaz.
+
+## İki adımlı doğrulama (MFA)
+
+Uç noktalar (`/v1/auth/mfa`): `GET` (durum), `POST totp/setup`, `POST totp/confirm`,
+`POST totp/disable`, `POST recovery-codes`, `POST verify` (girişin ikinci adımı).
+
+- **Faktör:** TOTP (doğrulayıcı uygulama, 30 saniye, 6 hane) ve 10 tek kullanımlık kurtarma kodu.
+  Kurulum parolayla yeniden doğrulama ister ve bir kodla onaylanınca açılır; kapatma parola ve
+  geçerli bir kod ister. Açma, kapatma ve kurtarma koduyla giriş kullanıcıya SMS ile bildirilir.
+- **Saklama:** TOTP sırrı XChaCha20-Poly1305 ile şifreli; anahtar `SHEDU_DATA_KEY`'den amaca özel
+  türetilir, anahtar sürümü kayıtla saklanır, şifreli metin kullanıcıya bağlıdır. Kullanılan
+  zaman adımı kaydedilir, aynı kod ikinci kez geçmez. Kurtarma kodlarının yalnızca HMAC özeti
+  saklanır.
+- **Giriş:** faktörü açık kullanıcı parolayı doğrulayınca oturum almaz; 5 dakikalık, tek
+  kullanımlık, 5 denemelik bir biletle (`mfa_token`) ikinci adımı tamamlar. Kişi başına ve kaynak
+  başına deneme sınırı vardır.
+- **Zorunluluk:** işletme ve izleme merkezi organizasyonlarının sahibi, yöneticileri ve
+  operatörleri (personel), ikinci adımı tamamlanmamış oturumla o organizasyona hiçbir istekte,
+  WebSocket'te veya push bildiriminde erişemez. Ev kullanıcıları ve işletmedeki sıradan üyeler
+  için isteğe bağlıdır. MFA kapatılınca bütün oturumların doğrulaması düşer.
 
 ## Panel ve komut API'si
 

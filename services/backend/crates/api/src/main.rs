@@ -34,8 +34,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options: PgConnectOptions = config.database_url.parse()?;
     let pool = db::connect(options, config.database_role.clone()).await?;
-    let mut state = AppState::new(pool.clone(), &config.jwt_secret, &config.hmac_secret, sms)
-        .map_err(|_| "uygulama durumu kurulamadı")?;
+    let mut state = AppState::new(
+        pool.clone(),
+        &config.jwt_secret,
+        &config.hmac_secret,
+        (&config.data_key, config.data_key_version),
+        sms,
+    )
+    .map_err(|_| "uygulama durumu kurulamadı")?;
     state.allowed_origins = config.allowed_origins.clone().into();
     state.push = push;
     state.start_event_listener();

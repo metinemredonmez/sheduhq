@@ -3,10 +3,12 @@
 pub mod codes;
 pub mod extract;
 mod handlers;
+pub mod mfa;
 pub mod password;
 pub mod rate_limit;
 pub mod reauth;
 pub mod tokens;
+pub mod totp;
 
 use axum::{
     Router,
@@ -33,4 +35,13 @@ pub fn routes() -> Router<AppState> {
             post(handlers::reset_complete),
         )
         .route("/me", get(handlers::me))
+        .route("/auth/mfa", get(mfa::status))
+        .route("/auth/mfa/totp/setup", post(mfa::setup))
+        .route("/auth/mfa/totp/confirm", post(mfa::confirm))
+        .route("/auth/mfa/totp/disable", post(mfa::disable))
+        .route(
+            "/auth/mfa/recovery-codes",
+            post(mfa::regenerate_recovery_codes),
+        )
+        .route("/auth/mfa/verify", post(mfa::verify))
 }

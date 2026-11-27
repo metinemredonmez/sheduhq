@@ -91,15 +91,24 @@ pub async fn begin(
 ) -> ApiResult<(Transaction<'static, Postgres>, OrgContext)> {
     let mut tx = state.db.begin().await?;
     set_context(&mut tx, Some(user.user_id), Some(organization_id)).await?;
-    let role: Option<(String,)> =
-        sqlx::query_as("SELECT role FROM memberships WHERE user_id = $1 AND organization_id = $2")
-            .bind(user.user_id)
-            .bind(organization_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let role = role
-        .and_then(|(role,)| Role::parse(&role))
-        .ok_or(ApiError::NotFound)?;
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT m.role, o.kind,
+                EXISTS (SELECT 1 FROM session_factors f WHERE f.family_id = $3 AND f.user_id = $1)
+           FROM memberships m JOIN organizations o ON o.id = m.organization_id
+          WHERE m.user_id = $1 AND m.organization_id = $2",
+    )
+    .bind(user.user_id)
+    .bind(organization_id)
+    .bind(user.session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (role, kind, second_factor) = row.ok_or(ApiError::NotFound)?;
+    let role = Role::parse(&role).ok_or(ApiError::NotFound)?;
+    // Ayrıcalıklı personel, ikinci adımı tamamlanmamış (yalnızca parolalı) bir oturumla
+    // organizasyona erişemez (AUT-01).
+    if mfa_required(&kind, role) && !second_factor {
+        return Err(ApiError::Forbidden("mfa_required"));
+    }
     Ok((
         tx,
         OrgContext {
@@ -297,6 +306,14 @@ pub async fn organization_kind(conn: &mut PgConnection) -> ApiResult<String> {
             .fetch_one(conn)
             .await?;
     Ok(kind)
+}
+
+/// İkinci faktör zorunlu mu? İşletme ve izleme merkezi organizasyonlarının sahibi, yöneticileri
+/// ve operatörleri (personel) için evet. Ev kullanıcıları ve işletmedeki sıradan üyeler için
+/// isteğe bağlıdır. Push alıcı sorgusu (`push.rs`) aynı kuralı SQL ile uygular.
+pub fn mfa_required(kind: &str, role: Role) -> bool {
+    matches!(kind, "business" | "monitoring_center")
+        && matches!(role, Role::Owner | Role::Admin | Role::Operator)
 }
 
 /// Rol bu türdeki organizasyonda kullanılabilir mi? Operatör yalnızca işletme ve izleme merkezi.
