@@ -15,6 +15,7 @@ use axum::{
 use crate::AppState;
 
 pub use extract::AuthUser;
+pub(crate) use handlers::normalize_phone;
 
 pub fn routes() -> Router<AppState> {
     Router::new()

@@ -38,7 +38,7 @@ Geliştirme sırası: **backend → AI servisi → admin → web → mobil.** Ge
 ## Faz 2
 
 - Kameralar: liste, QR ile ekleme, canlı izleme.
-- Alt kullanıcı davet etme, roller, gün ve saat bazlı yetki.
+- Alt kullanıcı davet etme, roller, gün ve saat bazlı yetki (backend API'si hazır; ekranlar bu fazda).
 - Acil durum kişi listesi, bildirim ayarları, sensör ve çıkış adlarını düzenleme.
 - Google ve Apple ile giriş, bağlı cihazlar.
 - AI: olay özeti, akıllı bildirim, destek asistanı.

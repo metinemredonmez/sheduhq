@@ -136,6 +136,33 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
 - **Sanal alarm:** hırsızlık zonu yalnızca kurulu bölümde, yangın/gaz/su/panik/tıbbi/sabotaj zonu
   her zaman alarm verir; bypass edilmiş zon alarm vermez.
 
+## Üyeler, davetler ve panel yetkileri
+
+Uç noktalar (`/v1/organizations/{org_id}` altında): `GET /members`, `PATCH`/`DELETE
+/members/{user_id}`, `GET`/`POST /invitations`, `DELETE /invitations/{id}`, `GET`/`POST
+/members/{user_id}/grants`, `PUT`/`DELETE /grants/{grant_id}`. Davet edilen taraf: `GET /v1/invitations`,
+`POST /v1/invitations/{id}/accept`, `POST /v1/invitations/{id}/decline`.
+
+- **Roller:** `owner` (tek, organizasyonu açan kişi), `admin`, `member`. Herkes yalnızca kendinden
+  alt roldeki birini yönetir ve yalnızca kendinden alt bir rol atar: sahip yöneticiyi ve üyeyi,
+  yönetici yalnızca üyeyi. Kimse kendi rolünü değiştiremez. Sahip çıkarılamaz, rolü değiştirilemez,
+  ayrılamaz; veritabanı da her organizasyonda tek sahip olmasını ve sahip üyeliğinin doğrudan
+  silinmemesini zorlar.
+- **Davet:** telefon numarasına bağlıdır; bağlantı veya kod taşımaz. Kişi o numarayla (SMS koduyla
+  doğrulanmış) oturum açınca daveti uygulamada görür. 7 gün geçerlidir, tek kez kabul, ret veya
+  iptal edilir. Davet SMS'i sabit bir metindir; organizasyon veya kişi adı içermez, böylece
+  platform adına oltalama mesajı gönderilemez. Davet oluşturma yanıtı numaranın kayıtlı olup
+  olmadığını belli etmez. Sınırlar: organizasyon başına günde 20, kullanıcı başına saatte 10, bir
+  numaraya bütün organizasyonlardan günde 3 davet SMS'i; bu sayaç kayıt kodunu etkilemez.
+- **Davet edenin yetkisi:** yönetici rolünü kaybeden veya çıkarılan kişinin açık davetleri iptal
+  edilir; ayrıca kabul anında davet edenin o rolü verme yetkisi yeniden doğrulanır.
+- **Panel yetkisi:** üye başına panel veya bölüm; görme, kurma, kapatma, bypass; geçerlilik süresi
+  ve haftalık pencereler. Yalnızca yöneticiler verir; yöneticilere yetki verilmez (zaten tam
+  yetkilidirler), böylece kimse kendine yetki veremez. Kurma/kapatma görme yetkisi olmadan
+  verilemez. Kapsam (kişi, panel, bölüm) sonradan değişmez.
+- **Etki hemen:** rol, üyelik ve yetki her istekte, her WebSocket mesajında ve her push
+  gönderiminde veritabanından okunur. Üyelik silinince yetki kayıtları da silinir.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

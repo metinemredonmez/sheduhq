@@ -25,7 +25,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "owner" => Some(Self::Owner),
             "admin" => Some(Self::Admin),
@@ -35,9 +35,33 @@ impl Role {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Member => "member",
+            Self::Operator => "operator",
+        }
+    }
+
     /// Organizasyonun bütün panellerinde tam yetkili mi?
     pub fn is_manager(self) -> bool {
         matches!(self, Self::Owner | Self::Admin)
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Owner => 3,
+            Self::Admin => 2,
+            Self::Member | Self::Operator => 1,
+        }
+    }
+
+    /// Bu rol, verilen rolü atayabilir veya o roldeki birini yönetebilir mi? Yalnızca kendinden
+    /// alt roller yönetilir: sahip yöneticiyi ve üyeyi, yönetici yalnızca üyeyi. Böylece kimse
+    /// kendi düzeyinde ya da üstünde yetki dağıtamaz (AZ-05).
+    pub fn outranks(self, other: Self) -> bool {
+        self.is_manager() && self.rank() > other.rank()
     }
 }
 

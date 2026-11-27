@@ -120,3 +120,22 @@ pub const PANIC_PER_USER: Budget = Budget {
     window_secs: 10 * 60,
     limit: 10,
 };
+
+/// Davetler (RES-01): bir organizasyonun ve bir kullanıcının gönderebileceği davet sayısı, ve bir
+/// numaraya bütün organizasyonlardan gidebilecek davet SMS'i. Davet SMS'i kayıt ve sıfırlama
+/// kodlarının sayacını kullanmaz; davetle birinin kod alması engellenemez.
+pub const INVITE_PER_ORG: Budget = Budget {
+    scope: "invite:org",
+    window_secs: 24 * 60 * 60,
+    limit: 20,
+};
+pub const INVITE_PER_USER: Budget = Budget {
+    scope: "invite:user",
+    window_secs: 60 * 60,
+    limit: 10,
+};
+pub const INVITE_SMS_PER_PHONE: Budget = Budget {
+    scope: "invite:phone",
+    window_secs: 24 * 60 * 60,
+    limit: 3,
+};

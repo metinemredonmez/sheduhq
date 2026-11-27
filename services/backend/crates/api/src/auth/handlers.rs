@@ -123,7 +123,7 @@ pub struct SessionSummary {
 // ---------------------------------------------------------------------------------------------
 
 /// E.164: `+` ve 8–15 rakam, ilk rakam 0 olamaz.
-fn normalize_phone(raw: &str) -> Option<String> {
+pub(crate) fn normalize_phone(raw: &str) -> Option<String> {
     let value = raw.trim();
     let digits = value.strip_prefix('+')?;
     let valid = (8..=15).contains(&digits.len())

@@ -30,6 +30,9 @@ INSERT INTO organizations (id, name, kind) VALUES
 
 INSERT INTO users (id, email, display_name) VALUES
     ('11111111-0000-0000-0000-000000000001', 'a@example.com', 'Kullanıcı A');
+-- Panel yetkisi yalnızca üyeye verilebilir.
+INSERT INTO memberships (user_id, organization_id, role) VALUES
+    ('11111111-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001', 'member');
 
 INSERT INTO panels (id, organization_id, name, brand, device_serial) VALUES
     ('a0000000-0000-0000-0000-0000000000a1', 'aaaaaaaa-0000-0000-0000-000000000001', 'Ev paneli', 'test', 'SN-A'),

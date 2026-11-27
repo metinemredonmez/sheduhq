@@ -17,6 +17,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
 | Oturum | SES-04, SES-05 | Çıkışta, cihaz silmede ve rol düşürmede iptal; refresh token ailesi | Doğrulanacak |
 | Token | TOK-01, TOK-02 | JWT'de algoritma listesi sabit; `exp`, `aud`, `iss` zorunlu; anahtar güvenilir kaynaktan | Doğrulanacak |
 | Yetki | AZ-01, AZ-02, AZ-04 | Her komutta izin + kapsam + nesne + durum birlikte; veri katmanında ikinci bariyer | Doğrulanacak |
+| Yetki | AZ-05 | Rol hiyerarşisi: yalnızca alt rol yönetilir; tek ve korunan sahip; kendine yetki yok | Doğrulanacak |
 | API | API-02 | Alan düzeyinde yazma izni; istemci izinsiz alan gönderemez | Doğrulanacak |
 | API | API-04 | WebSocket'te kimlik, origin ve mesaj başına yetki | Doğrulanacak |
 | İş mantığı | BUS-01, BUS-02 | Komut durum makinesi (`domain` crate'i), idempotency, atomik geçiş | Doğrulanacak |
@@ -55,6 +56,18 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   cihazlara ve kritik öncelikle; çıkış yapılmış cihaza bildirim gitmez; token el değiştirince eski
   hesaptan kalkar; iki dağıtıcı aynı olayı tek kez gönderir; kaçırılan olay taramayla yakalanır;
   teslim kaydı tutulur.
+- **Üyelik, davet ve yetki (AUT-03, AZ-01, AZ-02, AZ-04, AZ-05, API-02, SES-04, RES-01, LOG-01):**
+  `services/backend/crates/api/tests/members.rs` (7 entegrasyon testi) ve
+  `services/backend/tests/sql/003_members_invitations.sql`: davet yalnızca o numarayla doğrulanmış
+  hesaba görünür ve tek kez kabul edilir; başka hesap kimliği bilse de kabul edemez; iptal edilen
+  ve yetkisini kaybetmiş kişinin daveti geçersizdir (API dışında rol düşürülse de); davet SMS'inde
+  kullanıcı metni, bağlantı ve kod yoktur; bir numaraya günde en fazla 3 davet SMS'i gider ve bu
+  kayıt kodunu engellemez; yönetici başkasını yönetici yapamaz, sahibe ve kendine dokunamaz; rol
+  düşürme ve üyelikten çıkarma aynı access token'la bir sonraki istekte geçerlidir; çıkarılan
+  üyenin yetki kayıtları silinir; başka kiracının paneli, bölümü veya üye olmayan biri yetkiye
+  bağlanamaz; yetki kapsamı değiştirme isteğiyle taşınamaz; reddedilen denemeler denetim kaydına
+  girer. Üç koruma (kabul anındaki yeniden doğrulama, rol karşılaştırması, üyelik-yetki bağı)
+  tek tek bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -62,6 +75,10 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   - SES-03: mutlak oturum ömrü (refresh ailesi için üst süre) yok.
   - KEY-03: JWT anahtarı tek; planlı rotasyon için `kid` ile anahtar kümesi eklenecek.
   - NET-03: ters vekil arkasında gerçek IP için güvenilir vekil listesi yok.
+  - AZ-05: sahiplik devri yok. Sahip hesabı silinirse (KVKK silme akışı) organizasyon sahipsiz
+    kalabilir; silme akışı yazılırken önce organizasyonun devri veya kapatılması istenecek.
+  - AZ-05: `operator` rolü (izleme merkezi personeli) tanımlı ama davet ve rol atamasında
+    kullanılamaz; izleme merkezi modeli netleşince eklenecek.
 
 ## Değişmez kurallar
 

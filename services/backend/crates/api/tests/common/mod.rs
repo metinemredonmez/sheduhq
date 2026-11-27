@@ -85,6 +85,11 @@ impl TestApp {
         self.call(Method::DELETE, path, None, Some(bearer)).await
     }
 
+    pub async fn patch(&self, path: &str, body: Value, bearer: &str) -> (StatusCode, Value) {
+        self.call(Method::PATCH, path, Some(body), Some(bearer))
+            .await
+    }
+
     pub async fn put(&self, path: &str, body: Value, bearer: &str) -> (StatusCode, Value) {
         self.call(Method::PUT, path, Some(body), Some(bearer)).await
     }
@@ -132,13 +137,24 @@ impl TestApp {
             .await
     }
 
-    /// Arka planda gönderilen son SMS kodunu bekler.
+    /// Arka planda gönderilen son SMS kodunu bekler. Kod taşımayan mesajlar (ör. arka planda geç
+    /// ulaşan davet SMS'i) atlanır.
     pub async fn last_code(&self, phone: &str, previous: usize) -> String {
         for _ in 0..100 {
             let messages = self.sms.messages_to(phone);
-            if messages.len() > previous {
-                let text = messages.last().expect("mesaj");
-                return text.chars().filter(char::is_ascii_digit).take(6).collect();
+            let code = messages
+                .iter()
+                .skip(previous)
+                .rev()
+                .map(|text| {
+                    text.chars()
+                        .filter(char::is_ascii_digit)
+                        .take(6)
+                        .collect::<String>()
+                })
+                .find(|code| code.len() == 6);
+            if let Some(code) = code {
+                return code;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

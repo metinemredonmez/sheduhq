@@ -9,7 +9,10 @@ pub mod db;
 pub mod devices;
 pub mod error;
 pub mod events;
+pub mod grants;
 pub mod history;
+pub mod invitations;
+pub mod members;
 pub mod panels;
 pub mod push;
 pub mod simulator;
@@ -130,7 +133,10 @@ pub fn router(state: AppState) -> Router {
                 .merge(commands::routes())
                 .merge(history::routes())
                 .merge(devices::routes())
-                .merge(events::routes()),
+                .merge(events::routes())
+                .merge(members::routes())
+                .merge(invitations::routes())
+                .merge(grants::routes()),
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
