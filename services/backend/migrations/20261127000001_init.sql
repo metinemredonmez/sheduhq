@@ -16,11 +16,14 @@
 --    giriş akışında kiracı bağlamı olmadan okunduğu için RLS dışındadır; API bunları her zaman
 --    kullanıcı kimliğiyle filtreler.
 
+-- Roller küme genelidir; aynı kümede birden fazla veritabanı eşzamanlı kurulurken (ör. paralel
+-- testler) iki oturum aynı anda oluşturmaya çalışabilir. İkincisinin hatası yok sayılır.
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'shedu_app') THEN
-        CREATE ROLE shedu_app NOLOGIN;
-    END IF;
+    CREATE ROLE shedu_app NOLOGIN;
+EXCEPTION
+    WHEN duplicate_object OR unique_violation THEN
+        NULL;
 END
 $$;
 

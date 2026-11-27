@@ -20,6 +20,21 @@ jobs:
     defaults:
       run:
         working-directory: services/backend
+    services:
+      postgres:
+        image: postgres:19-alpine
+        env:
+          # Yalnızca CI'daki geçici veritabanı; gerçek bir sır değildir.
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:ci-only@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v5
         with:
@@ -32,6 +47,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all
+      - name: Entegrasyon testleri (giriş ve oturum, PostgreSQL 19)
+        run: cargo test --locked -p shedu-api --features db-tests --test auth
 
   ai:
     name: AI servisi (Python)

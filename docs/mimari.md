@@ -64,6 +64,30 @@
 - **Saklanmayanlar:** panel PIN'i hiç saklanmaz; parola argon2id, refresh token SHA-256, SMS
   kodu HMAC-SHA256 olarak tutulur.
 
+## Giriş ve oturum
+
+Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/login`, `auth/refresh`,
+`auth/logout`, `auth/sessions` (liste ve `DELETE auth/sessions/{id}`), `auth/password-reset/start`,
+`auth/password-reset/complete`, `me`.
+
+- **Kayıt ve sıfırlama:** SMS ile 6 haneli kod; 10 dakika geçerli, tek kullanımlık, en fazla 5
+  deneme; amaca ve telefona bağlı HMAC olarak saklanır. Başlatma her zaman 202 döner, hesabın var
+  olup olmadığı belli olmaz.
+- **Parola:** en az 15, en fazla 128 karakter; yaygın, tekrarlı, ardışık ve kişisel bilgi içeren
+  parolalar reddedilir; argon2id.
+- **Access token:** HS256, 10 dakika, `iss`/`aud`/`typ` zorunlu. Her istekte kullanıcının etkin ve
+  oturumun iptal edilmemiş olduğu veritabanından kontrol edilir; çıkış anında etkilidir.
+- **Refresh token:** 30 gün, her kullanımda yenilenir. Kullanılmış bir token yeniden gelirse bütün
+  oturum ailesi iptal edilir ve denetim kaydına yazılır. İstemci aynı oturumun yenilemesini tek
+  seferde yapmalıdır (single-flight).
+- **Deneme sınırları:** hesap, IP ve bütün sistem için ayrı sayaçlar; PostgreSQL'de, bütün API
+  kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır.
+- **Dışarıya açılma:** API varsayılan olarak yalnızca `127.0.0.1`'i dinler. Dışarıdan yalnızca
+  TLS'li ters vekil üzerinden erişilir; doğrudan erişime kapalıdır (NET-02). Ters vekil arkasında
+  gerçek istemci IP'si için güvenilir vekil listesi henüz yapılandırılmadı (NET-03).
+- **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı TLS istemiyorsa veya
+  sırlar kısa ya da aynıysa API başlamaz.
+
 ## Komut akışı (kurma / kapatma)
 
 1. Kullanıcı uygulamada komutu verir; kapatma için PIN ve isteğe bağlı biyometri istenir.

@@ -2,11 +2,29 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
+use std::sync::Arc;
+
 use http_body_util::BodyExt;
+use shedu_api::{AppState, sms::RecordingSms};
+use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
+/// Veritabanına hiç bağlanmayan durum: sağlık kontrolü veritabanı gerektirmez.
+fn state() -> AppState {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/kullanilmiyor")
+        .expect("tembel havuz");
+    AppState::new(
+        pool,
+        b"test-jwt-secret-0123456789abcdefghij",
+        b"test-hmac-secret-0123456789abcdefgh",
+        Arc::new(RecordingSms::default()),
+    )
+    .expect("durum")
+}
+
 async fn get(path: &str) -> axum::response::Response {
-    shedu_api::router()
+    shedu_api::router(state())
         .oneshot(
             Request::builder()
                 .uri(path)

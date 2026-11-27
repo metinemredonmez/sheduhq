@@ -36,6 +36,20 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   bozulunca kaldığı (RLS kapatma, yanlış beklenti) yerelde doğrulandı. API katmanı henüz bu
   bağlamı kullanmadığı için durumlar "Doğrulanacak" kalır.
 - **KEY-02:** CI'da gitleaks ile her push'ta sır taraması yapılır.
+- **AUT-02, AUT-03, PWD-01, SES-02, SES-04, SES-05, TOK-01 (kod düzeyi):**
+  `services/backend/crates/api/tests/auth.rs` (17 entegrasyon testi, gerçek PostgreSQL, uygulama
+  rolüyle) ve birim testleri; kod tek kullanımı ve 5 deneme sınırı, amaca bağlılık, hesabın
+  varlığının belli olmaması, hesap başına sınırın başka hesabı ve parola sıfırlamayı etkilememesi,
+  refresh yeniden kullanımında ailenin iptali, çıkışta access token'ın hemen geçersizleşmesi,
+  başkasının oturumunun kapatılamaması, yanlış `alg`/`iss`/`aud`/`typ`/süre ile token reddi.
+  Üretim ortamında çok kopyalı doğrulama yapılmadığı için durumlar "Doğrulanacak" kalır.
+- **Bilinen eksikler:**
+  - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
+    korumalı) kontrol eklenecek.
+  - AUT-02: kademeli doğrulama (ör. CAPTCHA) yok; yalnızca pencere bazlı sınır var.
+  - SES-03: mutlak oturum ömrü (refresh ailesi için üst süre) yok.
+  - KEY-03: JWT anahtarı tek; planlı rotasyon için `kid` ile anahtar kümesi eklenecek.
+  - NET-03: ters vekil arkasında gerçek IP için güvenilir vekil listesi yok.
 
 ## Değişmez kurallar
 

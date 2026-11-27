@@ -3,6 +3,7 @@ name = "shedu-domain"
 description = "Shedu panel durumları ve komut kuralları"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 # Bilerek bağımlılık yok: bu crate veritabanına, ağa veya AI servisine erişemez.

@@ -1,9 +1,14 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use shedu_api::{
+    AppState,
+    auth::rate_limit,
+    config::{Config, Environment},
+    db,
+    sms::{DevConsoleSms, SmsSender},
+};
+use sqlx::postgres::PgConnectOptions;
 use tracing_subscriber::EnvFilter;
-
-/// Varsayılan olarak yalnızca yerel arayüzü dinler; dışarı açmak bilinçli bir ayar olmalıdır (OPS-01).
-const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,19 +18,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let addr: SocketAddr = std::env::var("SHEDU_API_ADDR")
-        .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())
-        .parse()?;
+    let config = Config::from_env()?;
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "shedu-api dinliyor");
+    // Üretim için SMS sağlayıcısı henüz yok: güvensiz bir yedekle başlamak yerine dur (KEY-01).
+    let sms: Arc<dyn SmsSender> = match config.environment {
+        Environment::Development => Arc::new(DevConsoleSms),
+        Environment::Production => {
+            return Err("üretim için SMS sağlayıcısı yapılandırılmadı; API başlatılmadı".into());
+        }
+    };
 
-    axum::serve(listener, shedu_api::router())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("kapatılıyor");
-        })
-        .await?;
+    let options: PgConnectOptions = config.database_url.parse()?;
+    let pool = db::connect(options, config.database_role.clone()).await?;
+    let state = AppState::new(pool.clone(), &config.jwt_secret, &config.hmac_secret, sms)
+        .map_err(|_| "uygulama durumu kurulamadı")?;
+
+    // Eski deneme sayacı pencerelerini saatte bir temizle.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            if let Ok(mut conn) = pool.acquire().await
+                && let Err(error) = rate_limit::purge_old(&mut conn).await
+            {
+                tracing::warn!(?error, "deneme sayaçları temizlenemedi");
+            }
+        }
+    });
+
+    let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    tracing::info!(addr = %config.addr, environment = ?config.environment, "shedu-api dinliyor");
+
+    axum::serve(
+        listener,
+        shedu_api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("kapatılıyor");
+    })
+    .await?;
 
     Ok(())
 }
