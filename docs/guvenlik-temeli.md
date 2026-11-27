@@ -145,6 +145,14 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   en düşük sürüm yükselince önceki istemci hemen reddedilir; mağaza adresi resmi mağaza dışına
   (alt alan, `@`, yol içinde adres, http) gidemez; API rolü politikayı yazamaz. API'deki engel ve
   sayısal karşılaştırma bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
+- **Bildirim merkezi (AZ-01, AZ-02, AZ-03, AUT-01, SES-04):** `services/backend/crates/api/tests/inbox.rs`
+  (2 entegrasyon testi) ve `tests/sql/012_notification_center.sql`: sahip bütün, üye yalnızca
+  yetkili bölümün olaylarını görür; görülemeyen olay okundu yapılamaz; başkasının okuması
+  etkilemez; sayfalama, yalnızca okunmamış süzgeci ve hepsini okundu yapma çalışır; katılmadan
+  önceki olay okunmuş sayılır; üyelik silinince bildirimler ve okundu bilgisi gider; işletme
+  personelinin MFA'sız oturumunda olaylar gösterilmez, kilitli denir; okundu bilgisi başkası
+  adına yazılamaz, başka organizasyonun olayına bağlanamaz. Görünürlük kuralı, katılma zamanı ve
+  MFA kilidi bozulduğunda ilgili testin kaldığı yerelde doğrulandı.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.

@@ -332,7 +332,7 @@ fn alarm_label(alarm_kind: Option<&str>) -> &'static str {
     }
 }
 
-fn text(
+pub(crate) fn text(
     kind: &str,
     alarm_kind: Option<&str>,
     arm_mode: Option<&str>,

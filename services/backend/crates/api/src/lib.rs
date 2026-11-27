@@ -15,6 +15,7 @@ pub mod events;
 pub mod features;
 pub mod grants;
 pub mod history;
+pub mod inbox;
 pub mod invitations;
 pub mod members;
 pub mod notifications;
@@ -160,6 +161,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(privacy::routes())
                 .merge(notifications::routes())
                 .merge(features::routes())
+                .merge(inbox::routes())
                 // Desteklenmeyen sürümdeki istemci reddedilir; sürüm kontrol ucu bunun dışındadır.
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),

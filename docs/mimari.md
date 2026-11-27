@@ -164,6 +164,24 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   verildi mi?" sorusunun kanıtı); üyelik silinince tercihler de silinir. Bilinmeyen olay türü
   her zaman gönderilir.
 
+## Bildirim merkezi
+
+Uç noktalar (`/v1`): `GET notifications` (`before`, `limit` 1–100, `unread_only`),
+`GET notifications/unread-count`, `POST notifications/read` (`{"all": true}` isteğe bağlı
+`organization_id` ile ya da `{"event_ids": [...]}` en fazla 100).
+
+- **Tek akış:** kişinin bütün organizasyonlarındaki olaylar yeniden eskiye, okundu bilgisiyle;
+  başlık ve metin push ile aynıdır. Bildirimler ayrıca saklanmaz, her istekte olaylardan kişinin o
+  anki yetkisiyle türetilir: yöneticiler ve operatör bütün paneli, üye yalnızca görme yetkisi olan
+  bölümleri görür. Yetkisini veya üyeliğini kaybeden kişi eski bildirimleri de göremez.
+- **Okundu bilgisi:** organizasyon başına "buraya kadar hepsi okundu" sınırı ve sınırın üstünde
+  tek tek okunanlar; sınır ilerleyince tekil kayıtlar silinir. Organizasyona katılmadan önceki
+  olaylar okunmuş sayılır. Görülemeyen olay okundu yapılamaz (sessizce yok sayılır). Okunmamış
+  sayısı 999'da kesilir.
+- **MFA:** işletme personelinin ikinci adımı tamamlanmamış oturumunda o organizasyonun
+  bildirimleri gösterilmez; yanıtta `locked` listesinde `mfa_required` olarak belirtilir.
+- **Tercihler:** bildirim tercihleri yalnızca push'u etkiler; merkezde bütün olaylar görünür.
+
 ## Üyeler, davetler ve panel yetkileri
 
 Uç noktalar (`/v1/organizations/{org_id}` altında): `GET /members`, `PATCH`/`DELETE
