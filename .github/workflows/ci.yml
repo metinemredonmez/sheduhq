@@ -56,11 +56,17 @@ jobs:
         run: uv run pytest -q
 
   database:
-    name: Veritabanı şeması (PostgreSQL)
+    name: Veritabanı şeması (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 19: en son sürüm (hedef). 18: bulut sağlayıcılarının yeni sürümü sunması gecikirse
+        # kullanılacak bir önceki sürüm.
+        postgres: ["19", "18"]
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           # Yalnızca CI'daki geçici veritabanı; gerçek bir sır değildir.
           POSTGRES_PASSWORD: ci-only
