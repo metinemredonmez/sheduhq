@@ -133,7 +133,9 @@ struct AccessToken {
 fn classify(status: u16, code: Option<&str>) -> Outcome {
     match (status, code) {
         (200, _) => Outcome::Sent,
-        (404, _) | (_, Some("UNREGISTERED" | "SENDER_ID_MISMATCH")) => Outcome::InvalidToken,
+        // Token yalnızca FCM açıkça söylediğinde silinir: kodsuz 404 (ör. yanlış proje kimliği)
+        // bütün Android token'larını sildirmez.
+        (_, Some("UNREGISTERED" | "SENDER_ID_MISMATCH")) => Outcome::InvalidToken,
         (401, _) => Outcome::RenewAccessToken,
         (429, _) | (500..=599, _) => Outcome::Retry,
         // INVALID_ARGUMENT bozuk yük de olabilir: token silinmez, yeniden de denenmez.
@@ -420,6 +422,8 @@ mod tests {
     fn responses_are_classified() {
         assert_eq!(classify(200, None), Outcome::Sent);
         assert_eq!(classify(404, Some("UNREGISTERED")), Outcome::InvalidToken);
+        assert_eq!(classify(404, Some("NOT_FOUND")), Outcome::Reject);
+        assert_eq!(classify(404, None), Outcome::Reject);
         assert_eq!(
             classify(403, Some("SENDER_ID_MISMATCH")),
             Outcome::InvalidToken

@@ -245,8 +245,11 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   - **Sonuçlar:** gönderildi; geçersiz token (APNs 410, `BadDeviceToken`,
     `DeviceTokenNotForTopic`; FCM `UNREGISTERED`, `SENDER_ID_MISMATCH`) → token silinir; geçici
     (ağ, 429, 5xx, reddedilen sağlayıcı/erişim token'ı → yenisi alınır) → yeniden denenir;
-    kalıcı ret (bozuk yük, yanlış konu, yetkisiz hizmet hesabı) → yeniden denenmez, token silinmez,
-    hata olarak loglanır. Biçimi bozuk cihaz token'ı (APNs onaltılık, FCM `[A-Za-z0-9:_.-]`)
+    kalıcı ret (bozuk yük, yanlış konu, yetkisiz hizmet hesabı, FCM'de kodsuz 404 gibi yanlış
+    yapılandırma) → yeniden denenmez, token silinmez, hata olarak loglanır. Token yalnızca
+    sağlayıcı açıkça "bu token geçersiz" dediğinde silinir; APNs ortamı (`production` / `sandbox`)
+    yanlış seçilirse Apple token'ları `BadDeviceToken` ile reddeder ve silinir, uygulama bir sonraki
+    açılışta token'ını yeniden kaydeder. Biçimi bozuk cihaz token'ı (APNs onaltılık, FCM `[A-Za-z0-9:_.-]`)
     sağlayıcıya gönderilmez.
   - **İçerik:** bildirim Apple ve Google sunucularından geçer; KVKK aktarım kararına kadar (açık
     soru 11) varsayılan içerik kısadır: başlık "Shedu", metin yalnızca olay türü ("Yangın alarmı",
