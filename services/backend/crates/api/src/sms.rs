@@ -1,7 +1,8 @@
 //! SMS gönderimi.
 //!
-//! Gerçek sağlayıcı henüz seçilmedi. Üretimde sağlayıcı yoksa API başlamaz (fail-closed).
-//! Geliştirme göndericisi kodu konsola yazar; bu yüzden yalnızca geliştirme ortamında kullanılabilir.
+//! Sağlayıcı İleti Merkezi'dir (`providers::iletimerkezi`). Üretimde sağlayıcı yoksa API başlamaz
+//! (fail-closed). Geliştirme göndericisi kodu konsola yazar; bu yüzden yalnızca geliştirme
+//! ortamında kullanılabilir.
 
 use std::{
     future::Future,

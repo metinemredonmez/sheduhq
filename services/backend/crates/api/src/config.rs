@@ -3,9 +3,12 @@
 //! Güvensiz ayarla başlamak yerine açılışta hata verir (KEY-01, OPS-01):
 //! - sırlar en az 32 bayt olmalı ve birbirinden farklı olmalı (TOK-02, amaç ayrımı);
 //! - üretimde veritabanı bağlantısı TLS zorunlu kılmalı (NET-01);
-//! - geliştirme SMS göndericisi üretimde kullanılamaz.
+//! - üretimde SMS (İleti Merkezi) ve push (APNs, FCM) sağlayıcıları zorunludur; geliştirme
+//!   göndericileri (konsola yazan) üretimde kullanılamaz (EXC-01).
 
-use std::{fmt, net::SocketAddr};
+use std::{fmt, net::SocketAddr, path::PathBuf};
+
+use crate::push::PushContent;
 
 /// Varsayılan olarak yalnızca yerel arayüzü dinler; dışarı açmak bilinçli bir ayar olmalıdır.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -36,6 +39,50 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// İç AI servisinin adresi ve servis token'ı (ikisi birlikte; yoksa AI özellikleri kapalı).
     pub ai: Option<AiSettings>,
+    /// SMS sağlayıcısı. Yoksa (yalnızca geliştirme) kodlar konsola yazılır.
+    pub sms: Option<IletiMerkeziSettings>,
+    /// iOS push sağlayıcısı.
+    pub apns: Option<ApnsSettings>,
+    /// Android push sağlayıcısı.
+    pub fcm: Option<FcmSettings>,
+    /// Push bildiriminde ne yazacağı (varsayılan: kısa, ad içermez).
+    pub push_content: PushContent,
+}
+
+/// İleti Merkezi API kimliği ve onaylı gönderici adı (başlık).
+#[derive(Clone)]
+pub struct IletiMerkeziSettings {
+    pub key: String,
+    pub hash: String,
+    pub sender: String,
+}
+
+impl fmt::Debug for IletiMerkeziSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IletiMerkeziSettings")
+            .field("sender", &self.sender)
+            .finish_non_exhaustive()
+    }
+}
+
+/// APNs token tabanlı kimlik doğrulama: `.p8` anahtar dosyası, anahtar kimliği, ekip kimliği ve
+/// uygulamanın paket kimliği (konu).
+#[derive(Debug, Clone)]
+pub struct ApnsSettings {
+    pub key_file: PathBuf,
+    pub key_id: String,
+    pub team_id: String,
+    pub topic: String,
+    /// Geliştirme derlemeleri için Apple'ın sandbox ortamı.
+    pub sandbox: bool,
+    /// Sessiz modu aşan kritik uyarı; Apple'ın izni (entitlement) alınınca açılır.
+    pub critical_alerts: bool,
+}
+
+/// FCM için Google hizmet hesabı dosyası.
+#[derive(Debug, Clone)]
+pub struct FcmSettings {
+    pub service_account_file: PathBuf,
 }
 
 #[derive(Clone)]
@@ -54,6 +101,10 @@ impl fmt::Debug for Config {
             .field("addr", &self.addr)
             .field("database_role", &self.database_role)
             .field("ai_configured", &self.ai.is_some())
+            .field("sms", &self.sms)
+            .field("apns", &self.apns)
+            .field("fcm", &self.fcm)
+            .field("push_content", &self.push_content)
             .finish_non_exhaustive()
     }
 }
@@ -178,6 +229,31 @@ impl Config {
             }
         };
 
+        let sms = sms_settings(&get)?;
+        let apns = apns_settings(&get)?;
+        let fcm = get("SHEDU_FCM_SERVICE_ACCOUNT_FILE")
+            .filter(|v| !v.is_empty())
+            .map(|path| FcmSettings {
+                service_account_file: PathBuf::from(path),
+            });
+        let push_content = match get("SHEDU_PUSH_CONTENT").as_deref() {
+            None | Some("minimal") => PushContent::Minimal,
+            Some("full") => PushContent::Full,
+            Some(_) => return Err(ConfigError::Invalid("SHEDU_PUSH_CONTENT")),
+        };
+        // Alarm bildirimi veya giriş kodu gitmeyen bir sistemle başlamak yerine dur (EXC-01).
+        if environment == Environment::Production {
+            if sms.is_none() {
+                return Err(ConfigError::Missing("SHEDU_ILETIMERKEZI_KEY"));
+            }
+            if apns.is_none() {
+                return Err(ConfigError::Missing("SHEDU_APNS_KEY_FILE"));
+            }
+            if fcm.is_none() {
+                return Err(ConfigError::Missing("SHEDU_FCM_SERVICE_ACCOUNT_FILE"));
+            }
+        }
+
         Ok(Self {
             environment,
             addr,
@@ -189,8 +265,109 @@ impl Config {
             data_key_version,
             allowed_origins,
             ai,
+            sms,
+            apns,
+            fcm,
+            push_content,
         })
     }
+}
+
+/// İleti Merkezi: anahtar, hash ve başlık birlikte verilir; hiçbiri yoksa sağlayıcı yok.
+fn sms_settings(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<IletiMerkeziSettings>, ConfigError> {
+    let value = |name| get(name).filter(|v: &String| !v.is_empty());
+    let (key, hash, sender) = (
+        value("SHEDU_ILETIMERKEZI_KEY"),
+        value("SHEDU_ILETIMERKEZI_HASH"),
+        value("SHEDU_SMS_SENDER"),
+    );
+    if key.is_none() && hash.is_none() && sender.is_none() {
+        return Ok(None);
+    }
+    let key = key.ok_or(ConfigError::Missing("SHEDU_ILETIMERKEZI_KEY"))?;
+    let hash = hash.ok_or(ConfigError::Missing("SHEDU_ILETIMERKEZI_HASH"))?;
+    let sender = sender.ok_or(ConfigError::Missing("SHEDU_SMS_SENDER"))?;
+    let credential = |v: &str| v.len() <= 256 && v.bytes().all(|b| b.is_ascii_graphic());
+    if !credential(&key) {
+        return Err(ConfigError::Invalid("SHEDU_ILETIMERKEZI_KEY"));
+    }
+    if !credential(&hash) {
+        return Err(ConfigError::Invalid("SHEDU_ILETIMERKEZI_HASH"));
+    }
+    // Sağlayıcı kuralı: en çok 11 karakter, Türkçe karakter yok.
+    if sender.len() > 11
+        || !sender
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b' ')
+    {
+        return Err(ConfigError::Invalid("SHEDU_SMS_SENDER"));
+    }
+    Ok(Some(IletiMerkeziSettings { key, hash, sender }))
+}
+
+/// APNs: anahtar dosyası, anahtar kimliği, ekip kimliği ve konu birlikte verilir.
+fn apns_settings(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ApnsSettings>, ConfigError> {
+    let value = |name| get(name).filter(|v: &String| !v.is_empty());
+    let names = [
+        "SHEDU_APNS_KEY_FILE",
+        "SHEDU_APNS_KEY_ID",
+        "SHEDU_APNS_TEAM_ID",
+        "SHEDU_APNS_TOPIC",
+    ];
+    let values: Vec<Option<String>> = names.iter().map(|name| value(name)).collect();
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let mut present = Vec::with_capacity(names.len());
+    for (name, v) in names.iter().zip(values) {
+        present.push(v.ok_or(ConfigError::Missing(name))?);
+    }
+    let [key_file, key_id, team_id, topic]: [String; 4] = present
+        .try_into()
+        .map_err(|_| ConfigError::Missing("SHEDU_APNS_KEY_FILE"))?;
+    // Apple'ın kimlikleri 10 karakterlik büyük harf ve rakamdır.
+    let apple_id = |v: &str| {
+        v.len() == 10
+            && v.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    if !apple_id(&key_id) {
+        return Err(ConfigError::Invalid("SHEDU_APNS_KEY_ID"));
+    }
+    if !apple_id(&team_id) {
+        return Err(ConfigError::Invalid("SHEDU_APNS_TEAM_ID"));
+    }
+    // Paket kimliği (ör. `com.ornek.shedu`): başlığa girer, yalnızca güvenli karakterler.
+    if topic.len() > 155
+        || !topic.contains('.')
+        || !topic
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return Err(ConfigError::Invalid("SHEDU_APNS_TOPIC"));
+    }
+    let sandbox = match get("SHEDU_APNS_ENVIRONMENT").as_deref() {
+        None | Some("production") => false,
+        Some("sandbox") => true,
+        Some(_) => return Err(ConfigError::Invalid("SHEDU_APNS_ENVIRONMENT")),
+    };
+    let critical_alerts = match get("SHEDU_APNS_CRITICAL_ALERTS").as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ConfigError::Invalid("SHEDU_APNS_CRITICAL_ALERTS")),
+    };
+    Ok(Some(ApnsSettings {
+        key_file: PathBuf::from(key_file),
+        key_id,
+        team_id,
+        topic,
+        sandbox,
+        critical_alerts,
+    }))
 }
 
 fn secret(
@@ -281,14 +458,146 @@ mod tests {
             ("SHEDU_DATA_KEY", DATA),
         ]));
         assert_eq!(result.err(), Some(ConfigError::Missing("SHEDU_DB_ROLE")));
-        let ok = Config::from_lookup(lookup(&[
+        let mut pairs = vec![
             ("DATABASE_URL", "postgres://db/shedu?sslmode=verify-full"),
             ("SHEDU_DB_ROLE", "shedu_app"),
             ("SHEDU_JWT_SECRET", JWT),
             ("SHEDU_HMAC_SECRET", HMAC),
             ("SHEDU_DATA_KEY", DATA),
-        ]));
-        assert!(ok.is_ok());
+        ];
+        pairs.extend_from_slice(PROVIDERS);
+        assert!(Config::from_lookup(lookup(&pairs)).is_ok());
+    }
+
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("SHEDU_ILETIMERKEZI_KEY", "deneme-anahtar"),
+        ("SHEDU_ILETIMERKEZI_HASH", "deneme-hash"),
+        ("SHEDU_SMS_SENDER", "SHEDU"),
+        ("SHEDU_APNS_KEY_FILE", "/run/secrets/apns.p8"),
+        ("SHEDU_APNS_KEY_ID", "ABC123DEFG"),
+        ("SHEDU_APNS_TEAM_ID", "TEAM123456"),
+        ("SHEDU_APNS_TOPIC", "app.shedu.ios"),
+        ("SHEDU_FCM_SERVICE_ACCOUNT_FILE", "/run/secrets/fcm.json"),
+    ];
+
+    #[test]
+    fn production_requires_sms_and_push_providers() {
+        let base = [
+            ("DATABASE_URL", "postgres://db/shedu?sslmode=verify-full"),
+            ("SHEDU_DB_ROLE", "shedu_app"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
+        ];
+        let without = |skip: &str| {
+            let mut pairs = base.to_vec();
+            pairs.extend(PROVIDERS.iter().filter(|(name, _)| !name.starts_with(skip)));
+            Config::from_lookup(lookup(&pairs)).err()
+        };
+        assert_eq!(
+            without("SHEDU_ILETIMERKEZI").or(without("SHEDU_SMS")),
+            Some(ConfigError::Missing("SHEDU_ILETIMERKEZI_KEY"))
+        );
+        assert_eq!(
+            without("SHEDU_APNS"),
+            Some(ConfigError::Missing("SHEDU_APNS_KEY_FILE"))
+        );
+        assert_eq!(
+            without("SHEDU_FCM"),
+            Some(ConfigError::Missing("SHEDU_FCM_SERVICE_ACCOUNT_FILE"))
+        );
+
+        let mut pairs = base.to_vec();
+        pairs.extend_from_slice(PROVIDERS);
+        let config = Config::from_lookup(lookup(&pairs)).expect("üretim");
+        assert_eq!(config.push_content, PushContent::Minimal);
+        assert!(
+            config
+                .apns
+                .as_ref()
+                .is_some_and(|a| !a.sandbox && !a.critical_alerts)
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("deneme-anahtar") && !debug.contains("deneme-hash"));
+    }
+
+    #[test]
+    fn provider_settings_are_validated() {
+        let base = [
+            ("SHEDU_ENV", "development"),
+            ("DATABASE_URL", "postgres://localhost/shedu"),
+            ("SHEDU_JWT_SECRET", JWT),
+            ("SHEDU_HMAC_SECRET", HMAC),
+            ("SHEDU_DATA_KEY", DATA),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = base.to_vec();
+            pairs.extend_from_slice(extra);
+            Config::from_lookup(lookup(&pairs)).err()
+        };
+        // Geliştirmede sağlayıcı isteğe bağlı; verilirse eksiksiz ve geçerli olmalı.
+        assert_eq!(with(&[]), None);
+        assert_eq!(
+            with(&[("SHEDU_ILETIMERKEZI_KEY", "anahtar")]),
+            Some(ConfigError::Missing("SHEDU_ILETIMERKEZI_HASH"))
+        );
+        assert_eq!(
+            with(&[
+                ("SHEDU_ILETIMERKEZI_KEY", "anahtar"),
+                ("SHEDU_ILETIMERKEZI_HASH", "hash"),
+                ("SHEDU_SMS_SENDER", "ŞEDU"),
+            ]),
+            Some(ConfigError::Invalid("SHEDU_SMS_SENDER"))
+        );
+        assert_eq!(
+            with(&[
+                ("SHEDU_ILETIMERKEZI_KEY", "anahtar"),
+                ("SHEDU_ILETIMERKEZI_HASH", "hash"),
+                ("SHEDU_SMS_SENDER", "COK UZUN BASLIK"),
+            ]),
+            Some(ConfigError::Invalid("SHEDU_SMS_SENDER"))
+        );
+        assert_eq!(
+            with(&[("SHEDU_APNS_KEY_FILE", "/k.p8")]),
+            Some(ConfigError::Missing("SHEDU_APNS_KEY_ID"))
+        );
+        let apns = [
+            ("SHEDU_APNS_KEY_FILE", "/k.p8"),
+            ("SHEDU_APNS_KEY_ID", "ABC123DEFG"),
+            ("SHEDU_APNS_TEAM_ID", "TEAM123456"),
+        ];
+        let apns_with = |topic: &'static str, extra: &[(&'static str, &'static str)]| {
+            let mut pairs = apns.to_vec();
+            pairs.push(("SHEDU_APNS_TOPIC", topic));
+            pairs.extend_from_slice(extra);
+            with(&pairs)
+        };
+        assert_eq!(apns_with("app.shedu.ios", &[]), None);
+        assert_eq!(
+            apns_with("app.shedu.ios\r\nx: y", &[]),
+            Some(ConfigError::Invalid("SHEDU_APNS_TOPIC"))
+        );
+        assert_eq!(
+            apns_with("app.shedu.ios", &[("SHEDU_APNS_ENVIRONMENT", "test")]),
+            Some(ConfigError::Invalid("SHEDU_APNS_ENVIRONMENT"))
+        );
+        assert_eq!(
+            apns_with("app.shedu.ios", &[("SHEDU_APNS_CRITICAL_ALERTS", "evet")]),
+            Some(ConfigError::Invalid("SHEDU_APNS_CRITICAL_ALERTS"))
+        );
+        assert_eq!(
+            with(&[
+                ("SHEDU_APNS_KEY_FILE", "/k.p8"),
+                ("SHEDU_APNS_KEY_ID", "kisa"),
+                ("SHEDU_APNS_TEAM_ID", "TEAM123456"),
+                ("SHEDU_APNS_TOPIC", "app.shedu.ios"),
+            ]),
+            Some(ConfigError::Invalid("SHEDU_APNS_KEY_ID"))
+        );
+        assert_eq!(
+            with(&[("SHEDU_PUSH_CONTENT", "hepsi")]),
+            Some(ConfigError::Invalid("SHEDU_PUSH_CONTENT"))
+        );
     }
 
     #[test]

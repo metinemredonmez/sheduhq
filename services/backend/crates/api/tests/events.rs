@@ -272,7 +272,13 @@ async fn alarm_push_reaches_only_authorized_devices_with_critical_priority(
         "yalnızca ev bölümünü görebilenler"
     );
     assert!(pushes.iter().all(|m| m.priority == PushPriority::Critical));
-    assert_eq!(pushes[0].body, "Hırsızlık alarmı — Ön kapı");
+    // Varsayılan kısa içerik: panel ve zon adı yurt dışındaki sağlayıcıya gitmez.
+    assert!(
+        pushes
+            .iter()
+            .all(|m| m.title == "Shedu" && m.body == "Hırsızlık alarmı")
+    );
+    assert!(pushes.iter().all(|m| m.expires_at > 0));
     assert!(pushes.iter().any(|m| m.user_id.to_string() == owner_id));
 
     let (deliveries,): (i64,) = sqlx::query_as(

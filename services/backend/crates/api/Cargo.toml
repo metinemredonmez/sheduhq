@@ -30,6 +30,7 @@ futures-util.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

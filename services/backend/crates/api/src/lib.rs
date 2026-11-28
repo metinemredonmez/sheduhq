@@ -22,6 +22,7 @@ pub mod members;
 pub mod notifications;
 pub mod panels;
 pub mod privacy;
+pub mod providers;
 pub mod push;
 pub mod simulator;
 pub mod sms;
@@ -66,6 +67,8 @@ pub struct AppState {
     pub allowed_origins: Arc<[String]>,
     /// Push sağlayıcısı. Varsayılan: devre dışı (her gönderim başarısız sayılır).
     pub push: Arc<dyn PushSender>,
+    /// Push bildiriminin içeriği (varsayılan: kısa, ad içermez).
+    pub push_content: push::PushContent,
     /// Uygulama sürüm politikası önbelleği (varsayılan 60 saniye).
     pub versions: Arc<app_version::VersionCache>,
     /// İç AI servisi. Yapılandırılmadıysa AI özellikleri 503 döner; başka hiçbir şey etkilenmez.
@@ -101,6 +104,7 @@ impl AppState {
             simulator_delay: Duration::from_millis(800),
             allowed_origins: Arc::from(Vec::new()),
             push: Arc::new(push::DisabledPush),
+            push_content: push::PushContent::Minimal,
             versions: Arc::new(app_version::VersionCache::new(Duration::from_secs(60))),
             ai: None,
         })

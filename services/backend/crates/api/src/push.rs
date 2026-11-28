@@ -18,8 +18,13 @@
 //! yetkisi olan üyeler; yalnızca etkin oturumu (`session_active`) olan ve push token'ı kayıtlı
 //! cihazlar. Çıkış yapılmış cihaza bildirim gitmez; gönderim anında token silinmişse iş iptal olur.
 //!
-//! Gerçek sağlayıcılar (FCM, APNs) henüz bağlanmadı; üretimde sağlayıcı yoksa API başlamaz.
-//! Bağdaştırıcının gönderim zaman aşımı `LEASE_SECS`'ten kısa olmalıdır.
+//! Sağlayıcılar `providers` modülündedir: iOS → APNs, Android → FCM. Üretimde ikisi de
+//! yapılandırılmadan API başlamaz. Gönderimin üst süresi (`SEND_TIMEOUT`) `LEASE_SECS`'ten kısadır.
+//!
+//! İçerik: bildirim Apple ve Google sunucularından geçer. KVKK aktarım kararına kadar (açık soru
+//! 11) varsayılan içerik kısadır: başlık "Shedu", metin yalnızca olay türü; panel, bölüm ve zon
+//! adları (kullanıcının verdiği adlar) gitmez. Ayrıntı uygulamada açılır. `SHEDU_PUSH_CONTENT=full`
+//! adları da gönderir. Bildirim merkezi (uygulama içi) her zaman tam metni gösterir.
 
 use std::{
     future::Future,
@@ -63,6 +68,16 @@ impl PushPriority {
     }
 }
 
+/// Push bildiriminin içeriği.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PushContent {
+    /// Başlık "Shedu", metin yalnızca olay türü; ad gitmez.
+    #[default]
+    Minimal,
+    /// Başlıkta panel adı, metinde bölüm ve zon adı.
+    Full,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PushMessage {
     /// Cihazın push token'ı. Log'a yazılmaz.
@@ -80,6 +95,9 @@ pub struct PushMessage {
     /// Aynı bildirimin tekrarını cihazda tekilleştirme anahtarı (APNs `apns-collapse-id`, FCM
     /// `collapse_key`). Olay başına sabittir.
     pub collapse_key: String,
+    /// Bu andan sonra (Unix saniye) bildirim gösterilmez: olayın alınmasından bir saat sonrası.
+    /// Sağlayıcı cihaza o zamana kadar ulaşamazsa bildirimi atar.
+    pub expires_at: u64,
 }
 
 pub type PushFuture<'a> = Pin<Box<dyn Future<Output = Result<(), PushError>> + Send + 'a>>;
@@ -90,6 +108,9 @@ pub enum PushError {
     Transient,
     /// Token geçersiz veya cihaz sağlayıcıda kayıtlı değil: yeniden denenmez, token silinir.
     InvalidToken,
+    /// Sağlayıcı isteği kalıcı olarak reddetti (bozuk yük, yanlış yapılandırma, sağlayıcısı
+    /// olmayan platform): yeniden denenmez, token silinmez, hata olarak loglanır.
+    Rejected,
 }
 
 pub trait PushSender: Send + Sync {
@@ -120,12 +141,21 @@ impl PushSender for DevConsolePush {
     }
 }
 
-/// Testler için: gönderilen bildirimleri bellekte tutar; istenirse sonraki gönderimleri geçici
-/// hatayla düşürür.
-#[derive(Default, Clone)]
+/// Testler için: gönderilen bildirimleri bellekte tutar; istenirse sonraki gönderimleri hatayla
+/// düşürür.
+#[derive(Clone)]
 pub struct RecordingPush {
     sent: Arc<Mutex<Vec<PushMessage>>>,
-    failures: Arc<Mutex<usize>>,
+    failures: Arc<Mutex<(usize, PushError)>>,
+}
+
+impl Default for RecordingPush {
+    fn default() -> Self {
+        Self {
+            sent: Arc::default(),
+            failures: Arc::new(Mutex::new((0, PushError::Transient))),
+        }
+    }
 }
 
 impl RecordingPush {
@@ -138,8 +168,13 @@ impl RecordingPush {
 
     /// Sonraki `count` gönderim geçici hata verir.
     pub fn fail_next(&self, count: usize) {
+        self.fail_next_with(count, PushError::Transient);
+    }
+
+    /// Sonraki `count` gönderim verilen hatayı verir.
+    pub fn fail_next_with(&self, count: usize, error: PushError) {
         if let Ok(mut failures) = self.failures.lock() {
-            *failures = count;
+            *failures = (count, error);
         }
     }
 }
@@ -147,13 +182,13 @@ impl RecordingPush {
 impl PushSender for RecordingPush {
     fn send<'a>(&'a self, message: &'a PushMessage) -> PushFuture<'a> {
         Box::pin(async move {
-            let failing = self.failures.lock().is_ok_and(|mut failures| {
-                let fail = *failures > 0;
-                *failures = failures.saturating_sub(1);
-                fail
+            let failing = self.failures.lock().ok().and_then(|mut failures| {
+                let (count, error) = *failures;
+                failures.0 = count.saturating_sub(1);
+                (count > 0).then_some(error)
             });
-            if failing {
-                return Err(PushError::Transient);
+            if let Some(error) = failing {
+                return Err(error);
             }
             if let Ok(mut sent) = self.sent.lock() {
                 sent.push(message.clone());
@@ -278,6 +313,9 @@ pub async fn sweep_pending(state: &AppState) -> usize {
     }
     count
 }
+
+/// Alınan iş: olay, kişi, cihaz, deneme, öncelik, süresi geçti mi, son geçerlilik (Unix sn).
+type ClaimRow = (i64, Uuid, Option<Uuid>, i16, String, bool, i64);
 
 type EventRow = (
     Uuid,
@@ -423,7 +461,7 @@ async fn deliver(
     set_context(&mut tx, None, Some(organization_id)).await?;
     //    Deneme hakkı biten iş alınmaz (taramadaki kapatma onu `failed` yapar); yaş olayın alınma
     //    zamanından ölçülür.
-    let claimed: Option<(i64, Uuid, Option<Uuid>, i16, String, bool)> = sqlx::query_as(
+    let claimed: Option<ClaimRow> = sqlx::query_as(
         "UPDATE push_deliveries d
             SET status = 'sending', attempts = d.attempts + 1, updated_at = now(),
                 lease_until = now() + make_interval(secs => $2)
@@ -434,7 +472,8 @@ async fn deliver(
             AND ((d.status = 'pending' AND d.next_attempt_at <= now())
                  OR (d.status = 'sending' AND d.lease_until < now()))
           RETURNING d.panel_event_id, d.user_id, d.device_id, d.attempts, d.priority,
-                    e.received_at < now() - make_interval(mins => $3)",
+                    e.received_at < now() - make_interval(mins => $3),
+                    extract(epoch FROM e.received_at + make_interval(mins => $3))::bigint",
     )
     .bind(delivery_id)
     .bind(LEASE_SECS)
@@ -442,7 +481,8 @@ async fn deliver(
     .bind(MAX_ATTEMPTS)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((event_id, user_id, device_id, attempt, priority, too_old)) = claimed else {
+    let Some((event_id, user_id, device_id, attempt, priority, too_old, expires_at)) = claimed
+    else {
         tx.commit().await?;
         return Ok(Delivery::Skipped);
     };
@@ -502,15 +542,18 @@ async fn deliver(
     };
     tx.commit().await?;
 
-    let (title, body) = text(
-        &kind,
-        alarm_kind.as_deref(),
-        arm_mode.as_deref(),
-        &panel_name,
-        partition_name.as_deref(),
-        zone_name.as_deref(),
-        zone_number,
-    );
+    let (title, body) = match state.push_content {
+        PushContent::Full => text(
+            &kind,
+            alarm_kind.as_deref(),
+            arm_mode.as_deref(),
+            &panel_name,
+            partition_name.as_deref(),
+            zone_name.as_deref(),
+            zone_number,
+        ),
+        PushContent::Minimal => minimal_text(&kind, alarm_kind.as_deref(), arm_mode.as_deref()),
+    };
     let message = PushMessage {
         token,
         platform,
@@ -523,6 +566,7 @@ async fn deliver(
         event_id,
         kind,
         collapse_key: format!("shedu-event-{event_id}"),
+        expires_at: u64::try_from(expires_at).unwrap_or_default(),
     };
 
     // 2. Gönderim veritabanı işlemi dışında ve süre sınırıyla; süre dolarsa geçici hata sayılır.
@@ -563,6 +607,15 @@ async fn deliver(
                     "push token geçersiz; cihazın token'ı silindi"
                 );
             }
+            Delivery::Abandoned
+        }
+        Err(PushError::Rejected) => {
+            finish(&mut tx, delivery_id, attempt, "failed", None).await?;
+            tracing::error!(
+                event_id,
+                delivery_id,
+                "push sağlayıcısı bildirimi reddetti; yeniden denenmeyecek"
+            );
             Delivery::Abandoned
         }
         Err(PushError::Transient) if attempt >= MAX_ATTEMPTS => {
@@ -637,6 +690,29 @@ fn alarm_label(alarm_kind: Option<&str>) -> &'static str {
     }
 }
 
+/// Kısa içerik: başlık "Shedu", metin yalnızca olay türü. Kullanıcının verdiği adlar (panel,
+/// bölüm, zon) yurt dışındaki push sağlayıcısına gitmez.
+pub(crate) fn minimal_text(
+    kind: &str,
+    alarm_kind: Option<&str>,
+    arm_mode: Option<&str>,
+) -> (String, String) {
+    let body = match kind {
+        "alarm" => alarm_label(alarm_kind).to_owned(),
+        "armed" => match arm_mode {
+            Some("stay") => "Sistem evde kipinde kuruldu".to_owned(),
+            Some("night") => "Sistem gece kipinde kuruldu".to_owned(),
+            _ => "Sistem kuruldu".to_owned(),
+        },
+        "disarmed" => "Sistem kapatıldı".to_owned(),
+        "disconnected" => "Panel bağlantısı koptu".to_owned(),
+        "connected" => "Panel yeniden bağlandı".to_owned(),
+        "power_problem" => "Güç sorunu (pil veya şebeke)".to_owned(),
+        _ => "Yeni olay".to_owned(),
+    };
+    ("Shedu".to_owned(), body)
+}
+
 pub(crate) fn text(
     kind: &str,
     alarm_kind: Option<&str>,
@@ -701,6 +777,16 @@ mod tests {
     }
 
     #[test]
+    fn minimal_text_never_contains_names() {
+        let (title, body) = minimal_text("alarm", Some("fire"), None);
+        assert_eq!((title.as_str(), body.as_str()), ("Shedu", "Yangın alarmı"));
+        let (_, body) = minimal_text("armed", None, Some("night"));
+        assert_eq!(body, "Sistem gece kipinde kuruldu");
+        let (_, body) = minimal_text("disarmed", None, None);
+        assert_eq!(body, "Sistem kapatıldı");
+    }
+
+    #[test]
     fn push_message_serialization_never_contains_token() {
         let message = PushMessage {
             token: "gizli-cihaz-tokeni".into(),
@@ -714,6 +800,7 @@ mod tests {
             event_id: 1,
             kind: "alarm".into(),
             collapse_key: "shedu-event-1".into(),
+            expires_at: 0,
         };
         assert!(
             !serde_json::to_string(&message)

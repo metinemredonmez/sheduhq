@@ -38,9 +38,13 @@ tokio-tungstenite = "0.30"
 futures-util = "0.3"
 # Yönetici komut satırı aracı (shedu-admin).
 clap = { version = "4.6", features = ["derive", "env"] }
-# İç AI servisine HTTP istemcisi. TLS rustls + ring (sqlx ile aynı kripto sağlayıcısı); vekil
-# sunucu ve sistem vekil ayarı kapalı.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# İç AI servisine ve bildirim sağlayıcılarına (APNs, FCM, İleti Merkezi) HTTP istemcisi. TLS
+# rustls + ring (sqlx ile aynı kripto sağlayıcısı); vekil sunucu ve sistem vekil ayarı kapalı.
+# APNs yalnızca HTTP/2 kabul eder.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+# Sağlayıcılara giden kimlik doğrulama imzaları: APNs ES256, Google hizmet hesabı RS256. Gelen
+# token'ların doğrulanmasında kullanılmaz (orada yalnızca HS256, TOK-01).
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [workspace.lints.rust]

@@ -229,6 +229,39 @@ async fn push_retries_failures_and_recovers_lost_work(_: PgPoolOptions, connect:
     app.push.fail_next(0);
 }
 
+/// Sağlayıcının kalıcı reddi (bozuk yük, yanlış yapılandırma, sağlayıcısı olmayan platform)
+/// yeniden denenmez ve cihazın token'ını silmez; iş kalıcı hata olarak kapanır.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rejected_push_is_not_retried_and_keeps_the_token(
+    _: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let app = app(connect).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let d = demo(&app, &owner, &org).await;
+    set_token(&app, &owner, "tok-owner").await;
+    let org_id: Uuid = org.parse().expect("uuid");
+
+    let event = event_id(&simulate(&app, &owner, &d, 3).await);
+    app.push.fail_next_with(1, push::PushError::Rejected);
+    assert_eq!(
+        push::dispatch(&app.state, org_id, event)
+            .await
+            .expect("dağıtım"),
+        0
+    );
+    assert_eq!(delivery(&app, event).await, ("failed".to_owned(), 1));
+    push::sweep_pending(&app.state).await;
+    assert_eq!(delivery(&app, event).await, ("failed".to_owned(), 1));
+    assert!(app.push.messages().is_empty());
+    let (tokens,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM user_devices WHERE push_token = 'tok-owner'")
+            .fetch_one(&app.admin)
+            .await
+            .expect("sayım");
+    assert_eq!(tokens, 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // S02, S05: oturum kuralı ve kimlik bilgisi sürümü
 // ---------------------------------------------------------------------------------------------

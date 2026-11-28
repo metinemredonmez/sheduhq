@@ -5,6 +5,7 @@ use shedu_api::{
     auth::rate_limit,
     config::{Config, Environment},
     db,
+    providers::{PlatformPush, apns::Apns, fcm::Fcm, iletimerkezi::IletiMerkezi},
     push::{DevConsolePush, PushSender},
     sms::{DevConsoleSms, SmsSender},
 };
@@ -21,15 +22,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_env()?;
 
-    // Üretim için SMS ve push sağlayıcıları henüz yok: alarm bildirimi gitmeyen bir sistemle
-    // başlamak yerine dur (KEY-01, EXC-01).
-    let (sms, push): (Arc<dyn SmsSender>, Arc<dyn PushSender>) = match config.environment {
-        Environment::Development => (Arc::new(DevConsoleSms), Arc::new(DevConsolePush)),
-        Environment::Production => {
-            return Err(
-                "üretim için SMS ve push sağlayıcıları yapılandırılmadı; API başlatılmadı".into(),
-            );
-        }
+    // Sağlayıcılar açılışta kurulur; anahtar dosyası okunamazsa veya geçersizse API başlamaz.
+    // Üretimde üçü de zorunludur (yapılandırma bunu denetler); geliştirmede verilmeyen sağlayıcının
+    // yerine konsola yazan gönderici kullanılır (KEY-01, EXC-01).
+    let production = matches!(config.environment, Environment::Production);
+    if production && (config.sms.is_none() || config.apns.is_none() || config.fcm.is_none()) {
+        return Err(
+            "üretim için SMS ve push sağlayıcıları yapılandırılmadı; API başlatılmadı".into(),
+        );
+    }
+    let sms: Arc<dyn SmsSender> = match &config.sms {
+        Some(settings) => Arc::new(IletiMerkezi::new(settings)?),
+        None => Arc::new(DevConsoleSms),
+    };
+    let push: Arc<dyn PushSender> = if config.apns.is_none() && config.fcm.is_none() {
+        Arc::new(DevConsolePush)
+    } else {
+        Arc::new(PlatformPush {
+            apns: config.apns.as_ref().map(Apns::new).transpose()?,
+            fcm: config.fcm.as_ref().map(Fcm::new).transpose()?,
+        })
     };
 
     let options: PgConnectOptions = config.database_url.parse()?;
@@ -50,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|_| "uygulama durumu kurulamadı")?;
     state.allowed_origins = config.allowed_origins.clone().into();
     state.push = push;
+    state.push_content = config.push_content;
     if let Some(ai) = &config.ai {
         let client = shedu_api::ai::AiClient::new(&ai.url, &ai.token)
             .map_err(|_| "AI servisi istemcisi kurulamadı")?

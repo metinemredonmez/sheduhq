@@ -104,6 +104,15 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
   satırı `FOR NO KEY UPDATE` ile kilitlenir; oturum yenilemenin yabancı anahtar denetimini
   bekletmez. Komutta önce bölüm, sonra komut kilitlenir (sanal panel de aynı sırayla). Açık işlem
   içinde parola (Argon2) doğrulanmaz.
+- **SMS sağlayıcısı:** İleti Merkezi (`POST /v1/send-sms/json`, veri Türkiye'de). Anahtar ve hash
+  (`SHEDU_ILETIMERKEZI_KEY`, `SHEDU_ILETIMERKEZI_HASH`) panelden alınır; gönderici adı
+  (`SHEDU_SMS_SENDER`) panelde onaylı olmalı (en çok 11 karakter, Türkçe karakter yok). Bütün
+  Shedu SMS'leri işlem amaçlıdır (kod, davet, güvenlik bildirimi): `iys` her zaman `"0"`, pazarlama
+  SMS'i bu yoldan gitmez. Ağ hatası, zaman aşımı ve 5xx en fazla iki kez daha denenir; sağlayıcı
+  aynı başlık, alıcı ve metni kısa sürede ikinci kez reddettiği için (451, gönderildi sayılır)
+  yeniden deneme mesajı çoğaltmaz. Kimlik, bakiye, onaysız başlık ve hatalı numara denenmez, hata
+  olarak loglanır (numara maskeli bile yazılmaz). SMS arka planda gider; yanıt süresi kodun
+  gönderilip gönderilmediğini belli etmez.
 - **Deneme sınırları:** hesap, IP ve bütün sistem için ayrı sayaçlar; PostgreSQL'de, bütün API
   kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır. Kod
   başına 5 denemeye ek olarak hesap başına 24 saatte en fazla 20 başarısız doğrulama (SMS
@@ -116,7 +125,8 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
 - **Dışarıya açılma:** API varsayılan olarak yalnızca `127.0.0.1`'i dinler. Dışarıdan yalnızca
   TLS'li ters vekil üzerinden erişilir; doğrudan erişime kapalıdır (NET-02). Ters vekil arkasında
   gerçek istemci IP'si için güvenilir vekil listesi henüz yapılandırılmadı (NET-03).
-- **Üretim koruması:** üretimde SMS sağlayıcısı yoksa, veritabanı bağlantısı sunucu sertifikasını ve
+- **Üretim koruması:** üretimde SMS veya push sağlayıcısı (İleti Merkezi, APNs, FCM) yoksa ya da
+  anahtar dosyaları okunamıyorsa, veritabanı bağlantısı sunucu sertifikasını ve
   ana makine adını doğrulamıyorsa (ayrıştırılmış etkin `sslmode` `verify-full` değilse) veya
   sırlar (`SHEDU_JWT_SECRET`, `SHEDU_HMAC_SECRET`, `SHEDU_DATA_KEY`) kısa ya da aynıysa API
   başlamaz. Üretimde `SHEDU_DB_ROLE` zorunludur ve her ortamda açılışta bağlantı rolü denetlenir:
@@ -218,10 +228,37 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   gönderimde de aynen uygulanır: kuyrukta beklerken üyeliği, yetkisi veya oturumu düşen kişiye
   bildirim gitmez. Çıkışta, oturum kapatmada ve parola sıfırlamada token silinir. Aynı
   token başka hesaba kaydedilirse eski hesaptan kaldırılır.
-- **Öncelik:** alarm `critical` (iOS kritik uyarı, Android alarm kanalı), bağlantı kopması ve güç
-  sorunu `warning`, kurma/kapatma `info`.
-- **Sağlayıcı:** FCM/APNs henüz bağlanmadı; geliştirmede konsola yazılır, üretimde sağlayıcı yoksa
-  API başlamaz.
+- **Öncelik:** alarm `critical`, bağlantı kopması ve güç sorunu `warning`, kurma/kapatma `info`.
+- **Sağlayıcılar:** iOS cihazlara APNs, Android cihazlara FCM HTTP v1 doğrudan (aracı push servisi
+  yok); kod `crates/api/src/providers/`. Mobil uygulama yerel token'ı (`getDevicePushTokenAsync`)
+  kaydeder. Sağlayıcısı olmayan platform (`web`) kalıcı hatayla kapanır. Üretimde ikisi de
+  zorunludur; geliştirmede verilmezse konsola yazılır.
+  - **APNs:** `.p8` anahtarıyla ES256 imzalı sağlayıcı token'ı (40 dakikada bir yenilenir), HTTP/2.
+    `apns-collapse-id` olay başına sabit, `apns-expiration` olaydan bir saat sonrası, alarm ve
+    uyarıda öncelik 10. Kritik uyarı (sessiz modu aşan) Apple'ın izniyle çalışır (açık soru 7):
+    `SHEDU_APNS_CRITICAL_ALERTS=true` olmadan alarm `time-sensitive` gider.
+  - **FCM:** Google hizmet hesabıyla RS256 imzalı onay → yalnızca `firebase.messaging` kapsamlı
+    erişim token'ı (süresi dolmadan 5 dakika önce yenilenir, aynı anda tek yenileme). Hizmet hesabı
+    dosyasındaki `token_uri` Google'ın adresi değilse açılış reddedilir. Android kanalları
+    uygulamada tanımlanır: `alarm` (sessiz modu aşan), `warning`, `info`. `collapse_key` ve bildirim
+    `tag`'i olay başına sabit, `ttl` olaydan bir saat sonrasına kadar.
+  - **Sonuçlar:** gönderildi; geçersiz token (APNs 410, `BadDeviceToken`,
+    `DeviceTokenNotForTopic`; FCM `UNREGISTERED`, `SENDER_ID_MISMATCH`) → token silinir; geçici
+    (ağ, 429, 5xx, reddedilen sağlayıcı/erişim token'ı → yenisi alınır) → yeniden denenir;
+    kalıcı ret (bozuk yük, yanlış konu, yetkisiz hizmet hesabı) → yeniden denenmez, token silinmez,
+    hata olarak loglanır. Biçimi bozuk cihaz token'ı (APNs onaltılık, FCM `[A-Za-z0-9:_.-]`)
+    sağlayıcıya gönderilmez.
+  - **İçerik:** bildirim Apple ve Google sunucularından geçer; KVKK aktarım kararına kadar (açık
+    soru 11) varsayılan içerik kısadır: başlık "Shedu", metin yalnızca olay türü ("Yangın alarmı",
+    "Sistem kuruldu"). Panel, bölüm ve zon adları gitmez; veri alanında yalnızca organizasyon,
+    panel ve olay kimliği ile olay türü vardır (kişi kimliği, telefon yok). Uygulama ayrıntıyı
+    açarken API'den okur. `SHEDU_PUSH_CONTENT=full` adları da gönderir. Bildirim merkezi her zaman
+    tam metni gösterir.
+  - **Ayarlar:** `SHEDU_APNS_KEY_FILE`, `SHEDU_APNS_KEY_ID`, `SHEDU_APNS_TEAM_ID`,
+    `SHEDU_APNS_TOPIC` (paket kimliği), `SHEDU_APNS_ENVIRONMENT` (`production` / `sandbox`),
+    `SHEDU_APNS_CRITICAL_ALERTS`; `SHEDU_FCM_SERVICE_ACCOUNT_FILE`; `SHEDU_PUSH_CONTENT`
+    (`minimal` / `full`). Anahtarlar dosya olarak verilir (ör. sır deposundan bağlanan dosya),
+    depoda ve imajda bulunmaz.
 - **Sanal alarm:** hırsızlık zonu yalnızca kurulu bölümde, yangın/gaz/su/panik/tıbbi/sabotaj zonu
   her zaman alarm verir; bypass edilmiş zon alarm vermez.
 - **Bildirim tercihleri:** `GET`/`PATCH /v1/organizations/{org_id}/notification-preferences`.

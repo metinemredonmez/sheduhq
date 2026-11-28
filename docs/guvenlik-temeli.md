@@ -29,6 +29,7 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
 | Veri | DAT-01, DAT-02, AZ-03 | Kişisel veri dışa aktarma yalnızca kişinin kendi verisi; yeniden doğrulama, günlük sınır, dosya sunucuda tutulmaz | Doğrulanacak |
 | Veri | DAT-05 | Hesap silme: 30 gün geri alınabilir talep, sonra anonimleştirme ve yok etme tek işlemde; güvenlik kayıtları kimliksiz kalır; rıza defteri yalnızca eklenir | Doğrulanacak |
 | AI | AI-01, AI-02, AI-03 | Modelin aracı yok; yalnızca görünür ve kimliksiz veri; kesin bilgi koddan; sonuçtan bağımsız maliyet defteri ve bütçe; bayrakla kapalı | Doğrulanacak |
+| Dış entegrasyon | EXT-01, EXT-02, EXT-03, EXT-05, KEY-02 | Push (APNs, FCM) ve SMS (İleti Merkezi): sabit HTTPS adresleri, yönlendirme ve vekil yok, süre ve yanıt boyutu sınırı; anahtarlar dosyadan, log'da ve `Debug` çıktısında yok; cihaz token'ı adrese girmeden biçimi denetlenir; push içeriği varsayılan olarak ad taşımaz | Doğrulanacak |
 | Üretim | OPS-01 | Güvenli üretim profili; debug ve sunucu seçici yok; varsayılan dinleme adresi `127.0.0.1` | Doğrulanacak |
 | Build | OPS-04 | CODEOWNERS, korumalı `main`, Dependabot, en az yetkili CI | Doğrulanacak |
 | Hata | ARC-05, EXC-01 | Arıza halinde güvenli davranış: belirsizse komut reddedilir | Doğrulanacak |
@@ -227,6 +228,19 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   | Y10 | AI-03 | Uygulama deftere doğrudan yazamaz (`ai_settle`); sert üst sınırlar; eksik/negatif kullanım tahminle kapanır; commit ve çağrı aynı görevde; sağlayıcının 5xx'i (529 hariç) faturalanmış olabilir sayılır | Geçti (yerel) |
   | Y11 | AI-02 | Son bağlantı durumu sayılarla aynı sorguda | Geçti (yerel) |
   | K01 | BUS-01 | Reddedilen komutun tekrarı ilk yanıtla aynı 409 ve kodu döner | Geçti (yerel) |
+- **Bildirim sağlayıcıları (28 Kasım 2026; EXT-01, EXT-02, EXT-03, EXT-05, KEY-01, KEY-02, LOG-02,
+  BUS-02, DAT-02):** `crates/api/src/providers/` birim testleri yerel sahte sunucuyla: APNs
+  sağlayıcı token'ı ES256 ile imzalı ve doğru anahtar ve ekip kimliğiyle, önbellekten gelir,
+  reddedilince yenilenir; `apns-collapse-id`, süre ve öncelik başlıkları; kritik uyarı yalnızca
+  ayarla; onaltılık olmayan token (ör. `../../`) hiç gönderilmez. FCM erişim token'ı bir kez
+  alınır, 401'de yenilenir; hizmet hesabı dosyasındaki yabancı `token_uri`, başka hesap türü ve
+  bozuk proje kimliği açılışta reddedilir; `UNREGISTERED` token'ı siler, `INVALID_ARGUMENT` yeniden
+  denenmez. İleti Merkezi isteği `iys: "0"` ve onaylı başlıkla gider; 5xx iki kez daha denenir,
+  451 gönderildi sayılır, 401/402/450/466 denenmez. Gövdeler istemci kimliği, cihaz token'ı ve
+  kişi kimliği taşımaz; `Debug` çıktısı anahtar, hash ve token içermez. Üretimde üç sağlayıcı
+  zorunlu (`config.rs` testleri). Kuyrukta kalıcı ret token'ı silmeden işi kapatır
+  (`audit_fixes.rs`), varsayılan push metni ad içermez (`events.rs`). Gerçek Apple, Google ve
+  İleti Merkezi hesaplarıyla gönderim yapılmadı; anahtarlar alınınca uçtan uca denenecek.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -306,8 +320,22 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
     12) verilene kadar açılmayacak. Model sağlayıcısıyla veri saklama koşulları da bu kararla
     birlikte ele alınacak.
   - DAT-01: silinen kullanıcının eski numarasını içeren SMS sağlayıcısı kayıtları ve push
-    sağlayıcısındaki cihaz kayıtları Shedu'nun dışındadır; sağlayıcılar bağlanırken
-    sözleşmeyle ele alınacak.
+    sağlayıcısındaki cihaz kayıtları Shedu'nun dışındadır; İleti Merkezi, Apple ve Google ile
+    veri işleme koşulları sözleşmeyle ele alınacak.
+  - KVKK (açık soru 11): push Apple ve Google üzerinden yurt dışına çıkar. Karar verilene kadar
+    içerik kısa (`SHEDU_PUSH_CONTENT=minimal`): olay türü ve kimlikler gider, ad gitmez. Cihaz
+    token'ı ve olay zamanı yine de sağlayıcıya ulaşır.
+  - KEY-03: APNs anahtarı, Google hizmet hesabı anahtarı ve İleti Merkezi anahtarı için rotasyon
+    yordamı yazılmadı; değişim dosyanın veya ortam değişkeninin değişip API'nin yeniden
+    başlatılmasıyla olur. Google hizmet hesabının yalnızca FCM gönderme yetkisi olmalı (en az
+    yetki); bu Google tarafında ayarlanır ve kodla denetlenmez.
+  - EXT-02: sağlayıcı adresleri sabit ve TLS doğrulamalı, ama ağ düzeyinde çıkış kısıtı (egress
+    izin listesi) altyapıda henüz yok.
+  - BUS-02: SMS yeniden denemesi sağlayıcının 451 tekrar korumasına dayanır; korumanın süresi
+    belgede "kısa süre" diye geçiyor, ölçülmedi. Push'ta Apple ve Google'ın `collapse-id`/`tag`
+    tekilleştirmesi gerçek cihazda denenmedi.
+  - iOS kritik uyarı Apple'ın iznine bağlı (açık soru 7); izin gelene kadar alarm sessiz modu
+    aşmaz.
 
 ## Değişmez kurallar
 
