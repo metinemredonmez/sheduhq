@@ -12,7 +12,9 @@
 //!    alınır: bildirim kaybolmaz (en az bir kez). Aynı bildirimin ikinci kez gitmesi yalnızca
 //!    sağlayıcının kabulü ile sonucun yazılması arasındaki kesintide olur; sağlayıcı bağdaştırıcısı
 //!    `collapse_key`'i (APNs `apns-collapse-id`, FCM `collapse_key`) kullanarak cihazda tekilleştirir.
-//! 4. Kaçırılan olaylar ve zamanı gelen işler düzenli taramayla yakalanır.
+//! 4. Kaçırılan olaylar ve zamanı gelen işler düzenli taramayla yakalanır. Tarama yeni olayların
+//!    dağıtımından ayrı yürür ve işler sınırlı sayıda eşzamanlı gönderilir: yavaş veya düşmüş bir
+//!    sağlayıcı (iş başına en çok `SEND_TIMEOUT`) yeni alarmları ve öbür platformu bekletmez.
 //!
 //! Alıcılar: organizasyonun yöneticileri, operatörleri ve o panelde (bölüm düzeyinde) geçerli görme
 //! yetkisi olan üyeler; yalnızca etkin oturumu (`session_active`) olan ve push token'ı kayıtlı
@@ -33,8 +35,12 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{StreamExt, stream};
 use serde::Serialize;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::{
+    sync::{Semaphore, broadcast::error::RecvError},
+    time::MissedTickBehavior,
+};
 use uuid::Uuid;
 
 use crate::{AppState, db::set_context, notifications};
@@ -147,6 +153,7 @@ impl PushSender for DevConsolePush {
 pub struct RecordingPush {
     sent: Arc<Mutex<Vec<PushMessage>>>,
     failures: Arc<Mutex<(usize, PushError)>>,
+    delay: Arc<Mutex<Duration>>,
 }
 
 impl Default for RecordingPush {
@@ -154,6 +161,7 @@ impl Default for RecordingPush {
         Self {
             sent: Arc::default(),
             failures: Arc::new(Mutex::new((0, PushError::Transient))),
+            delay: Arc::default(),
         }
     }
 }
@@ -171,6 +179,13 @@ impl RecordingPush {
         self.fail_next_with(count, PushError::Transient);
     }
 
+    /// Her gönderim bu kadar bekler (yavaş sağlayıcı).
+    pub fn set_delay(&self, delay: Duration) {
+        if let Ok(mut current) = self.delay.lock() {
+            *current = delay;
+        }
+    }
+
     /// Sonraki `count` gönderim verilen hatayı verir.
     pub fn fail_next_with(&self, count: usize, error: PushError) {
         if let Ok(mut failures) = self.failures.lock() {
@@ -182,6 +197,10 @@ impl RecordingPush {
 impl PushSender for RecordingPush {
     fn send<'a>(&'a self, message: &'a PushMessage) -> PushFuture<'a> {
         Box::pin(async move {
+            let delay = self.delay.lock().map(|d| *d).unwrap_or_default();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let failing = self.failures.lock().ok().and_then(|mut failures| {
                 let (count, error) = *failures;
                 failures.0 = count.saturating_sub(1);
@@ -209,6 +228,12 @@ const MAX_AGE_MINUTES: i32 = 60;
 /// beklenirken iş başka bir kopyaya geçmez, tarama da tek bir çağrıda takılı kalmaz.
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Aynı anda dağıtılan en fazla olay sayısı (kopya başına).
+const CONCURRENT_EVENTS: usize = 3;
+/// Bir grupta aynı anda gönderilen en fazla teslim işi. Her iş veritabanı bağlantısını yalnızca
+/// kısa işlemlerde tutar, sağlayıcıyı beklerken tutmaz; havuz (20) bu sınırlarla dolmaz.
+const CONCURRENT_DELIVERIES: usize = 4;
+
 /// Geçici hatadan sonra bir sonraki denemeye kadar bekleme (saniye).
 fn retry_delay_secs(attempts: i16) -> f64 {
     match attempts {
@@ -221,28 +246,58 @@ fn retry_delay_secs(attempts: i16) -> f64 {
 }
 
 /// Olay bildirimlerini dinleyen dağıtıcı ve kaçırılan olaylar için düzenli tarama.
+///
+/// İkisi aynı görevde ama birbirini beklemeden yürür: tarama sağlayıcı yanıtını beklerken yeni
+/// olaylar dağıtılmaya devam eder. Her yeni olay ayrı görevde dağıtılır (aynı anda en çok
+/// `CONCURRENT_EVENTS`). Tarama turu bitmeden sonraki başlamaz; turlar arasında en az 5 saniye
+/// vardır.
 pub fn start_dispatcher(state: &AppState) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     tokio::spawn(async move {
-        let mut events = state.events.subscribe();
-        let mut sweep = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            tokio::select! {
-                received = events.recv() => match received {
+        let listen = async {
+            let mut events = state.events.subscribe();
+            let limit = Arc::new(Semaphore::new(CONCURRENT_EVENTS));
+            loop {
+                match events.recv().await {
                     Ok(event) if event.kind == "panel_event" => {
-                        if let Ok(id) = event.id.parse::<i64>()
-                            && let Err(error) = dispatch(&state, event.org, id).await
-                        {
-                            tracing::warn!(?error, event_id = id, "push dağıtımı başarısız; tarama yeniden deneyecek");
-                        }
+                        let Ok(id) = event.id.parse::<i64>() else {
+                            continue;
+                        };
+                        let Ok(permit) = limit.clone().acquire_owned().await else {
+                            break;
+                        };
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = dispatch(&state, event.org, id).await {
+                                tracing::warn!(
+                                    ?error,
+                                    event_id = id,
+                                    "push dağıtımı başarısız; tarama yeniden deneyecek"
+                                );
+                            }
+                            drop(permit);
+                        });
                     }
-                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Ok(_) => {}
+                    // Kaçırılan olayları tarama yakalar (`pending_panel_events`).
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "olay akışında gecikme; tarama yakalayacak");
+                    }
                     Err(RecvError::Closed) => break,
-                },
-                _ = sweep.tick() => {
-                    sweep_pending(&state).await;
                 }
             }
+        };
+        let sweep = async {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                sweep_pending(&state).await;
+            }
+        };
+        tokio::select! {
+            () = listen => {}
+            () = sweep => {}
         }
     })
 }
@@ -276,8 +331,15 @@ pub async fn sweep_pending(state: &AppState) -> usize {
     .await
     {
         Ok(pending) => {
-            for (id, organization_id) in pending {
-                match dispatch(state, organization_id, id).await {
+            let results: Vec<_> = stream::iter(pending)
+                .map(|(id, organization_id)| async move {
+                    (id, dispatch(state, organization_id, id).await)
+                })
+                .buffer_unordered(CONCURRENT_EVENTS)
+                .collect()
+                .await;
+            for (id, result) in results {
+                match result {
                     Ok(_) => count += 1,
                     Err(error) => tracing::warn!(
                         ?error,
@@ -297,8 +359,15 @@ pub async fn sweep_pending(state: &AppState) -> usize {
     .await
     {
         Ok(due) => {
-            for (id, organization_id) in due {
-                match deliver(state, organization_id, id).await {
+            let results: Vec<_> = stream::iter(due)
+                .map(|(id, organization_id)| async move {
+                    (id, deliver(state, organization_id, id).await)
+                })
+                .buffer_unordered(CONCURRENT_DELIVERIES)
+                .collect()
+                .await;
+            for (id, result) in results {
+                match result {
                     Ok(Delivery::Skipped) => {}
                     Ok(_) => count += 1,
                     Err(error) => tracing::warn!(
@@ -338,9 +407,14 @@ pub async fn dispatch(
     event_id: i64,
 ) -> Result<usize, sqlx::Error> {
     let deliveries = fan_out(state, organization_id, event_id).await?;
+    let results: Vec<_> = stream::iter(deliveries)
+        .map(|id| deliver(state, organization_id, id))
+        .buffer_unordered(CONCURRENT_DELIVERIES)
+        .collect()
+        .await;
     let mut sent = 0;
-    for id in deliveries {
-        if deliver(state, organization_id, id).await? == Delivery::Sent {
+    for result in results {
+        if result? == Delivery::Sent {
             sent += 1;
         }
     }

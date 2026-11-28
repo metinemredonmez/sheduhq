@@ -222,6 +222,16 @@ async fn login_is_throttled_per_account_without_locking_others_or_recovery(
     app.register(PHONE).await;
     app.register("+905557776655").await;
 
+    // Hesap sayacı sabit 15 dakikalık pencerededir: test pencere sınırına denk gelirse sayaç
+    // sıfırlanır ve test yanlışlıkla kalır. Sınıra 30 saniyeden az kaldıysa sınırı bekle.
+    let into_window = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() % 900)
+        .unwrap_or_default();
+    if into_window > 870 {
+        tokio::time::sleep(std::time::Duration::from_secs(901 - into_window)).await;
+    }
+
     for _ in 0..10 {
         assert_eq!(
             app.login(PHONE, "yanlis ama uzun bir parola").await.0,

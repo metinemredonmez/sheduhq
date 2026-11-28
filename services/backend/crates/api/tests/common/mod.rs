@@ -191,7 +191,7 @@ impl TestApp {
                 "/v1/auth/register/complete",
                 json!({
                     "phone": phone, "code": code, "display_name": "Ayşe",
-                    "password": PASSWORD, "device": { "platform": "ios", "name": "iPhone" }
+                    "password": PASSWORD, "device": { "platform": "android", "name": "Pixel" }
                 }),
             )
             .await;

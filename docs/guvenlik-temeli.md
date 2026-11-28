@@ -232,15 +232,20 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   BUS-02, DAT-02):** `crates/api/src/providers/` birim testleri yerel sahte sunucuyla: APNs
   sağlayıcı token'ı ES256 ile imzalı ve doğru anahtar ve ekip kimliğiyle, önbellekten gelir,
   reddedilince yenilenir; `apns-collapse-id`, süre ve öncelik başlıkları; kritik uyarı yalnızca
-  ayarla; onaltılık olmayan token (ör. `../../`) hiç gönderilmez. FCM erişim token'ı bir kez
-  alınır, 401'de yenilenir; hizmet hesabı dosyasındaki yabancı `token_uri`, başka hesap türü ve
-  bozuk proje kimliği açılışta reddedilir; `UNREGISTERED` token'ı siler, `INVALID_ARGUMENT` yeniden
-  denenmez. İleti Merkezi isteği `iys: "0"` ve onaylı başlıkla gider; 5xx iki kez daha denenir,
+  ayarla; onaltılık olmayan token (ör. `../../`) hiç gönderilmez; reddedilen sağlayıcı token'ı 20
+  dakikadan yeniyse korunur. FCM erişim token'ı bir kez alınır, 401'de yenilenir; hizmet hesabı
+  dosyasındaki yabancı `token_uri`, başka hesap türü ve bozuk proje kimliği açılışta reddedilir.
+  Token'ı yalnızca "cihaz kayıtlı değil" yanıtı (APNs 410, FCM `UNREGISTERED`) siler; yanlış
+  ortam, paket kimliği veya proje ayarında dönen yanıtlar (`BadDeviceToken`,
+  `DeviceTokenNotForTopic`, kodsuz 404, `SENDER_ID_MISMATCH`) silmez, yeniden de denenmez. İleti Merkezi isteği `iys: "0"` ve onaylı başlıkla gider; 5xx iki kez daha denenir,
   451 gönderildi sayılır, 401/402/450/466 denenmez. Gövdeler istemci kimliği, cihaz token'ı ve
   kişi kimliği taşımaz; `Debug` çıktısı anahtar, hash ve token içermez. Üretimde üç sağlayıcı
-  zorunlu (`config.rs` testleri). Kuyrukta kalıcı ret token'ı silmeden işi kapatır
-  (`audit_fixes.rs`), varsayılan push metni ad içermez (`events.rs`). Gerçek Apple, Google ve
-  İleti Merkezi hesaplarıyla gönderim yapılmadı; anahtarlar alınınca uçtan uca denenecek.
+  zorunlu (`config.rs` testleri). Kuyrukta kalıcı ret token'ı silmeden işi kapatır; kayıt ucu
+  token biçimini platforma göre denetler; yavaş sağlayıcı (800 ms) üç cihazlık teslimi sıraya
+  sokmaz (`audit_fixes.rs`); varsayılan push metni ad içermez (`events.rs`). Codex denetimi (28
+  Kasım, `37c3df6..9a9ea70`): mesaj sözleşmesi testleri alan bozulunca kaldı; `cargo audit`
+  bu farkta açık bulmadı. Gerçek Apple, Google ve İleti Merkezi hesaplarıyla gönderim yapılmadı;
+  anahtarlar alınınca uçtan uca denenecek.
 - **Bilinen eksikler:**
   - PWD-03: yalnızca yerel yaygın parola listesi var; büyük sızıntı listesiyle (gizlilik
     korumalı) kontrol eklenecek.
@@ -332,8 +337,19 @@ Durum dili: **Doğrulanacak / Geçti / Kaldı / Uygulanmaz / Risk kabul edildi /
   - EXT-02: sağlayıcı adresleri sabit ve TLS doğrulamalı, ama ağ düzeyinde çıkış kısıtı (egress
     izin listesi) altyapıda henüz yok.
   - BUS-02: SMS yeniden denemesi sağlayıcının 451 tekrar korumasına dayanır; korumanın süresi
-    belgede "kısa süre" diye geçiyor, ölçülmedi. Push'ta Apple ve Google'ın `collapse-id`/`tag`
-    tekilleştirmesi gerçek cihazda denenmedi.
+    belgede "kısa süre" diye geçiyor, ölçülmedi: koruma erken biterse mesaj iki kez gidebilir.
+    "Gönderildi" sağlayıcının kabulüdür, teslim raporu okunmaz. SMS arka plan görevinde gider;
+    süreç kapanırken bekleyen yeniden deneme kaybolur. Push'ta APNs `collapse-id` ve Android
+    `tag` gerçek cihazda denenmedi; Android'de `tag` kapatılmış bildirimin tekrarını engellemez.
+  - BUS-02, ARC-05: çevrimdışı cihaz için Apple ve Google uygulama başına yalnızca son bildirimi
+    saklar; arada kalan alarm push'u kaybolabilir (olay bildirim merkezinde durur). Mobil
+    uygulamada açılışta bildirim merkezi ve Android'de veri mesajı + yerel bildirim
+    değerlendirilecek.
+  - Birden fazla API kopyası: her kopya kendi APNs sağlayıcı token'ını üretir (40 dakikada bir).
+    Apple'ın sık yenileme sınırının (`TooManyProviderTokenUpdates`) kopya sayısıyla nasıl
+    işlediği ölçülmedi; pilotta tek kopya ile başlanacak.
+  - Bağımlılık: `cargo audit` (28 Kasım) açık bulmadı; `chrono 0.4.45` için düzeltilmiş sürümü
+    olmayan bir bakım uyarısı var (RUSTSEC-2026-0543, bu değişiklikten önce de vardı).
   - iOS kritik uyarı Apple'ın iznine bağlı (açık soru 7); izin gelene kadar alarm sessiz modu
     aşmaz.
 

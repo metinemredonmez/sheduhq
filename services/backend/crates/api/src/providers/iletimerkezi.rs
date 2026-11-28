@@ -7,10 +7,11 @@
 //!   ticari ileti değildir, bu yüzden `iys` her zaman `"0"`dır. Pazarlama SMS'i bu bağdaştırıcıyla
 //!   gönderilmez.
 //! - **Yeniden deneme:** ağ hatası, zaman aşımı ve sağlayıcının 5xx yanıtı en fazla iki kez daha
-//!   denenir. Sağlayıcı aynı başlık, alıcı ve metni kısa sürede ikinci kez almayı reddeder (451):
-//!   ilk deneme kabul edilmiş demektir, gönderildi sayılır. Bu yüzden yeniden deneme mesajı
-//!   çoğaltmaz. Diğer hatalar (kimlik, bakiye, onaysız başlık, hatalı numara) denenmez, hata
-//!   olarak loglanır; numara log'a yazılmaz.
+//!   denenir. Sağlayıcı aynı başlık, alıcı ve metni kısa süre içinde ikinci kez almayı reddeder
+//!   (451): ilk deneme kabul edilmiş demektir, gönderildi sayılır. Korumanın süresi belgelenmemiştir;
+//!   ilk deneme kabul edilmiş ve koruma bitmişse yeniden deneme mesajı ikinci kez gönderebilir.
+//!   "Gönderildi" sağlayıcının kabulüdür, alıcıya teslim değildir. Diğer hatalar (kimlik, bakiye,
+//!   onaysız başlık, hatalı numara) denenmez, hata koduyla loglanır; numara log'a yazılmaz.
 
 use std::{fmt, time::Duration};
 

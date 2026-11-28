@@ -1,8 +1,13 @@
 //! Apple Push Notification service (APNs) bağdaştırıcısı.
 //!
 //! - **Kimlik doğrulama:** token tabanlı (`.p8` anahtarıyla ES256 imzalı JWT). Sağlayıcı token'ı 40
-//!   dakikada bir yenilenir (Apple en az 20, en çok 60 dakika ister); Apple token'ı reddederse
-//!   bir sonraki denemede yenisi üretilir.
+//!   dakikada bir yenilenir (Apple en az 20, en çok 60 dakika ister). Apple token'ı reddederse yenisi
+//!   ancak eldeki token 20 dakikadan eskiyse üretilir: art arda retler (ör. yanlış anahtar kimliği)
+//!   Apple'ın sık yenileme sınırını (`TooManyProviderTokenUpdates`) tetiklemez.
+//! - **Token silme:** cihaz token'ı yalnızca Apple "bu cihaz artık kayıtlı değil" dediğinde (410)
+//!   silinir. `BadDeviceToken` ve `DeviceTokenNotForTopic` yanlış ortam (`production` / `sandbox`)
+//!   veya yanlış konu (paket kimliği) ayarında bütün token'lar için döner; bunlar kalıcı hata
+//!   olarak loglanır, token silinmez.
 //! - **Bağlantı:** yalnızca HTTP/2 ve TLS; adres sabittir (üretim veya sandbox).
 //! - **Tekilleştirme:** `apns-collapse-id` olay başına sabittir; aynı bildirim iki kez giderse
 //!   cihazda tek görünür (BUS-02).
@@ -37,6 +42,8 @@ const PRODUCTION_URL: &str = "https://api.push.apple.com";
 const SANDBOX_URL: &str = "https://api.sandbox.push.apple.com";
 /// Sağlayıcı token'ının yenilenme aralığı (saniye).
 const PROVIDER_TOKEN_TTL: u64 = 40 * 60;
+/// Apple'ın kuralı: sağlayıcı token'ı 20 dakikadan sık yenilenmez.
+const MIN_RENEW_INTERVAL: u64 = 20 * 60;
 
 pub struct Apns {
     http: reqwest::Client,
@@ -81,9 +88,7 @@ struct ErrorBody {
 fn classify(status: u16, reason: Option<&str>) -> Outcome {
     match (status, reason) {
         (200, _) => Outcome::Sent,
-        (410, _) | (400, Some("BadDeviceToken" | "DeviceTokenNotForTopic")) => {
-            Outcome::InvalidToken
-        }
+        (410, _) => Outcome::InvalidToken,
         (403, Some("ExpiredProviderToken" | "InvalidProviderToken" | "MissingProviderToken")) => {
             Outcome::RenewProviderToken
         }
@@ -93,7 +98,7 @@ fn classify(status: u16, reason: Option<&str>) -> Outcome {
 }
 
 /// APNs cihaz token'ı onaltılık bir dizidir (bugün 64 karakter).
-fn valid_device_token(token: &str) -> bool {
+pub(crate) fn valid_device_token(token: &str) -> bool {
     (32..=200).contains(&token.len())
         && token.len().is_multiple_of(2)
         && token.bytes().all(|b| b.is_ascii_hexdigit())
@@ -154,8 +159,14 @@ impl Apns {
         Some(token)
     }
 
+    /// Reddedilen token'ı bırakır; yalnızca 20 dakikadan eskiyse (Apple'ın yenileme sınırı).
     fn forget_provider_token(&self) {
-        if let Ok(mut cached) = self.provider_token.lock() {
+        let now = unix_now();
+        if let Ok(mut cached) = self.provider_token.lock()
+            && cached
+                .as_ref()
+                .is_some_and(|(_, issued_at)| now.saturating_sub(*issued_at) >= MIN_RENEW_INTERVAL)
+        {
             *cached = None;
         }
     }
@@ -317,10 +328,11 @@ mod tests {
     fn responses_are_classified() {
         assert_eq!(classify(200, None), Outcome::Sent);
         assert_eq!(classify(410, Some("Unregistered")), Outcome::InvalidToken);
-        assert_eq!(classify(400, Some("BadDeviceToken")), Outcome::InvalidToken);
+        // Yanlış ortam veya konu ayarında her cihaz için döner: token silinmez.
+        assert_eq!(classify(400, Some("BadDeviceToken")), Outcome::Reject);
         assert_eq!(
             classify(400, Some("DeviceTokenNotForTopic")),
-            Outcome::InvalidToken
+            Outcome::Reject
         );
         assert_eq!(
             classify(403, Some("ExpiredProviderToken")),
@@ -445,8 +457,17 @@ mod tests {
         .await;
         let apns = Apns::build(&pem, &settings(false), &url, false).expect("apns");
 
-        // Süresi dolmuş sağlayıcı token'ı: geçici hata ve sonraki denemede yeni token.
-        let first = apns.provider_token();
+        // Reddedilen sağlayıcı token'ı: geçici hata. Token 20 dakikadan yeniyse korunur (art arda
+        // retler Apple'ın yenileme sınırını tetiklemez); eskiyse sonraki denemede yenisi üretilir.
+        let first = apns.provider_token().expect("token");
+        assert_eq!(
+            apns.send(&message(PushPriority::Critical)).await,
+            Err(PushError::Transient)
+        );
+        assert_eq!(apns.provider_token(), Some(first.clone()));
+        if let Ok(mut cached) = apns.provider_token.lock() {
+            *cached = Some((first.clone(), unix_now() - MIN_RENEW_INTERVAL));
+        }
         assert_eq!(
             apns.send(&message(PushPriority::Critical)).await,
             Err(PushError::Transient)
@@ -457,7 +478,6 @@ mod tests {
                 .map(|t| t.is_none())
                 .unwrap_or(false)
         );
-        assert!(first.is_some());
 
         let unregistered = PushMessage {
             kind: "armed".into(),

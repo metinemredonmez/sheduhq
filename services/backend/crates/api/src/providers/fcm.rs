@@ -7,7 +7,12 @@
 //! - **Adresler sabittir:** token adresi `oauth2.googleapis.com`, gönderim `fcm.googleapis.com`.
 //!   Hizmet hesabı dosyasındaki `token_uri` başka bir adres gösterirse açılış reddedilir: imzalı
 //!   onay başka yere gönderilmez (EXT-01).
-//! - **Tekilleştirme:** `collapse_key` ve bildirim `tag`'i olay başına sabittir (BUS-02).
+//! - **Tekilleştirme:** bildirim `tag`'i olay başına sabittir: aynı bildirim ikinci kez gelirse ve
+//!   ilki hâlâ ekrandaysa onun yerine geçer; ilki kapatıldıysa ikincisi yeniden görünür. FCM
+//!   bildirim mesajlarında `collapse_key`'i yok sayar, bu yüzden gönderilmez (BUS-02).
+//! - **Token silme:** yalnızca `UNREGISTERED` (cihaz artık kayıtlı değil). Kodsuz 404 (ör. yanlış
+//!   proje kimliği) ve `SENDER_ID_MISMATCH` (yanlış Firebase projesi) yapılandırma hatasında bütün
+//!   cihazlar için döner; kalıcı hata olarak loglanır, token silinmez.
 //! - **Süre:** `ttl` olayın alınmasından en fazla bir saat sonrasına kadardır.
 //! - **Kanallar:** Android'de bildirim kanalı uygulamada tanımlanır: `alarm` (sessiz modu aşan
 //!   alarm kanalı), `warning`, `info`.
@@ -133,9 +138,7 @@ struct AccessToken {
 fn classify(status: u16, code: Option<&str>) -> Outcome {
     match (status, code) {
         (200, _) => Outcome::Sent,
-        // Token yalnızca FCM açıkça söylediğinde silinir: kodsuz 404 (ör. yanlış proje kimliği)
-        // bütün Android token'larını sildirmez.
-        (_, Some("UNREGISTERED" | "SENDER_ID_MISMATCH")) => Outcome::InvalidToken,
+        (_, Some("UNREGISTERED")) => Outcome::InvalidToken,
         (401, _) => Outcome::RenewAccessToken,
         (429, _) | (500..=599, _) => Outcome::Retry,
         // INVALID_ARGUMENT bozuk yük de olabilir: token silinmez, yeniden de denenmez.
@@ -144,8 +147,8 @@ fn classify(status: u16, code: Option<&str>) -> Outcome {
 }
 
 /// FCM kayıt token'ı: harf, rakam ve `:_-.` karakterleri.
-fn valid_device_token(token: &str) -> bool {
-    (20..=4096).contains(&token.len())
+pub(crate) fn valid_device_token(token: &str) -> bool {
+    (1..=4096).contains(&token.len())
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.'))
@@ -278,7 +281,6 @@ impl Fcm {
                 "android": {
                     "priority": priority,
                     "ttl": format!("{ttl}s"),
-                    "collapse_key": message.collapse_key,
                     "notification": {
                         "channel_id": channel,
                         "tag": message.collapse_key,
@@ -424,10 +426,7 @@ mod tests {
         assert_eq!(classify(404, Some("UNREGISTERED")), Outcome::InvalidToken);
         assert_eq!(classify(404, Some("NOT_FOUND")), Outcome::Reject);
         assert_eq!(classify(404, None), Outcome::Reject);
-        assert_eq!(
-            classify(403, Some("SENDER_ID_MISMATCH")),
-            Outcome::InvalidToken
-        );
+        assert_eq!(classify(403, Some("SENDER_ID_MISMATCH")), Outcome::Reject);
         assert_eq!(
             classify(401, Some("UNAUTHENTICATED")),
             Outcome::RenewAccessToken
@@ -520,7 +519,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&send.body).expect("json");
         let android = &body["message"]["android"];
         assert_eq!(android["priority"], "HIGH");
-        assert_eq!(android["collapse_key"], "shedu-event-7");
+        assert!(android.get("collapse_key").is_none());
         assert_eq!(android["notification"]["channel_id"], "alarm");
         assert_eq!(android["notification"]["tag"], "shedu-event-7");
         let ttl: u64 = android["ttl"]

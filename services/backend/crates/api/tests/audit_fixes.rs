@@ -262,6 +262,85 @@ async fn rejected_push_is_not_retried_and_keeps_the_token(
     assert_eq!(tokens, 1);
 }
 
+/// Aynı kullanıcı için verilen platformda yeni bir oturum açar.
+async fn session_on(app: &TestApp, platform: &str) -> String {
+    let (status, body) = app
+        .post(
+            "/v1/auth/login",
+            json!({ "identifier": PHONE, "password": PASSWORD, "device": { "platform": platform } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    s(&body, "access_token")
+}
+
+/// Push token'ının biçimi kayıtta cihazın platformuna göre denetlenir: hatalı kayıt ilk alarma
+/// kadar gizli kalmaz.
+#[sqlx::test(migrations = "../../migrations")]
+async fn push_token_format_is_checked_per_platform(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (android, _, _) = app.user(PHONE).await;
+    let put = |access: String, token: &'static str| {
+        let app = &app;
+        async move {
+            app.put(
+                "/v1/devices/current/push-token",
+                json!({ "token": token }),
+                &access,
+            )
+            .await
+        }
+    };
+    let hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+    assert_eq!(
+        put(android.clone(), "tok-owner").await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = put(android, "tok\"}").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(s(&body, "error"), "invalid_push_token");
+
+    let ios = session_on(&app, "ios").await;
+    let (status, body) = put(ios.clone(), "tok-owner").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(s(&body, "error"), "invalid_push_token");
+    let (status, _) = put(ios.clone(), "../../3/device/x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(put(ios, hex).await.0, StatusCode::NO_CONTENT);
+
+    let web = session_on(&app, "web").await;
+    let (status, body) = put(web, hex).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(s(&body, "error"), "push_not_supported");
+}
+
+/// Yavaş sağlayıcı teslimi sıraya sokmaz: bir olayın cihazlarına bildirim aynı anda gider.
+#[sqlx::test(migrations = "../../migrations")]
+async fn slow_provider_does_not_serialize_deliveries(_: PgPoolOptions, connect: PgConnectOptions) {
+    let app = app(connect).await;
+    let (owner, _, org) = app.user(PHONE).await;
+    let d = demo(&app, &owner, &org).await;
+    set_token(&app, &owner, "tok-a").await;
+    for token in ["tok-b", "tok-c"] {
+        let access = session_on(&app, "android").await;
+        set_token(&app, &access, token).await;
+    }
+    let org_id: Uuid = org.parse().expect("uuid");
+
+    let event = event_id(&simulate(&app, &owner, &d, 3).await);
+    app.push.set_delay(Duration::from_millis(800));
+    let started = std::time::Instant::now();
+    let sent = push::dispatch(&app.state, org_id, event)
+        .await
+        .expect("dağıtım");
+    let elapsed = started.elapsed();
+    app.push.set_delay(Duration::ZERO);
+    assert_eq!(sent, 3);
+    // Sırayla gönderilseydi en az 2,4 saniye sürerdi.
+    assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // S02, S05: oturum kuralı ve kimlik bilgisi sürümü
 // ---------------------------------------------------------------------------------------------

@@ -108,11 +108,16 @@ Uç noktalar (`/v1`): `auth/register/start`, `auth/register/complete`, `auth/log
   (`SHEDU_ILETIMERKEZI_KEY`, `SHEDU_ILETIMERKEZI_HASH`) panelden alınır; gönderici adı
   (`SHEDU_SMS_SENDER`) panelde onaylı olmalı (en çok 11 karakter, Türkçe karakter yok). Bütün
   Shedu SMS'leri işlem amaçlıdır (kod, davet, güvenlik bildirimi): `iys` her zaman `"0"`, pazarlama
-  SMS'i bu yoldan gitmez. Ağ hatası, zaman aşımı ve 5xx en fazla iki kez daha denenir; sağlayıcı
-  aynı başlık, alıcı ve metni kısa sürede ikinci kez reddettiği için (451, gönderildi sayılır)
-  yeniden deneme mesajı çoğaltmaz. Kimlik, bakiye, onaysız başlık ve hatalı numara denenmez, hata
-  olarak loglanır (numara maskeli bile yazılmaz). SMS arka planda gider; yanıt süresi kodun
-  gönderilip gönderilmediğini belli etmez.
+  SMS'i bu yoldan gitmez. Ağ hatası, zaman aşımı ve 5xx en fazla iki kez daha denenir (1 ve 3 sn
+  sonra). Sağlayıcı aynı başlık, alıcı ve metni kısa süre içinde ikinci kez reddeder (451); bu
+  yanıt "önceki deneme kabul edildi" sayılır. Koruma süresi belgelenmemiştir (ölçülmedi): ilk
+  denemenin kabulüyle yeniden deneme arasında koruma sona ererse mesaj iki kez gidebilir. "Gönderildi"
+  sağlayıcının kabulüdür, alıcıya teslim değildir (teslim raporu okunmaz). Kimlik, bakiye, onaysız
+  başlık ve hatalı numara denenmez, sağlayıcının hata koduyla loglanır. Bağdaştırıcı numarayı
+  log'a yazmaz; SMS'i gönderen akışlar (kod, davet, güvenlik bildirimi) hata halinde numaranın
+  maskeli biçimini (`+90******2233`) yazar. SMS arka planda gider; yanıt süresi kodun gönderilip
+  gönderilmediğini belli etmez. Süreç kapanırken bekleyen yeniden deneme kaybolabilir; kişi kodu
+  yeniden ister.
 - **Deneme sınırları:** hesap, IP ve bütün sistem için ayrı sayaçlar; PostgreSQL'de, bütün API
   kopyalarında ortak ve atomik. Kalıcı kilit yok; parola sıfırlama ayrı sayaçla çalışır. Kod
   başına 5 denemeye ek olarak hesap başına 24 saatte en fazla 20 başarısız doğrulama (SMS
@@ -211,12 +216,17 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   `reap_push_deliveries()` `failed` yapar ve hata olarak loglanır: uzun kesintiden sonra da hiçbir
   iş `pending` veya `sending` durumunda kalmaz. Geç dağıtılan eski olay için iş yazılmaz, olay
   yalnızca dağıtıldı işaretlenir. Geçersiz token denenmez; işin sonucunu bu deneme yazdıysa
-  cihazdan silinir. Süreç gönderim sırasında kesilirse süre dolunca iş yeniden alınır; 5
-  saniyelik tarama kaçırılan olayları (yaş sınırı olmadan) ve zamanı gelen işleri yakalar. Tarama
-  her olayı ve işi ayrı ele alır: birinin hatası loglanır, diğerleri (başka organizasyonlarınki
-  dahil) işlenmeye devam eder. Teslim en az bir kezdir: sağlayıcının kabulü ile sonucun yazılması arasındaki kesintide
-  bildirim ikinci kez gidebilir; sağlayıcı bağdaştırıcısı olay başına sabit `collapse_key`'i
-  (APNs `apns-collapse-id`, FCM `collapse_key`) kullanarak cihazda tekilleştirir.
+  cihazdan silinir. Süreç gönderim sırasında kesilirse süre dolunca iş yeniden alınır; tarama
+  kaçırılan olayları (yaş sınırı olmadan) ve zamanı gelen işleri yakalar. Tarama, yeni olayların
+  dağıtımından ayrı yürür: sağlayıcı yanıtını beklerken yeni olaylar dağıtılmaya devam eder. Bir
+  tarama turu bitmeden sonraki başlamaz; turlar arasında en az 5 saniye vardır. Yeni olaylar ayrı
+  görevlerde dağıtılır (kopya başına aynı anda en çok 3 olay), işler gruplar halinde aynı anda
+  gönderilir (en çok 4). Böylece yavaş veya düşmüş bir sağlayıcı (iş başına en çok 20 sn) öbür
+  işleri sıraya sokmaz. Tarama her olayı ve işi ayrı ele alır: birinin hatası loglanır, diğerleri
+  (başka organizasyonlarınki dahil) işlenmeye devam eder. Teslim en az bir kezdir: sağlayıcının
+  kabulü ile sonucun yazılması arasındaki kesintide bildirim ikinci kez gidebilir. APNs'te
+  `apns-collapse-id` aynı bildirimleri tek gösterir; Android'de bildirim `tag`'i yalnızca ilki
+  hâlâ ekrandaysa onun yerini alır, kapatılmışsa ikincisi yeniden görünür.
 - **Paylaşılan zon:** bir zon birden fazla bölümdeyse alarm, alarma geçen her bölüm için ayrı
   kritik olay olarak yazılır (yalnızca o bölümü gören de bildirim alır); bypass zonun ait olduğu
   her bölümde bypass yetkisi ister; panel ayrıntısı görünmeyen bölümlerin kimliğini göstermez.
@@ -240,17 +250,26 @@ Uç noktalar: `GET …/panels/{panel_id}/events` (geçmiş; `before`, `limit`, `
   - **FCM:** Google hizmet hesabıyla RS256 imzalı onay → yalnızca `firebase.messaging` kapsamlı
     erişim token'ı (süresi dolmadan 5 dakika önce yenilenir, aynı anda tek yenileme). Hizmet hesabı
     dosyasındaki `token_uri` Google'ın adresi değilse açılış reddedilir. Android kanalları
-    uygulamada tanımlanır: `alarm` (sessiz modu aşan), `warning`, `info`. `collapse_key` ve bildirim
-    `tag`'i olay başına sabit, `ttl` olaydan bir saat sonrasına kadar.
-  - **Sonuçlar:** gönderildi; geçersiz token (APNs 410, `BadDeviceToken`,
-    `DeviceTokenNotForTopic`; FCM `UNREGISTERED`, `SENDER_ID_MISMATCH`) → token silinir; geçici
-    (ağ, 429, 5xx, reddedilen sağlayıcı/erişim token'ı → yenisi alınır) → yeniden denenir;
-    kalıcı ret (bozuk yük, yanlış konu, yetkisiz hizmet hesabı, FCM'de kodsuz 404 gibi yanlış
-    yapılandırma) → yeniden denenmez, token silinmez, hata olarak loglanır. Token yalnızca
-    sağlayıcı açıkça "bu token geçersiz" dediğinde silinir; APNs ortamı (`production` / `sandbox`)
-    yanlış seçilirse Apple token'ları `BadDeviceToken` ile reddeder ve silinir, uygulama bir sonraki
-    açılışta token'ını yeniden kaydeder. Biçimi bozuk cihaz token'ı (APNs onaltılık, FCM `[A-Za-z0-9:_.-]`)
-    sağlayıcıya gönderilmez.
+    uygulamada tanımlanır: `alarm` (sessiz modu aşan), `warning`, `info`. Bildirim `tag`'i olay
+    başına sabit, `ttl` olaydan bir saat sonrasına kadar. FCM bildirim mesajlarında `collapse_key`'i
+    yok sayar; gönderilmez.
+  - **Çevrimdışı cihaz:** Apple da Google da çevrimdışı cihaz için uygulama başına yalnızca son
+    bildirimi saklar. Telefon kapalıyken önce alarm, sonra "Sistem kapatıldı" gelirse telefon
+    açıldığında yalnızca sonuncusu görünür; alarm bildirim merkezinde (uygulama içinde) durur.
+    Mobil uygulama açılışta bildirim merkezini göstermeli; Android'de alarmların veri mesajı ve
+    uygulamanın yerel bildirimiyle gönderilmesi mobil yazılırken değerlendirilecek.
+  - **Sonuçlar:** gönderildi; cihaz artık kayıtlı değil (APNs 410, FCM `UNREGISTERED`) → token
+    silinir; geçici (ağ, 429, 5xx, reddedilen sağlayıcı/erişim token'ı) → yeniden denenir; kalıcı
+    ret → yeniden denenmez, token silinmez, hata olarak loglanır. Kalıcı ret: bozuk yük, yetkisiz
+    hizmet hesabı ve yapılandırma hatasında bütün cihazlar için dönen yanıtlar (APNs
+    `BadDeviceToken` yanlış ortamda, `DeviceTokenNotForTopic` yanlış paket kimliğinde; FCM kodsuz
+    404 yanlış proje kimliğinde, `SENDER_ID_MISMATCH` yanlış Firebase projesinde). Böylece yanlış
+    bir ayar token'ları toplu sildirmez. Apple'ın reddettiği sağlayıcı token'ı ancak 20 dakikadan
+    eskiyse yenilenir (Apple'ın sık yenileme sınırı). Biçimi bozuk cihaz token'ı sağlayıcıya
+    gönderilmez.
+  - **Kayıt:** `PUT /v1/devices/current/push-token` token'ı cihazın platformuna göre denetler
+    (iOS: onaltılık APNs token'ı; Android: FCM karakterleri `[A-Za-z0-9:_.-]`); hatalıysa `400
+    invalid_push_token`. Push sağlayıcısı olmayan platform (`web`) `400 push_not_supported` alır.
   - **İçerik:** bildirim Apple ve Google sunucularından geçer; KVKK aktarım kararına kadar (açık
     soru 11) varsayılan içerik kısadır: başlık "Shedu", metin yalnızca olay türü ("Yangın alarmı",
     "Sistem kuruldu"). Panel, bölüm ve zon adları gitmez; veri alanında yalnızca organizasyon,

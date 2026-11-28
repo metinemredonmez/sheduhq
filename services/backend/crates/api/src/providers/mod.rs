@@ -242,6 +242,15 @@ mod tests {
         assert_eq!(pkcs8_from_pem(&pem("")), None);
     }
 
+    #[test]
+    fn pem_accepts_crlf_and_reads_only_the_first_block() {
+        let block = format!("{PEM_BEGIN}\r\nYWJj\r\n{PEM_END}");
+        assert_eq!(pkcs8_from_pem(&block).as_deref(), Some(&b"abc"[..]));
+        let multiple = format!("önek\n{block}\n{PEM_BEGIN}\nZGVm\n{PEM_END}\nsonek");
+        assert_eq!(pkcs8_from_pem(&multiple).as_deref(), Some(&b"abc"[..]));
+        assert_eq!(pkcs8_from_pem(&format!("{PEM_BEGIN}\n*\n{PEM_END}")), None);
+    }
+
     #[tokio::test]
     async fn platform_without_provider_is_rejected_not_retried() {
         let push = PlatformPush {
